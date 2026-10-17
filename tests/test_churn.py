@@ -1997,3 +1997,12 @@ def test_bot_prs_off_without_config_and_churn_prs_are_ignored(bot, monkeypatch):
     g = _BotGH(state="dirty")
     monkeypatch.setitem(churn._CFG, "bot_prs", {})
     assert churn.tend_bot_prs(g.gh, g.sh) == [] and g.calls == []
+
+
+def test_bot_pr_with_an_uncomputed_merge_state_waits_a_tick(bot):
+    churn, _ = bot
+    g = _BotGH(state="unknown", runs=[{"id": 7, "name": "ground-truth", "conclusion": "failure", "run_attempt": 1}])
+    assert churn.tend_bot_prs(g.gh, g.sh) == [] and g.calls == []  # no rerun of a PR that may conflict
+    g.state = "dirty"
+    [line] = churn.tend_bot_prs(g.gh, g.sh)
+    assert "conflicts with main" in line and g.calls == [["gh", "workflow", "run"]]
