@@ -1489,14 +1489,27 @@ def test_refill_asks_the_tick_then_falls_back_to_callgraph(churn, monkeypatch):
     assert churn.refill(churn.load_state(), {}) == ("ask", [])  # nothing for the rules: stage 2
     put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now())})
     assert churn.refill(churn.load_state(), {}) == ("wait", [])  # the asked tick gets its grace hour
-    put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now() - churn.dt.timedelta(hours=2))})
+    put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now() - churn.dt.timedelta(minutes=20))})
     stage, items = churn.refill(churn.load_state(), {})
     assert stage == "callgraph" and [x["issue"] for x in items] == [3782]
     monkeypatch.setattr(churn, "open_issues", lambda: [])  # every call-graph child taken: the standing epic item
-    put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now() - churn.dt.timedelta(hours=2))})
+    put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now() - churn.dt.timedelta(minutes=20))})
     stage, items = churn.refill(churn.load_state(), {})
     assert [x["issue"] for x in items] == [churn.CALLGRAPH_EPIC] and "call-graph function work" in items[0]["task"]
     assert churn.refill(churn.load_state(), {})[1] == []  # never a second epic item while one is queued
+
+
+def test_refill_asks_every_30_min_only_while_nothing_is_launchable(churn, monkeypatch):  # owner 2026-10-17
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
+    monkeypatch.setattr(churn, "open_issues", lambda: [_iss(3782, "scope:infra", title="Call-graph reference: Go")])
+    ago = lambda **kw: {"agent_t": churn.iso(churn.now() - churn.dt.timedelta(**kw))}  # noqa: E731
+    put(churn, queue=[], max_workers=2, refill=ago(minutes=40))
+    assert churn.refill(churn.load_state(), {}) == ("ask", [])  # idle slots: no 6 h wait
+    put(churn, queue=[], max_workers=2, refill=ago(minutes=10))
+    assert churn.refill(churn.load_state(), {}) == ("wait", [])  # a 15 min grace for the asked tick
+    item = {"issue": 9, "model": "sonnet", "task": "x", "needs_owner": False}
+    put(churn, queue=[item], max_workers=2, refill=ago(minutes=40))
+    assert churn.refill(churn.load_state(), {})[0] == "wait"  # something launchable: the hourly grace as before
 
 
 def test_refill_respects_off_paused_and_the_cooldown_log(churn, monkeypatch):
@@ -1809,3 +1822,85 @@ def test_host_settings_come_from_the_config_file(tmp_path, monkeypatch):
     assert mod.DASH_REPO == "acme/squid-bot" and mod.SELFSCAN_PY == "/opt/venv/bin/python"
     brief = mod.AGY_BRIEF.format(issue=1, wt="w", branch="b", task="t", repo=mod.REPO, repo_dir=mod.V6, python=mod.SELFSCAN_PY)
     assert "/data/proj/repo" in brief and "/opt/venv/bin/python -m pytest" in brief
+
+
+def _procs(loop_age=55, target=False):
+    loop = "/bin/bash -c source snap.sh && eval 'until ! pgrep -f \"evidence.py prove\" >/dev/null; do sleep 15; done'"
+    p = {100: (1, "python3 churn _run 5053-x", 300), 101: (100, "/usr/bin/claude -p go", 300),
+         102: (101, loop, loop_age), 103: (102, "sleep 15", 0.1)}
+    if target:
+        p[200] = (1, "python3 tools/evidence.py prove", 10)
+    return p
+
+
+def test_stuck_workers_flags_a_wait_loop_that_matches_only_itself(churn):
+    st = {"running": [{"run_id": "5053-x", "pid": 100}]}
+    [(key, _, msg)] = churn.stuck_workers(st, _procs(), transcript=lambda pid: None)
+    assert key == "stuck-5053-x" and "kill 102" in msg
+    assert churn.stuck_workers(st, _procs(target=True), transcript=lambda pid: None) == []  # really waiting
+    assert churn.stuck_workers(st, _procs(loop_age=5), transcript=lambda pid: None) == []  # too young to judge
+    assert churn.stuck_workers({"running": [{"pid": 100}]}, _procs(), transcript=lambda pid: None) == []  # agy/legacy
+
+
+def test_stuck_workers_flags_a_silent_transcript(churn, tmp_path):
+    import os
+    t = tmp_path / "s.jsonl"
+    t.write_text("{}")
+    st = {"running": [{"run_id": "5053-x", "pid": 100}]}
+    procs = _procs(target=True)
+    assert churn.stuck_workers(st, procs, transcript=lambda pid: t) == []
+    old = churn.time.time() - 50 * 60
+    os.utime(t, (old, old))
+    [(_, _, msg)] = churn.stuck_workers(st, procs, transcript=lambda pid: t)
+    assert "50 min" in msg and "evidence.py prove" in msg
+
+
+def test_gate_ends_a_dead_wait_loop_on_its_second_sighting_only(churn, monkeypatch):
+    st = {"running": [{"run_id": "5053-x", "pid": 100}]}
+    killed, clock = [], [1_000_000.0]
+    monkeypatch.setattr(churn.time, "time", lambda: clock[0])
+    end = lambda procs: churn.end_dead_wait_loops(st, procs, kill=lambda pid, sig: killed.append(pid))
+    assert end(_procs(loop_age=12)) == [] and killed == []  # first sighting: remembered
+    clock[0] += 9 * 60
+    [line] = end(_procs(loop_age=21))
+    assert killed == [102] and "5053-x" in line and "evidence.py prove" in line
+    assert end(_procs(loop_age=5)) == []  # too young
+    killed.clear()
+    end(_procs(loop_age=12))
+    clock[0] += 9 * 60
+    assert end(_procs(loop_age=21, target=True)) == [] and killed == []  # the job came back: a real wait
+
+
+def test_gate_treats_a_reused_pid_as_a_new_loop(churn, monkeypatch):
+    st = {"running": [{"run_id": "5053-x", "pid": 100}]}
+    killed, clock = [], [1_000_000.0]
+    monkeypatch.setattr(churn.time, "time", lambda: clock[0])
+    churn.end_dead_wait_loops(st, _procs(loop_age=12), kill=lambda pid, sig: killed.append(pid))
+    clock[0] += 9 * 60
+    churn.end_dead_wait_loops(st, _procs(loop_age=11), kill=lambda pid, sig: killed.append(pid))  # started 8 min later
+    assert killed == []
+
+
+def test_every_churn_session_gets_the_self_wait_hook(churn):
+    cmd = churn.claude_cmd("go", "sonnet", 1.0)
+    hooks = json.loads(cmd[cmd.index("--settings") + 1])["hooks"]["PreToolUse"]
+    assert hooks[0]["matcher"] == "Bash" and str(churn.SELF_WAIT_HOOK) in hooks[0]["hooks"][0]["command"]
+    assert churn.SELF_WAIT_HOOK.exists()
+
+
+@pytest.mark.parametrize(("cmd", "blocked"), [
+    ('until ! pgrep -f "evidence.py prove" >/dev/null; do sleep 15; done; tail ev.log', True),
+    ('while pgrep -f "det_mutation.py run" >/dev/null; do sleep 30; done', True),
+    ("while pgrep -af det_mutation.py; do sleep 30; done", True),
+    ('while ps aux | grep -q "heavy-run"; do sleep 5; done', True),
+    ('until ! pgrep -f "[e]vidence.py prove" >/dev/null; do sleep 15; done', False),
+    ("while kill -0 $pid 2>/dev/null; do sleep 15; done", False),
+    ('pgrep -af "evidence.py prove"', False),
+    ("while pgrep -x java >/dev/null; do sleep 5; done", False),
+    ('until ! pgrep -f "evidence.py prove"; do sleep 15; done # self-wait-ok', False),
+])
+def test_self_wait_hook_blocks_only_loops_that_match_themselves(cmd, blocked):
+    hook = SCRIPT.parent / "tools" / "block-self-wait.py"
+    out = subprocess.run(["python3", str(hook)], input=json.dumps({"tool_input": {"command": cmd}}),
+                         capture_output=True, text=True, check=True).stdout
+    assert ('"deny"' in out) is blocked
