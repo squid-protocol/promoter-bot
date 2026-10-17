@@ -1278,14 +1278,35 @@ def test_a_held_plan_approval_is_new_work_not_a_fix_loop(churn):
     assert churn.run_kind({"resume_of": "5078-b"}) == "send_back"
 
 
-def test_a_pr_with_three_recent_fix_runs_goes_to_the_owner(churn):
-    for i in range(3):
+def _fix_runs(churn, k, rescue=False):
+    for i in range(k):
         _run(churn, f"5176-{i}", issue=5176, task="Fix PR #5180 (b): shepherd:needs-fix", started=churn.iso(churn.now()))
+    if rescue:
+        _run(churn, "5176-r", issue=5176, task=churn.rescue_task(5180, "b", 5176, k, []), started=churn.iso(churn.now()))
     st = {"prs": [{"number": 5180, "issue": 5176}], "queue": [], "running": []}
-    snap = {"5180": pr(ms="dirty", branch="churn/5176-x")}
-    assert churn.queue_pr_fixes(st, snap) == ["#5180"]
-    q = st["queue"][0]
-    assert q["needs_owner"] and "3 fix runs in 24 h" in q["task"]
+    assert churn.queue_pr_fixes(st, {"5180": pr(ms="dirty", branch="churn/5176-x")}) == ["#5180"]
+    return st["queue"][0]
+
+
+def test_one_fix_run_stays_on_sonnet(churn):
+    q = _fix_runs(churn, 1)
+    assert q["model"] == "sonnet" and not q["needs_owner"] and "rescue" not in q
+
+
+def test_two_sonnet_fix_runs_bring_one_opus_rescue_that_judges_first(churn):
+    q = _fix_runs(churn, 2)
+    assert q["model"] == "opus" and q["rescue"] and not q["needs_owner"]
+    assert q["task"].startswith("RESCUE (Fix PR #5180") and "Rescue verdict: SAVE|SLICE|RESTART|OWNER" in q["task"]
+    assert "edit issue #5176" in q["task"] and "Sonnet-sized" in q["task"] and "Owner OK (2026-10-17)" in q["task"]
+    assert churn.run_kind({"task": q["task"]}) == "pr_fix"  # the rescue counts as a fix run
+    st = {"queue": [dict(q)]}
+    churn.normalize_state(st)
+    assert st["queue"][0].get("rescue") is True and not st.get("quarantine")  # the validator keeps the key
+
+
+def test_a_pr_that_fails_after_its_rescue_goes_to_the_owner(churn):
+    q = _fix_runs(churn, 2, rescue=True)
+    assert q["model"] == "sonnet" and q["needs_owner"] and "an Opus rescue already ran, owner decides" in q["task"]
 
 
 # ---------------------------------------------------------------- liveness (2026-10-16 audit, step 1)
