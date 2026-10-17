@@ -47,7 +47,8 @@ from pathlib import Path
 
 # Machine-specific settings (paths, repository) live in a JSON file outside the code, so the code carries no host details:
 # {"project_root": "...", "state_dir": "...", "repo_dir": "...", "worktree_dir": "...", "repo": "org/name",
-#  "dashboard_repo": "org/name", "tick_cwd": "...", "python": ".../bin/python"}; anything missing gets a default below.
+#  "dashboard_repo": "org/name", "tick_cwd": "...", "python": ".../bin/python",
+#  "bot_prs": {"auto/branch-prefix": "workflow-that-rebuilds-it.yml"}}; anything missing gets a default below.
 CONFIG_FILE = Path(os.environ.get("PROMOTER_BOT_CONFIG", str(Path.home() / ".config/promoter-bot/config.json")))
 
 
@@ -2336,6 +2337,68 @@ def stuck_workers(state: dict, procs: dict | None = None, transcript=session_tra
     return out
 
 
+BOT_PRS = H / "churn-bot-prs.json"  # what tend_bot_prs did per bot PR: {n: {head, rerun, dispatched, paged}}
+BOT_PR_MAX_AGE_H = 24
+
+
+def tend_bot_prs(gh=None, sh=None) -> list[str]:
+    """Bot PRs (a workflow's PR from a branch prefix in config `bot_prs`) have no worker and no shepherd label, so
+    nothing looked after them: #5317 (evidence refresh) sat 13 h on 2026-10-17 after a 15.2 s timing flake failed
+    ground-truth and blocked its auto-merge, then main moved and it conflicted. Per PR head, once each (owner
+    2026-10-17): conflicting or older than BOT_PR_MAX_AGE_H -> dispatch its workflow on main (it rebuilds the PR from
+    current main; skipped while a run is queued or running); a failed check -> rerun the failed jobs; still red after
+    that -> page the owner. Returns log lines."""
+    prefixes = _CFG.get("bot_prs") or {}
+    if not prefixes:
+        return []
+    gh, sh = gh or gh_json, sh or run
+    seen = {}
+    with contextlib.suppress(OSError, ValueError):
+        seen = json.loads(BOT_PRS.read_text())
+    keep, lines, t = {}, [], now()
+    for pr in gh(f"repos/{REPO}/pulls?state=open&per_page=100"):
+        ref = pr["head"]["ref"]
+        wf = next((w for pre, w in prefixes.items() if ref.startswith(pre)), None)
+        if not wf:
+            continue
+        n, head = pr["number"], pr["head"]["sha"]
+        mem = seen.get(str(n)) or {}
+        mem = mem if mem.get("head") == head else {"head": head}
+        keep[str(n)] = mem
+        if mem.get("dispatched"):
+            continue  # its rebuild is on the way: a new head starts over
+        full = gh(f"repos/{REPO}/pulls/{n}")
+        age_h = (t - parse_iso(pr["created_at"])).total_seconds() / 3600
+        if full.get("mergeable_state") == "dirty" or age_h > BOT_PR_MAX_AGE_H:
+            if any(gh(f"repos/{REPO}/actions/workflows/{wf}/runs?status={st}&per_page=5").get("workflow_runs")
+                   for st in ("queued", "in_progress")):
+                continue
+            why = "conflicts with main" if full.get("mergeable_state") == "dirty" else f"open {age_h:.0f} h"
+            if sh(["gh", "workflow", "run", wf, "-R", REPO, "--ref", "main"]).returncode == 0:
+                mem["dispatched"] = iso(t)
+                lines.append(f"bot PR #{n} {why}: dispatched {wf} on main to rebuild it")
+            continue
+        failed = [r for r in gh(f"repos/{REPO}/actions/runs?head_sha={head}&per_page=50").get("workflow_runs", [])
+                  if r.get("conclusion") in ("failure", "timed_out")]
+        names = ", ".join(r.get("name", "?") for r in failed)[:300]
+        if not failed:
+            continue
+        if not mem.get("rerun"):
+            for r in failed:
+                sh(["gh", "run", "rerun", str(r["id"]), "--failed", "-R", REPO])
+            mem["rerun"] = iso(t)
+            lines.append(f"bot PR #{n}: reran the failed jobs once ({names})")
+        elif not mem.get("paged") and all(r.get("run_attempt", 1) > 1 for r in failed):
+            mem["paged"] = iso(t)
+            notify(f"bot-pr-{n}-{head[:8]}", f"churn: bot PR #{n} still red",
+                   f"Bot PR #{n} ({ref}) is still red after one rerun: {names}. Its auto-merge stays blocked until "
+                   "that is fixed.", priority="high", tags="warning")
+            lines.append(f"bot PR #{n}: still red after a rerun; paged the owner")
+    with contextlib.suppress(OSError):
+        BOT_PRS.write_text(json.dumps(keep))
+    return lines
+
+
 def end_dead_wait_loops(state: dict, procs: dict | None = None, kill=os.kill) -> list[str]:
     """The gate's half (owner 2026-10-17): a dead wait loop seen on two ticks at least DEAD_LOOP_RECHECK_MIN apart is
     ended with SIGTERM. Only the loop's shell: the worker gets its tool call back and goes on. Returns log lines."""
@@ -3375,6 +3438,9 @@ def cmd_tick(a) -> int:
                 gate_alerts(state, b, snap)
             with contextlib.suppress(Exception):
                 for line in end_dead_wait_loops(state):
+                    log(line)
+            with contextlib.suppress(Exception):
+                for line in tend_bot_prs():
                     log(line)
             SNAP.write_text(json.dumps(snap, indent=1))  # a cache for other commands; nothing diffs it any more
             with edit_state() as st:
