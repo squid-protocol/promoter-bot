@@ -1822,3 +1822,34 @@ def test_host_settings_come_from_the_config_file(tmp_path, monkeypatch):
     assert mod.DASH_REPO == "acme/squid-bot" and mod.SELFSCAN_PY == "/opt/venv/bin/python"
     brief = mod.AGY_BRIEF.format(issue=1, wt="w", branch="b", task="t", repo=mod.REPO, repo_dir=mod.V6, python=mod.SELFSCAN_PY)
     assert "/data/proj/repo" in brief and "/opt/venv/bin/python -m pytest" in brief
+
+
+def _procs(loop_age=55, target=False):
+    loop = "/bin/bash -c source snap.sh && eval 'until ! pgrep -f \"evidence.py prove\" >/dev/null; do sleep 15; done'"
+    p = {100: (1, "python3 churn _run 5053-x", 300), 101: (100, "/usr/bin/claude -p go", 300),
+         102: (101, loop, loop_age), 103: (102, "sleep 15", 0.1)}
+    if target:
+        p[200] = (1, "python3 tools/evidence.py prove", 10)
+    return p
+
+
+def test_stuck_workers_flags_a_wait_loop_that_matches_only_itself(churn):
+    st = {"running": [{"run_id": "5053-x", "pid": 100}]}
+    [(key, _, msg)] = churn.stuck_workers(st, _procs(), transcript=lambda pid: None)
+    assert key == "stuck-5053-x" and "kill 102" in msg
+    assert churn.stuck_workers(st, _procs(target=True), transcript=lambda pid: None) == []  # really waiting
+    assert churn.stuck_workers(st, _procs(loop_age=5), transcript=lambda pid: None) == []  # too young to judge
+    assert churn.stuck_workers({"running": [{"pid": 100}]}, _procs(), transcript=lambda pid: None) == []  # agy/legacy
+
+
+def test_stuck_workers_flags_a_silent_transcript(churn, tmp_path):
+    import os
+    t = tmp_path / "s.jsonl"
+    t.write_text("{}")
+    st = {"running": [{"run_id": "5053-x", "pid": 100}]}
+    procs = _procs(target=True)
+    assert churn.stuck_workers(st, procs, transcript=lambda pid: t) == []
+    old = churn.time.time() - 50 * 60
+    os.utime(t, (old, old))
+    [(_, _, msg)] = churn.stuck_workers(st, procs, transcript=lambda pid: t)
+    assert "50 min" in msg and "evidence.py prove" in msg

@@ -2234,11 +2234,89 @@ def guarded_tick(fn) -> int:
     return rc
 
 
-def watchdog_checks(gh_ok=None, timer_active=None) -> list[tuple[str, str, str]]:
+STUCK_LOOP_MIN = 20  # a pgrep wait loop this old whose target is gone waits forever
+WORKER_SILENT_MIN = 45  # no transcript write for this long: the worker sits inside one tool call
+WAIT_LOOP_RE = re.compile(r"""\b(?:while|until)\b.*?\bpgrep\s+-f\s+(?:"([^"]+)"|'([^']+)'|(\S+))""")
+
+
+def proc_table() -> dict[int, tuple[int, str, float]]:
+    """{pid: (ppid, cmdline, age in minutes)} for every process we can read."""
+    tck, up = os.sysconf("SC_CLK_TCK"), float(Path("/proc/uptime").read_text().split()[0])
+    out = {}
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            f = (p / "stat").read_text().rsplit(")", 1)[1].split()
+            cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+            out[int(p.name)] = (int(f[1]), cmd, (up - int(f[19]) / tck) / 60)
+    return out
+
+
+def session_transcript(claude_pid: int) -> Path | None:
+    """The live transcript of a claude process, from its ~/.claude/sessions registry entry."""
+    with contextlib.suppress(OSError, ValueError, KeyError):
+        s = json.loads((Path.home() / ".claude/sessions" / f"{claude_pid}.json").read_text())
+        return Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", s["cwd"]) / f"{s['sessionId']}.jsonl"
+    return None
+
+
+def stuck_workers(state: dict, procs: dict | None = None, transcript=session_transcript) -> list[tuple[str, str, str]]:
+    """Live churn workers that wait on nothing (2026-10-17: #5053 and #4628 each spun ~1 h in
+    `until ! pgrep -f "evidence.py prove"`, a loop that matches its own command line), or whose transcript has gone
+    silent. Alert only: killing the loop is the owner's call."""
+    runs = [r for r in state.get("running", []) if r.get("run_id") and pid_alive(r.get("pid"))]
+    if not runs:
+        return []
+    procs = procs if procs is not None else proc_table()
+    kids = collections.defaultdict(list)
+    for pid, (ppid, _, _) in procs.items():
+        kids[ppid].append(pid)
+    out = []
+    for r in runs:
+        tree, todo = [], list(kids[r["pid"]])
+        while todo:
+            tree.append(todo.pop())
+            todo += kids[tree[-1]]
+        found = []
+        for pid in tree:
+            _, cmd, age = procs[pid]
+            m = WAIT_LOOP_RE.search(cmd)
+            if not m or age < STUCK_LOOP_MIN:
+                continue
+            pat = next(g for g in m.groups() if g)
+            try:
+                hit = re.compile(pat).search
+            except re.error:
+                hit = lambda c, pat=pat: pat in c
+            targets = [q for q, (_, c, _) in procs.items() if "pgrep" not in c and hit(c)]
+            if not targets:
+                found.append(f"pid {pid} has waited {age:.0f} min on `pgrep -f \"{pat}\"`, but no such process runs "
+                             f"(the loop matches itself). `kill {pid}` lets the worker go on.")
+        silent = None
+        for pid in tree:
+            t = transcript(pid) if "claude" in procs[pid][1].split(" ", 1)[0] else None
+            if t and t.exists():
+                silent = (time.time() - t.stat().st_mtime) / 60
+                break
+        if found or (silent is not None and silent >= WORKER_SILENT_MIN):
+            shells = [procs[p][1].split("&& eval ", 1)[-1][:160] for p in tree if "eval " in procs[p][1]]
+            msg = " ".join(found) or (f"No transcript write for {silent:.0f} min; it sits inside one tool call: "
+                                      + ("; ".join(shells) or "no shell running"))
+            out.append((f"stuck-{r['run_id']}", f"churn: worker {r['run_id']} looks stuck", msg))
+    return out
+
+
+def watchdog_checks(gh_ok=None, timer_active=None, state=None) -> list[tuple[str, str, str]]:
     """(key, title, message) for each problem the gate cannot report itself."""
     if STOP.exists():
         return []  # stopped on purpose
     out = []
+    if state is None:
+        with contextlib.suppress(Exception):
+            state = load_state()
+    with contextlib.suppress(OSError, ValueError):
+        out += stuck_workers(state or {})
     age = (time.time() - HEARTBEAT.stat().st_mtime) / 60 if HEARTBEAT.exists() else None
     if age is not None and age > WATCHDOG_STALE_MIN:
         out.append(("stale", f"churn: no gate tick for {age / 60:.1f} h",
@@ -2258,7 +2336,7 @@ def watchdog_checks(gh_ok=None, timer_active=None) -> list[tuple[str, str, str]]
 def cmd_watchdog(a) -> int:
     for key, title, msg in watchdog_checks():
         notify(key, title, msg, priority="urgent" if key == "gh-auth" else "high", tags="warning")
-        log(f"watchdog: {title}", quiet=True)
+        log(f"watchdog: {title}" + (f": {msg}" if key.startswith("stuck-") else ""), quiet=not key.startswith("stuck-"))
     return 0
 
 
