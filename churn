@@ -1003,9 +1003,16 @@ def worker_slots(b: dict, running: int, max_workers: int = 2) -> int:
 
 
 # ---------------------------------------------------------------- workers
+# Every session churn starts gets the self-wait hook (2026-10-17: two workers spun ~1 h in a `pgrep -f` loop that
+# matched its own command line). It adds to the user's own hooks.
+SELF_WAIT_HOOK = Path(SELF).parent / "tools" / "block-self-wait.py"
+SESSION_SETTINGS = json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+    {"type": "command", "command": f"python3 {SELF_WAIT_HOOK}", "timeout": 10}]}]}})
+
+
 def claude_cmd(prompt: str, model: str, budget: float, resume: str | None = None, allowed: list[str] | None = None) -> list[str]:
     cmd = [CLAUDE, "-p", prompt, "--model", model, "--permission-mode", "auto", "--output-format", "json",
-           "--max-budget-usd", str(budget)]
+           "--max-budget-usd", str(budget), "--settings", SESSION_SETTINGS]
     if resume:
         cmd += ["--resume", resume]
     if allowed:
@@ -2236,7 +2243,11 @@ def guarded_tick(fn) -> int:
 
 STUCK_LOOP_MIN = 20  # a pgrep wait loop this old whose target is gone waits forever
 WORKER_SILENT_MIN = 45  # no transcript write for this long: the worker sits inside one tool call
-WAIT_LOOP_RE = re.compile(r"""\b(?:while|until)\b.*?\bpgrep\s+-f\s+(?:"([^"]+)"|'([^']+)'|(\S+))""")
+WAIT_LOOP_RE = re.compile(r"""\b(?:while|until)\b.*?\bpgrep\s+(?:-\S+\s+)*?-[A-Za-z]*f[A-Za-z]*\s+(?:-\S+\s+)*"""
+                          r"""(?:"([^"]+)"|'([^']+)'|([^\s;|&)]+))""")
+DEAD_LOOP_MIN = 10  # the gate's threshold; it acts on the second sighting, so a dead loop lives ~20-30 min at most
+DEAD_LOOP_RECHECK_MIN = 8
+DEAD_LOOPS = H / "churn-dead-loops.json"  # dead loops seen once: {pid: {first seen, loop start}}
 
 
 def proc_table() -> dict[int, tuple[int, str, float]]:
@@ -2261,50 +2272,91 @@ def session_transcript(claude_pid: int) -> Path | None:
     return None
 
 
-def stuck_workers(state: dict, procs: dict | None = None, transcript=session_transcript) -> list[tuple[str, str, str]]:
-    """Live churn workers that wait on nothing (2026-10-17: #5053 and #4628 each spun ~1 h in
-    `until ! pgrep -f "evidence.py prove"`, a loop that matches its own command line), or whose transcript has gone
-    silent. Alert only: killing the loop is the owner's call."""
-    runs = [r for r in state.get("running", []) if r.get("run_id") and pid_alive(r.get("pid"))]
-    if not runs:
-        return []
-    procs = procs if procs is not None else proc_table()
+def worker_trees(state: dict, procs: dict) -> dict[str, list[int]]:
+    """{run_id: descendant pids} for each live churn worker."""
     kids = collections.defaultdict(list)
     for pid, (ppid, _, _) in procs.items():
         kids[ppid].append(pid)
-    out = []
-    for r in runs:
+    out = {}
+    for r in state.get("running", []):
+        if not (r.get("run_id") and pid_alive(r.get("pid"))):
+            continue
         tree, todo = [], list(kids[r["pid"]])
         while todo:
             tree.append(todo.pop())
             todo += kids[tree[-1]]
-        found = []
+        out[r["run_id"]] = tree
+    return out
+
+
+def dead_wait_loops(state: dict, procs: dict, min_age: float = STUCK_LOOP_MIN) -> list[tuple[str, int, str, float]]:
+    """(run_id, pid, pattern, age min) for each worker shell looping on `pgrep -f PATTERN` at least min_age old while
+    no process but the loops themselves matches PATTERN (2026-10-17: #5053 and #4628 each spun ~1 h in
+    `until ! pgrep -f "evidence.py prove"`, a loop that matches its own command line)."""
+    out = []
+    for rid, tree in worker_trees(state, procs).items():
         for pid in tree:
             _, cmd, age = procs[pid]
             m = WAIT_LOOP_RE.search(cmd)
-            if not m or age < STUCK_LOOP_MIN:
+            if not m or age < min_age:
                 continue
             pat = next(g for g in m.groups() if g)
             try:
                 hit = re.compile(pat).search
             except re.error:
                 hit = lambda c, pat=pat: pat in c
-            targets = [q for q, (_, c, _) in procs.items() if "pgrep" not in c and hit(c)]
-            if not targets:
-                found.append(f"pid {pid} has waited {age:.0f} min on `pgrep -f \"{pat}\"`, but no such process runs "
-                             f"(the loop matches itself). `kill {pid}` lets the worker go on.")
+            if not any("pgrep" not in c and hit(c) for _, c, _ in procs.values()):
+                out.append((rid, pid, pat, age))
+    return out
+
+
+def stuck_workers(state: dict, procs: dict | None = None, transcript=session_transcript) -> list[tuple[str, str, str]]:
+    """Live churn workers that wait on nothing (dead_wait_loops), or whose transcript has gone silent. Alert only:
+    the gate ends dead loops itself (end_dead_wait_loops)."""
+    if not any(r.get("run_id") and pid_alive(r.get("pid")) for r in state.get("running", [])):
+        return []
+    procs = procs if procs is not None else proc_table()
+    dead = collections.defaultdict(list)
+    for rid, pid, pat, age in dead_wait_loops(state, procs):
+        dead[rid].append(f"pid {pid} has waited {age:.0f} min on `pgrep -f \"{pat}\"`, but no such process runs "
+                         f"(the loop matches itself). `kill {pid}` lets the worker go on.")
+    out = []
+    for rid, tree in worker_trees(state, procs).items():
         silent = None
         for pid in tree:
             t = transcript(pid) if "claude" in procs[pid][1].split(" ", 1)[0] else None
             if t and t.exists():
                 silent = (time.time() - t.stat().st_mtime) / 60
                 break
-        if found or (silent is not None and silent >= WORKER_SILENT_MIN):
+        if dead[rid] or (silent is not None and silent >= WORKER_SILENT_MIN):
             shells = [procs[p][1].split("&& eval ", 1)[-1][:160] for p in tree if "eval " in procs[p][1]]
-            msg = " ".join(found) or (f"No transcript write for {silent:.0f} min; it sits inside one tool call: "
-                                      + ("; ".join(shells) or "no shell running"))
-            out.append((f"stuck-{r['run_id']}", f"churn: worker {r['run_id']} looks stuck", msg))
+            msg = " ".join(dead[rid]) or (f"No transcript write for {silent:.0f} min; it sits inside one tool call: "
+                                          + ("; ".join(shells) or "no shell running"))
+            out.append((f"stuck-{rid}", f"churn: worker {rid} looks stuck", msg))
     return out
+
+
+def end_dead_wait_loops(state: dict, procs: dict | None = None, kill=os.kill) -> list[str]:
+    """The gate's half (owner 2026-10-17): a dead wait loop seen on two ticks at least DEAD_LOOP_RECHECK_MIN apart is
+    ended with SIGTERM. Only the loop's shell: the worker gets its tool call back and goes on. Returns log lines."""
+    procs = procs if procs is not None else proc_table()
+    seen = {}
+    with contextlib.suppress(OSError, ValueError):
+        seen = json.loads(DEAD_LOOPS.read_text())
+    t, keep, lines = time.time(), {}, []
+    for rid, pid, pat, age in dead_wait_loops(state, procs, min_age=DEAD_LOOP_MIN):
+        start, prev = t - age * 60, seen.get(str(pid)) or {}
+        first = prev["first"] if abs(prev.get("start", 0) - start) < 120 else t  # a reused pid is a new loop
+        if t - first < DEAD_LOOP_RECHECK_MIN * 60:
+            keep[str(pid)] = {"first": first, "start": start}
+            continue
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, 15)
+            lines.append(f"ended a dead wait loop in {rid}: pid {pid} waited {age:.0f} min on `pgrep -f \"{pat}\"` "
+                         "with no such process (it matched itself); the worker goes on")
+    with contextlib.suppress(OSError):
+        DEAD_LOOPS.write_text(json.dumps(keep))
+    return lines
 
 
 def watchdog_checks(gh_ok=None, timer_active=None, state=None) -> list[tuple[str, str, str]]:
@@ -3321,6 +3373,9 @@ def cmd_tick(a) -> int:
         if not a.dry_run:
             with contextlib.suppress(Exception):  # an alert bug must never stop the gate
                 gate_alerts(state, b, snap)
+            with contextlib.suppress(Exception):
+                for line in end_dead_wait_loops(state):
+                    log(line)
             SNAP.write_text(json.dumps(snap, indent=1))  # a cache for other commands; nothing diffs it any more
             with edit_state() as st:
                 for note in settle_closed(st, snap):

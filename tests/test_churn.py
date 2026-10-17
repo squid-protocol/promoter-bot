@@ -1853,3 +1853,54 @@ def test_stuck_workers_flags_a_silent_transcript(churn, tmp_path):
     os.utime(t, (old, old))
     [(_, _, msg)] = churn.stuck_workers(st, procs, transcript=lambda pid: t)
     assert "50 min" in msg and "evidence.py prove" in msg
+
+
+def test_gate_ends_a_dead_wait_loop_on_its_second_sighting_only(churn, monkeypatch):
+    st = {"running": [{"run_id": "5053-x", "pid": 100}]}
+    killed, clock = [], [1_000_000.0]
+    monkeypatch.setattr(churn.time, "time", lambda: clock[0])
+    end = lambda procs: churn.end_dead_wait_loops(st, procs, kill=lambda pid, sig: killed.append(pid))
+    assert end(_procs(loop_age=12)) == [] and killed == []  # first sighting: remembered
+    clock[0] += 9 * 60
+    [line] = end(_procs(loop_age=21))
+    assert killed == [102] and "5053-x" in line and "evidence.py prove" in line
+    assert end(_procs(loop_age=5)) == []  # too young
+    killed.clear()
+    end(_procs(loop_age=12))
+    clock[0] += 9 * 60
+    assert end(_procs(loop_age=21, target=True)) == [] and killed == []  # the job came back: a real wait
+
+
+def test_gate_treats_a_reused_pid_as_a_new_loop(churn, monkeypatch):
+    st = {"running": [{"run_id": "5053-x", "pid": 100}]}
+    killed, clock = [], [1_000_000.0]
+    monkeypatch.setattr(churn.time, "time", lambda: clock[0])
+    churn.end_dead_wait_loops(st, _procs(loop_age=12), kill=lambda pid, sig: killed.append(pid))
+    clock[0] += 9 * 60
+    churn.end_dead_wait_loops(st, _procs(loop_age=11), kill=lambda pid, sig: killed.append(pid))  # started 8 min later
+    assert killed == []
+
+
+def test_every_churn_session_gets_the_self_wait_hook(churn):
+    cmd = churn.claude_cmd("go", "sonnet", 1.0)
+    hooks = json.loads(cmd[cmd.index("--settings") + 1])["hooks"]["PreToolUse"]
+    assert hooks[0]["matcher"] == "Bash" and str(churn.SELF_WAIT_HOOK) in hooks[0]["hooks"][0]["command"]
+    assert churn.SELF_WAIT_HOOK.exists()
+
+
+@pytest.mark.parametrize(("cmd", "blocked"), [
+    ('until ! pgrep -f "evidence.py prove" >/dev/null; do sleep 15; done; tail ev.log', True),
+    ('while pgrep -f "det_mutation.py run" >/dev/null; do sleep 30; done', True),
+    ("while pgrep -af det_mutation.py; do sleep 30; done", True),
+    ('while ps aux | grep -q "heavy-run"; do sleep 5; done', True),
+    ('until ! pgrep -f "[e]vidence.py prove" >/dev/null; do sleep 15; done', False),
+    ("while kill -0 $pid 2>/dev/null; do sleep 15; done", False),
+    ('pgrep -af "evidence.py prove"', False),
+    ("while pgrep -x java >/dev/null; do sleep 5; done", False),
+    ('until ! pgrep -f "evidence.py prove"; do sleep 15; done # self-wait-ok', False),
+])
+def test_self_wait_hook_blocks_only_loops_that_match_themselves(cmd, blocked):
+    hook = SCRIPT.parent / "tools" / "block-self-wait.py"
+    out = subprocess.run(["python3", str(hook)], input=json.dumps({"tool_input": {"command": cmd}}),
+                         capture_output=True, text=True, check=True).stdout
+    assert ('"deny"' in out) is blocked
