@@ -1489,14 +1489,27 @@ def test_refill_asks_the_tick_then_falls_back_to_callgraph(churn, monkeypatch):
     assert churn.refill(churn.load_state(), {}) == ("ask", [])  # nothing for the rules: stage 2
     put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now())})
     assert churn.refill(churn.load_state(), {}) == ("wait", [])  # the asked tick gets its grace hour
-    put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now() - churn.dt.timedelta(hours=2))})
+    put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now() - churn.dt.timedelta(minutes=20))})
     stage, items = churn.refill(churn.load_state(), {})
     assert stage == "callgraph" and [x["issue"] for x in items] == [3782]
     monkeypatch.setattr(churn, "open_issues", lambda: [])  # every call-graph child taken: the standing epic item
-    put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now() - churn.dt.timedelta(hours=2))})
+    put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now() - churn.dt.timedelta(minutes=20))})
     stage, items = churn.refill(churn.load_state(), {})
     assert [x["issue"] for x in items] == [churn.CALLGRAPH_EPIC] and "call-graph function work" in items[0]["task"]
     assert churn.refill(churn.load_state(), {})[1] == []  # never a second epic item while one is queued
+
+
+def test_refill_asks_every_30_min_only_while_nothing_is_launchable(churn, monkeypatch):  # owner 2026-10-17
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
+    monkeypatch.setattr(churn, "open_issues", lambda: [_iss(3782, "scope:infra", title="Call-graph reference: Go")])
+    ago = lambda **kw: {"agent_t": churn.iso(churn.now() - churn.dt.timedelta(**kw))}  # noqa: E731
+    put(churn, queue=[], max_workers=2, refill=ago(minutes=40))
+    assert churn.refill(churn.load_state(), {}) == ("ask", [])  # idle slots: no 6 h wait
+    put(churn, queue=[], max_workers=2, refill=ago(minutes=10))
+    assert churn.refill(churn.load_state(), {}) == ("wait", [])  # a 15 min grace for the asked tick
+    item = {"issue": 9, "model": "sonnet", "task": "x", "needs_owner": False}
+    put(churn, queue=[item], max_workers=2, refill=ago(minutes=40))
+    assert churn.refill(churn.load_state(), {})[0] == "wait"  # something launchable: the hourly grace as before
 
 
 def test_refill_respects_off_paused_and_the_cooldown_log(churn, monkeypatch):

@@ -3026,7 +3026,10 @@ def model_tick(reasons: list[str], model: str, state: dict, b: dict) -> dict:
 #     at most every agent_every_h;
 #  3. still dry an hour after that ask: call-graph work (epic #3772, effectively endless): its open child issues,
 #     else one standing item on the epic.
-REFILL_DEFAULT = {"enabled": True, "batch": 8, "cooldown_h": 12, "agent_every_h": 6, "agent_grace_h": 1}
+# Owner 2026-10-17: with NOTHING launchable (slots idle) stage 2 asks every agent_empty_min with an agent_empty_grace_min
+# grace, so stage 3 still gets its turn (2026-10-17 02:30-04:20Z the slots sat idle ~2 h waiting on the 6 h ask).
+REFILL_DEFAULT = {"enabled": True, "batch": 8, "cooldown_h": 12, "agent_every_h": 6, "agent_grace_h": 1,
+                  "agent_empty_min": 30, "agent_empty_grace_min": 15}
 CALLGRAPH_EPIC = 3772
 CALLGRAPH_TASK = (f"#{CALLGRAPH_EPIC} call-graph function work: pick the language whose call graph agrees least with its "
                   "compiler reference (callgraph-* skills, .claude/agents/callgraph-triage-scout.md), fix one class of "
@@ -3135,9 +3138,15 @@ def refill(state: dict, snap: dict | None, dry_run: bool = False, force: bool = 
     stage, items = "rules", [refill_item(i) for i in refill_candidates(state, issues, in_pr)]
     if not items:
         asked = parse_iso((state.get("refill") or {}).get("agent_t"))
-        if not asked or now() - asked >= dt.timedelta(hours=float(cfg["agent_every_h"])):
+        if launchable(state, snap) == 0:
+            every = dt.timedelta(minutes=float(cfg["agent_empty_min"]))
+            grace = dt.timedelta(minutes=float(cfg["agent_empty_grace_min"]))
+        else:
+            every = dt.timedelta(hours=float(cfg["agent_every_h"]))
+            grace = dt.timedelta(hours=float(cfg["agent_grace_h"]))
+        if not asked or now() - asked >= every:
             return "ask", []
-        if now() - asked < dt.timedelta(hours=float(cfg["agent_grace_h"])):
+        if now() - asked < grace:
             return "wait", []  # the tick that was asked may still be filing issues
         stage = "callgraph"
         items = [refill_item(i) for i in refill_candidates(state, issues, in_pr, callgraph=True)]
