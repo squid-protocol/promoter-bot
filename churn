@@ -47,7 +47,8 @@ from pathlib import Path
 
 # Machine-specific settings (paths, repository) live in a JSON file outside the code, so the code carries no host details:
 # {"project_root": "...", "state_dir": "...", "repo_dir": "...", "worktree_dir": "...", "repo": "org/name",
-#  "dashboard_repo": "org/name", "tick_cwd": "...", "python": ".../bin/python"}; anything missing gets a default below.
+#  "dashboard_repo": "org/name", "tick_cwd": "...", "python": ".../bin/python",
+#  "bot_prs": {"auto/branch-prefix": "workflow-that-rebuilds-it.yml"}}; anything missing gets a default below.
 CONFIG_FILE = Path(os.environ.get("PROMOTER_BOT_CONFIG", str(Path.home() / ".config/promoter-bot/config.json")))
 
 
@@ -152,7 +153,7 @@ LANES = ("normal", "ci", "backfill")
 # their PRs add ~nothing to the shared 20-job runner pool. Only the batched tag + gitgalaxy pin bump touches gitgalaxy CI.
 CRUCIBLE_REPOS = {"estate-crucible", "cics-crucible"}
 QUEUE_KEYS = {"issue", "model", "task", "needs_owner", "backend", "pr", "after_prs", "allow_workflows", "agy_step", "lane", "repo", "after_merge",
-              "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "scope", "promoted"}
+              "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "scope", "promoted", "rescue"}
 # Owner 2026-10-15: follow-ups ("Siblings of #X" rounds) were jumping the line ahead of the work they came from. Normal
 # items now launch by tier, then queue position: each era's core functionality, then customer-facing items, then
 # translation scores, then follow-ups. `--front` only reorders within a tier. The tier comes from the issue's
@@ -2336,6 +2337,70 @@ def stuck_workers(state: dict, procs: dict | None = None, transcript=session_tra
     return out
 
 
+BOT_PRS = H / "churn-bot-prs.json"  # what tend_bot_prs did per bot PR: {n: {head, rerun, dispatched, paged}}
+BOT_PR_MAX_AGE_H = 24
+
+
+def tend_bot_prs(gh=None, sh=None) -> list[str]:
+    """Bot PRs (a workflow's PR from a branch prefix in config `bot_prs`) have no worker and no shepherd label, so
+    nothing looked after them: #5317 (evidence refresh) sat 13 h on 2026-10-17 after a 15.2 s timing flake failed
+    ground-truth and blocked its auto-merge, then main moved and it conflicted. Per PR head, once each (owner
+    2026-10-17): conflicting or older than BOT_PR_MAX_AGE_H -> dispatch its workflow on main (it rebuilds the PR from
+    current main; skipped while a run is queued or running); a failed check -> rerun the failed jobs; still red after
+    that -> page the owner. Returns log lines."""
+    prefixes = _CFG.get("bot_prs") or {}
+    if not prefixes:
+        return []
+    gh, sh = gh or gh_json, sh or run
+    seen = {}
+    with contextlib.suppress(OSError, ValueError):
+        seen = json.loads(BOT_PRS.read_text())
+    keep, lines, t = {}, [], now()
+    for pr in gh(f"repos/{REPO}/pulls?state=open&per_page=100"):
+        ref = pr["head"]["ref"]
+        wf = next((w for pre, w in prefixes.items() if ref.startswith(pre)), None)
+        if not wf:
+            continue
+        n, head = pr["number"], pr["head"]["sha"]
+        mem = seen.get(str(n)) or {}
+        mem = mem if mem.get("head") == head else {"head": head}
+        keep[str(n)] = mem
+        if mem.get("dispatched"):
+            continue  # its rebuild is on the way: a new head starts over
+        full = gh(f"repos/{REPO}/pulls/{n}")
+        if full.get("mergeable_state") in (None, "unknown"):
+            continue  # GitHub computes it lazily; the first pass on #5317 read it unknown and reran a conflicting PR
+        age_h = (t - parse_iso(pr["created_at"])).total_seconds() / 3600
+        if full.get("mergeable_state") == "dirty" or age_h > BOT_PR_MAX_AGE_H:
+            if any(gh(f"repos/{REPO}/actions/workflows/{wf}/runs?status={st}&per_page=5").get("workflow_runs")
+                   for st in ("queued", "in_progress")):
+                continue
+            why = "conflicts with main" if full.get("mergeable_state") == "dirty" else f"open {age_h:.0f} h"
+            if sh(["gh", "workflow", "run", wf, "-R", REPO, "--ref", "main"]).returncode == 0:
+                mem["dispatched"] = iso(t)
+                lines.append(f"bot PR #{n} {why}: dispatched {wf} on main to rebuild it")
+            continue
+        failed = [r for r in gh(f"repos/{REPO}/actions/runs?head_sha={head}&per_page=50").get("workflow_runs", [])
+                  if r.get("conclusion") in ("failure", "timed_out")]
+        names = ", ".join(r.get("name", "?") for r in failed)[:300]
+        if not failed:
+            continue
+        if not mem.get("rerun"):
+            for r in failed:
+                sh(["gh", "run", "rerun", str(r["id"]), "--failed", "-R", REPO])
+            mem["rerun"] = iso(t)
+            lines.append(f"bot PR #{n}: reran the failed jobs once ({names})")
+        elif not mem.get("paged") and all(r.get("run_attempt", 1) > 1 for r in failed):
+            mem["paged"] = iso(t)
+            notify(f"bot-pr-{n}-{head[:8]}", f"churn: bot PR #{n} still red",
+                   f"Bot PR #{n} ({ref}) is still red after one rerun: {names}. Its auto-merge stays blocked until "
+                   "that is fixed.", priority="high", tags="warning")
+            lines.append(f"bot PR #{n}: still red after a rerun; paged the owner")
+    with contextlib.suppress(OSError):
+        BOT_PRS.write_text(json.dumps(keep))
+    return lines
+
+
 def end_dead_wait_loops(state: dict, procs: dict | None = None, kill=os.kill) -> list[str]:
     """The gate's half (owner 2026-10-17): a dead wait loop seen on two ticks at least DEAD_LOOP_RECHECK_MIN apart is
     ended with SIGTERM. Only the loop's shell: the worker gets its tool call back and goes on. Returns log lines."""
@@ -2771,6 +2836,32 @@ def recent_fix_runs(pr: int, issue: int) -> int:
     return n
 
 
+RESCUE_AT = 2  # Sonnet fix runs in the window before the one Opus rescue run (owner 2026-10-17)
+RESCUE_TAG = "RESCUE"
+
+
+def was_rescued(pr: int, issue: int) -> bool:
+    """An Opus rescue run for this PR has started (ever: one rescue per PR)."""
+    return any(re.match(rf"{RESCUE_TAG} \(Fix PR #{pr}\b", _run_meta(d.name).get("task") or "") for d in RUNS.glob(f"{issue}-*"))
+
+
+def rescue_task(n, branch: str | None, issue: int, loops: int, why: list[str]) -> str:
+    """The Opus rescue brief: judge the PR before touching it, then one verdict (owner 2026-10-17)."""
+    return (f"{RESCUE_TAG} (Fix PR #{n}, Opus) ({branch}): {loops} fix runs in {FIX_LOOP_WINDOW_H} h and it is back"
+            f"{' (' + ' + '.join(why) + ')' if why else ''}. Owner OK (2026-10-17): a rescue run may close this PR and "
+            f"edit issue #{issue}. FIRST judge, before changing anything: read issue #{issue}, the PR's diff and size, "
+            f"every review note and send-back reason, its CI failures and the earlier runs' reports "
+            f"({RUNS}/{issue}-*/report.md). Then end your report with `## Rescue verdict: SAVE|SLICE|RESTART|OWNER` and "
+            f"why. SAVE: the fix is tractable; do it now on the PR's branch (merge origin/main, never rebase; gates; "
+            f"push). SLICE: sound but too big (5-file rule); cut this PR to a first self-contained slice of <= 5 "
+            f"hand-written files, push, and list the rest under **Remaining slices**. RESTART: the approach is wrong; "
+            f"close the PR with a comment saying why, then edit issue #{issue}: append `## Plan (Opus rescue of PR "
+            f"#{n})` with ordered steps, each one Sonnet-sized PR of <= 5 hand-written files with its own acceptance "
+            f"check, the pitfalls the failed attempts hit, and what to reuse from the closed branch; list the same "
+            f"steps under **Remaining slices**. OWNER: only for a ruling only the owner can make; ask one plain question. "
+            f"There is no second rescue: if this fails again the PR goes to the owner.")
+
+
 def queue_pr_fixes(state: dict, snap: dict, triage=None) -> list[str]:
     """Owner 2026-10-13: #5038/#5041 sat conflicting for hours because a tick with no free slot only logged them and
     stuck_seen then hid them. Any watched open PR that is conflicting (dirty) or shepherd:needs-fix, with no live worker
@@ -2805,16 +2896,22 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None) -> list[str]:
         m = re.match(r"churn/(\d+)-", v.get("branch", ""))
         issue = issue_of.get(int(n)) or (int(m.group(1)) if m else int(n))
         loops = recent_fix_runs(int(n), issue)
-        if loops >= FIX_LOOP_CAP:  # 2026-10-16: chains of 3+ workers chased one PR's CI timings; the owner decides
-            why.append(f"{loops} fix runs in {FIX_LOOP_WINDOW_H} h, owner decides")
+        # Owner 2026-10-17: two Sonnet fix runs, then ONE Opus rescue that judges the PR (save / slice / restart /
+        # owner); a PR that fails again after its rescue goes to the owner. Before: the owner at 3 runs, no rescue.
+        rescued = loops >= RESCUE_AT and was_rescued(int(n), issue)
+        rescue = loops >= RESCUE_AT and not rescued
+        if rescued:  # 2026-10-16: chains of 3+ workers chased one PR's CI timings; the owner decides
+            why.append(f"{loops} fix runs in {FIX_LOOP_WINDOW_H} h and an Opus rescue already ran, owner decides")
         note = next((str(p.get("note") or "") for p in state.get("prs", []) if isinstance(p, dict) and pr_num(p) == int(n)), "")
-        task = (f"Fix PR #{n} ({v.get('branch')}): {' + '.join(why)}. Work on the PR's own branch: merge origin/main "
+        review = (f" The review at this head asked for: {note[:400]} (This item comes back every tick until the head "
+                  f"changes: to defer it use `churn queue wait`, never `churn queue rm`.)" if sent_back and note else "")
+        task = (rescue_task(n, v.get("branch"), issue, loops, why) + review if rescue else
+                f"Fix PR #{n} ({v.get('branch')}): {' + '.join(why)}. Work on the PR's own branch: merge origin/main "
                 f"(never rebase), resolve (regenerate generated docs, never hand-merge them), read any red check and fix "
-                f"what is real, gates, push; report the PR's CI."
-                + (f" The review at this head asked for: {note[:400]} (This item comes back every tick until the head "
-                   f"changes: to defer it use `churn queue wait`, never `churn queue rm`.)" if sent_back and note else ""))
-        state.setdefault("queue", []).insert(0, {"issue": issue, "pr": int(n), "model": "sonnet", "task": task,
-                                                 "needs_owner": loops >= FIX_LOOP_CAP, "auto": "pr-fix",
+                f"what is real, gates, push; report the PR's CI." + review)
+        state.setdefault("queue", []).insert(0, {"issue": issue, "pr": int(n), "model": "opus" if rescue else "sonnet",
+                                                 "task": task, "needs_owner": rescued, "auto": "pr-fix",
+                                                 **({"rescue": True} if rescue else {}),
                                                  **({"head": v["head"]} if v.get("head") else {})})
         added.append(f"#{n}")
     return added
@@ -3375,6 +3472,9 @@ def cmd_tick(a) -> int:
                 gate_alerts(state, b, snap)
             with contextlib.suppress(Exception):
                 for line in end_dead_wait_loops(state):
+                    log(line)
+            with contextlib.suppress(Exception):
+                for line in tend_bot_prs():
                     log(line)
             SNAP.write_text(json.dumps(snap, indent=1))  # a cache for other commands; nothing diffs it any more
             with edit_state() as st:
