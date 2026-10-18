@@ -2367,3 +2367,52 @@ def test_worker_will_not_start_on_an_issue_someone_else_holds(churn, gh, monkeyp
     monkeypatch.setattr(churn, "crucible_repo_of", lambda n: None)
     with pytest.raises(SystemExit, match="claimed by box2"):
         churn.cmd_worker(a)
+
+
+def gh_issue(n, labels=(), ms=None):
+    return {"number": n, "title": "t", "labels": [{"name": x} for x in ("scope:core", *labels)], "assignees": [],
+            "milestone": {"title": ms} if ms else None}
+
+
+def test_host_without_a_host_section_takes_everything_and_every_role(churn):
+    assert churn.HOST == {}
+    assert churn.host_skips(gh_issue(1, ["needs:db2"], "Aerospace")) is None
+    assert all(churn.host_role(r) for r in churn.HOST_ROLES)
+
+
+def test_host_lanes_milestones_labels_and_hand_routing(churn, monkeypatch):
+    monkeypatch.setattr(churn, "HOST", {"milestones": ["Aerospace"], "labels": ["docs"]})
+    assert churn.host_skips(gh_issue(1, ms="Aerospace")) is None
+    assert churn.host_skips(gh_issue(2, ["docs"])) is None
+    assert churn.host_skips(gh_issue(3, ms="Side Quests")) == "outside this host's lanes"
+    assert churn.host_skips(gh_issue(4, [f"lane:{churn.HOST_ID}"], "Side Quests")) is None  # routed here by hand
+    assert churn.host_skips(gh_issue(5, ["lane:box2"], "Aerospace")) == "routed to box2"
+
+
+def test_host_capabilities_and_excluded_milestones(churn, monkeypatch):
+    monkeypatch.setattr(churn, "HOST", {"capabilities": ["docker"], "exclude_milestones": ["Aerospace"]})
+    assert churn.host_skips(gh_issue(1, ["needs:docker"])) is None
+    assert churn.host_skips(gh_issue(2, ["needs:db2", "needs:corpus"])) == "needs corpus, db2"
+    assert churn.host_skips(gh_issue(3, ms="Aerospace")) == "milestone Aerospace is another host's"
+    assert churn.host_skips(gh_issue(4, [f"lane:{churn.HOST_ID}", "needs:db2"])) == "needs db2"  # routing can't add a box
+
+
+def test_host_roles_limit_the_one_host_jobs(churn, monkeypatch):
+    monkeypatch.setattr(churn, "HOST", {"roles": ["retro"]})
+    assert churn.host_role("retro") and not churn.host_role("bot_prs") and not churn.host_role("main_red")
+    monkeypatch.setattr(churn, "HOST", {"roles": []})
+    monkeypatch.setattr(churn, "retro_due", lambda st: pytest.fail("a host without the retro role never asks"))
+    assert churn.retro_lane({"verdict": "GREEN"}, {}) == []
+
+
+def test_refill_queues_only_this_hosts_lanes_and_no_callgraph_fallback(churn, monkeypatch):
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
+    monkeypatch.setattr(churn, "recently_worked", lambda n, h: False)
+    monkeypatch.setattr(churn, "HOST", {"milestones": ["Aerospace"], "capabilities": []})
+    issues = [gh_issue(1, ms="Aerospace"), gh_issue(2, ms="Side Quests"), gh_issue(3, ["needs:db2"], "Aerospace")]
+    assert [i["number"] for i in churn.refill_candidates(churn.load_state(), issues, set())] == [1]
+    monkeypatch.setattr(churn, "open_issues", lambda: [gh_issue(2, ms="Side Quests")])
+    put(churn, refill={"agent_t": "2026-01-01T00:00Z"})
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "agent_every_h", 10 ** 6)
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "agent_empty_min", 10 ** 8)
+    assert churn.refill(churn.load_state(), {}, force=True) == ("callgraph", [])  # not the standing call-graph epic

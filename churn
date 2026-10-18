@@ -50,8 +50,9 @@ from pathlib import Path
 # Machine-specific settings (paths, repository) live in a JSON file outside the code, so the code carries no host details:
 # {"project_root": "...", "state_dir": "...", "repo_dir": "...", "worktree_dir": "...", "repo": "org/name",
 #  "dashboard_repo": "org/name", "tick_cwd": "...", "python": ".../bin/python",
-#  "bot_prs": {"auto/branch-prefix": "workflow-that-rebuilds-it.yml"}, "host_id": "box1"}; anything missing gets a
-#  default below.
+#  "bot_prs": {"auto/branch-prefix": "workflow-that-rebuilds-it.yml"}, "host_id": "box1",
+#  "host": {"milestones": [...], "exclude_milestones": [...], "labels": [...], "capabilities": [...], "roles": [...]}};
+#  anything missing gets a default below (no "host" section = this host takes everything and does every role).
 CONFIG_FILE = Path(os.environ.get("PROMOTER_BOT_CONFIG", str(Path.home() / ".config/promoter-bot/config.json")))
 
 
@@ -81,6 +82,8 @@ REPO = _CFG.get("repo", "your-org/your-repo")
 ORG = REPO.split("/")[0]
 TICK_CWD = Path(_CFG.get("tick_cwd", str(Path.home())))  # where tick sessions start (it decides which memory loads)
 CLAUDE = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
+HOST = _CFG.get("host") or {}
+HOST_ROLES = ("bot_prs", "retro", "main_red")  # jobs one host does for all; others leave them out of host.roles
 # This host's name in `claim:<host_id>` labels. The repo may be public, so the default is a hash, not the hostname.
 HOST_ID = _CFG.get("host_id") or "h" + hashlib.sha1(socket.gethostname().encode()).hexdigest()[:6]
 SELF = str(Path(__file__).resolve())
@@ -1663,6 +1666,8 @@ def retro_data(state: dict, since: dt.datetime, runs_dir: Path | None = None, lo
 
 def retro_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
     """Launch the weekly retro as a normal plan worker (it takes a slot) when it is due and a slot is free."""
+    if not host_role("retro"):
+        return []
     state = load_state()
     ok, _ = retro_due(state)
     if not ok or state.get("workers_paused") or b.get("verdict") != "GREEN":
@@ -3701,8 +3706,8 @@ def refill_candidates(state: dict, issues: list[dict], in_pr: set[int], callgrap
             continue  # frontier waits for the owner; unlabelled goes to stage 2
         if recently_worked(i["number"], float(cfg["cooldown_h"])):
             continue
-        if foreign_claim(i):
-            continue  # a person or another host has it
+        if foreign_claim(i) or host_skips(i):
+            continue  # a person or another host has it, or it is not this host's kind of work
         out.append(i)
 
     def rank(i):
@@ -3739,7 +3744,7 @@ def refill(state: dict, snap: dict | None, dry_run: bool = False, force: bool = 
         stage = "callgraph"
         items = [refill_item(i) for i in refill_candidates(state, issues, in_pr, callgraph=True)]
         if not items and not any(x.get("issue") == CALLGRAPH_EPIC for x in state.get("queue", [])) \
-                and not recently_worked(CALLGRAPH_EPIC, 1):
+                and not recently_worked(CALLGRAPH_EPIC, 1) and not HOST.get("milestones") and not HOST.get("labels"):
             items = [refill_item({"number": CALLGRAPH_EPIC, "title": "", "labels": [{"name": "scope:infra"}]},
                                  CALLGRAPH_TASK)]
     if items and not dry_run:
@@ -3866,6 +3871,34 @@ def claim_age_h(n: int, host: str) -> float | None:
                   if e.get("event") == "labeled" and (e.get("label") or {}).get("name") == claim_label(host)]
     stamps = [t for t in stamps if t]
     return (now() - max(stamps)).total_seconds() / 3600 if stamps else None
+
+
+def host_role(name: str) -> bool:
+    """Whether this host does a job that only one host should do (HOST_ROLES); every role when host.roles is unset."""
+    return HOST.get("roles") is None or name in HOST["roles"]
+
+
+def host_skips(i: dict) -> str | None:
+    """Why issue `i` (a gh issue dict with labels + milestone) is not this host's work; None if it is.
+    A `lane:<host_id>` label routes an issue to that host whatever its milestone. Otherwise an issue must be in one of
+    host.milestones or carry one of host.labels (both empty: anything), must not be in host.exclude_milestones, and
+    every `needs:<x>` label it carries must be in host.capabilities (unset: this host can do anything)."""
+    names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
+    ms = str((i.get("milestone") or {}).get("title", ""))
+    lanes = {n[5:] for n in names if n.startswith("lane:")}
+    if lanes and HOST_ID not in lanes:
+        return "routed to " + ", ".join(sorted(lanes))
+    caps = HOST.get("capabilities")
+    if caps is not None and (missing := sorted(n[6:] for n in names if n.startswith("needs:") and n[6:] not in caps)):
+        return "needs " + ", ".join(missing)
+    if lanes:
+        return None
+    if ms and ms in (HOST.get("exclude_milestones") or []):
+        return f"milestone {ms} is another host's"
+    want_ms, want_labels = HOST.get("milestones") or [], HOST.get("labels") or []
+    if (want_ms or want_labels) and ms not in want_ms and not names & set(want_labels):
+        return "outside this host's lanes"
+    return None
 
 
 def claim(state: dict, n: int, dry_run: bool = False) -> tuple[bool, str, dict | None]:
@@ -4012,6 +4045,9 @@ def cmd_claims(a) -> int:
     cfg = claims_cfg(state)
     print(f"host {HOST_ID} (label {claim_label()}), claims {'on' if cfg['enabled'] else 'off'}, "
           f"ttl {cfg['ttl_h']} h, renew every {cfg['refresh_h']} h")
+    print("lanes: " + (", ".join(f"{k}={HOST[k]}" for k in ("milestones", "labels", "exclude_milestones") if HOST.get(k))
+                       or "everything") + f"; capabilities: {HOST.get('capabilities', 'all')}; roles: "
+          + ", ".join(r for r in HOST_ROLES if host_role(r)))
     for k, lease in sorted((state.get("claims") or {}).get("held", {}).items(), key=lambda kv: int(kv[0])):
         print(f"  #{k} renewed {lease.get('t')}")
     return 0
@@ -4073,7 +4109,7 @@ def cmd_tick(a) -> int:
                 for line in end_dead_wait_loops(state):
                     log(line)
             with contextlib.suppress(Exception):
-                for line in tend_bot_prs():
+                for line in (tend_bot_prs() if host_role("bot_prs") else []):
                     log(line)
             SNAP.write_text(json.dumps(snap, indent=1))  # a cache for other commands; nothing diffs it any more
             with edit_state() as st:
@@ -4081,7 +4117,7 @@ def cmd_tick(a) -> int:
                     log(note)
                 pruned = prune_pr_fixes(st, snap)
                 fixes = queue_pr_fixes(st, snap)
-                reds = queue_main_red(st, red_main_issues(), snap)
+                reds = queue_main_red(st, red_main_issues(), snap) if host_role("main_red") else []
                 relabelled = fix_merge_labels(st, snap)
             if reds:
                 log("queued main-red fixes (ci lane): " + ", ".join(reds))
@@ -5094,7 +5130,7 @@ def main() -> int:
     rt.add_argument("value", nargs="?")
     nt = sub.add_parser("notify", help="phone alerts (ntfy): status (default) or send a test")
     nt.add_argument("action", nargs="?", choices=["status", "test", "boot"], default="status")
-    cl = sub.add_parser("claims", help="this host's issue claims: status (default) / sync [--dry-run] / on / off / release N")
+    cl = sub.add_parser("claims", help="this host's lanes and issue claims: status (default) / sync [--dry-run] / on / off / release N")
     cl.add_argument("action", nargs="?", default="status", choices=["status", "sync", "on", "off", "release"])
     cl.add_argument("issue", nargs="?", type=int)
     cl.add_argument("--dry-run", action="store_true")
