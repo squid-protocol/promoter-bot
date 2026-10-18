@@ -19,6 +19,7 @@ whole context on every tick. Here nothing stays alive:
   churn status               what is running, pending, spent; timer state.
   churn worktrees            remove finished worktrees now (the gate does it every 6 h); --dry-run lists.
   churn notify test|status   phone alerts via ntfy (topic in $H/churn-notify.json); `churn watchdog` runs hourly.
+  churn claims               this host's issue claims (`claim:<host_id>` labels; other hosts and people skip them).
 
 All state stays in $H/churn-state.json (shared with the night-shift skill).
 """
@@ -31,6 +32,7 @@ import collections
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -48,7 +50,8 @@ from pathlib import Path
 # Machine-specific settings (paths, repository) live in a JSON file outside the code, so the code carries no host details:
 # {"project_root": "...", "state_dir": "...", "repo_dir": "...", "worktree_dir": "...", "repo": "org/name",
 #  "dashboard_repo": "org/name", "tick_cwd": "...", "python": ".../bin/python",
-#  "bot_prs": {"auto/branch-prefix": "workflow-that-rebuilds-it.yml"}}; anything missing gets a default below.
+#  "bot_prs": {"auto/branch-prefix": "workflow-that-rebuilds-it.yml"}, "host_id": "box1"}; anything missing gets a
+#  default below.
 CONFIG_FILE = Path(os.environ.get("PROMOTER_BOT_CONFIG", str(Path.home() / ".config/promoter-bot/config.json")))
 
 
@@ -78,6 +81,8 @@ REPO = _CFG.get("repo", "your-org/your-repo")
 ORG = REPO.split("/")[0]
 TICK_CWD = Path(_CFG.get("tick_cwd", str(Path.home())))  # where tick sessions start (it decides which memory loads)
 CLAUDE = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
+# This host's name in `claim:<host_id>` labels. The repo may be public, so the default is a hash, not the hostname.
+HOST_ID = _CFG.get("host_id") or "h" + hashlib.sha1(socket.gethostname().encode()).hexdigest()[:6]
 SELF = str(Path(__file__).resolve())
 
 # Per-run spend caps (list-price USD, --max-budget-usd). A capped worker has pushed WIP;
@@ -1185,6 +1190,13 @@ def cmd_worker(a) -> int:
                       f"ONE PR on {ORG}/{repo} and report its URL. Never tag and never touch gitgalaxy's pin: the "
                       f"release + pin bump is a separate owner-approved step. Handoff notes go in {H}.\n\n{prompt}")
         else:
+            if not a.force:
+                ok, why, lease = claim(load_state(), issue)
+                if not ok:
+                    raise SystemExit(f"#{issue} is not ours to start: {why} (--force to override)")
+                if lease:
+                    with edit_state() as st:
+                        st.setdefault("claims", {}).setdefault("held", {})[str(issue)] = lease
             wt, branch = make_worktree(issue, stamp)
             prompt = (f"Your working directory {wt} is your git worktree, on branch {branch} off origin/main "
                       f"(rename the branch if you like). Handoff notes go in {H}.\n\n{prompt}")
@@ -3632,7 +3644,7 @@ def is_callgraph(i: dict) -> bool:
 
 def open_issues() -> list[dict]:
     r = run(["gh", "issue", "list", "--repo", REPO, "--state", "open", "--limit", "500",
-             "--json", "number,title,labels,milestone"], timeout=120)
+             "--json", "number,title,labels,milestone,assignees"], timeout=120)
     if r.returncode:
         raise RuntimeError(f"gh issue list: {r.stderr.strip()[:160]}")
     return json.loads(r.stdout)
@@ -3689,6 +3701,8 @@ def refill_candidates(state: dict, issues: list[dict], in_pr: set[int], callgrap
             continue  # frontier waits for the owner; unlabelled goes to stage 2
         if recently_worked(i["number"], float(cfg["cooldown_h"])):
             continue
+        if foreign_claim(i):
+            continue  # a person or another host has it
         out.append(i)
 
     def rank(i):
@@ -3707,6 +3721,8 @@ def refill(state: dict, snap: dict | None, dry_run: bool = False, force: bool = 
     if not force and launchable(state, snap) >= low_water(state):
         return "full", []
     issues, in_pr = open_issues(), issues_with_open_prs()
+    if not dry_run:
+        expire_claims(state, issues)
     stage, items = "rules", [refill_item(i) for i in refill_candidates(state, issues, in_pr)]
     if not items:
         asked = parse_iso((state.get("refill") or {}).get("agent_t"))
@@ -3762,6 +3778,242 @@ def cmd_refill(a) -> int:
     print(f"{stage}: launchable {launchable(state, snap)} / low-water {low_water(state)}")
     for x in items:
         print(f"  #{x['issue']} [{x.get('scope', '-')}{', ' + x['tier'] if x.get('tier') else ''}] {x['task'][:110]}")
+    return 0
+
+
+# Owner 2026-10-18: more than one host (and later people) work the same repo. GitHub is the only state they share, so
+# an issue's owner is recorded there: a person by assigning themselves, a host by a `claim:<host_id>` label plus one
+# lease comment it edits on every refresh. Every host skips issues that are assigned or claimed by someone else; a
+# claim nobody refreshed for ttl_h hours expires and may be taken over. Two hosts claiming in the same minute: the
+# earliest `labeled` event of a claim still on the issue wins, the other host takes its label back off.
+CLAIMS_DEFAULT = {"enabled": True, "ttl_h": 6, "refresh_h": 2, "expire_checks": 10, "per_tick": 10}
+CLAIM_PREFIX = "claim:"
+CLAIM_MARK = "<!-- promoter-bot claim host={} -->"
+
+
+def claims_cfg(state: dict) -> dict:
+    return {**CLAIMS_DEFAULT, **{k: v for k, v in (state.get("claims") or {}).items() if k in CLAIMS_DEFAULT}}
+
+
+def claim_label(host: str = HOST_ID) -> str:
+    return CLAIM_PREFIX + host
+
+
+def claim_exempt(state: dict, issue) -> bool:
+    """Standing issues every host may work at once: the call-graph epic and the weekly retro's issue."""
+    return not issue or int(issue) in {CALLGRAPH_EPIC, retro_cfg(state).get("issue")}
+
+
+def foreign_claim(i: dict) -> str | None:
+    """Who else holds issue `i` (a gh issue dict with labels + assignees): a person or another host; None if free."""
+    if who := [str(x.get("login", "")) for x in i.get("assignees") or []]:
+        return "assigned to " + ", ".join(who)
+    hosts = [n[len(CLAIM_PREFIX):] for n in (str(lab.get("name", "")) for lab in i.get("labels") or [])
+             if n.startswith(CLAIM_PREFIX) and n != claim_label()]
+    return f"claimed by {', '.join(hosts)}" if hosts else None
+
+
+def gh_pages(path: str) -> list[dict]:
+    """Every element of a paginated GitHub list endpoint."""
+    r = run(["gh", "api", "--paginate", path, "--jq", ".[]"], timeout=120)
+    if r.returncode:
+        raise RuntimeError(f"gh api {path}: {r.stderr.strip()[:200]}")
+    return [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+
+
+def gh_comment(n: int, body: str, cid: int | None = None) -> int:
+    """Post a comment on #n (or edit comment `cid`); returns its id."""
+    path = f"repos/{REPO}/issues/comments/{cid}" if cid else f"repos/{REPO}/issues/{n}/comments"
+    r = run(["gh", "api", *(["-X", "PATCH"] if cid else []), path, "-f", f"body={body}"])
+    if r.returncode:
+        raise RuntimeError(f"gh api {path}: {r.stderr.strip()[:200]}")
+    return int(json.loads(r.stdout)["id"])
+
+
+def gh_uncomment(cid: int) -> None:
+    run(["gh", "api", "-X", "DELETE", f"repos/{REPO}/issues/comments/{cid}"])  # already gone: fine
+
+
+def claim_body(state: dict) -> str:
+    return (CLAIM_MARK.format(HOST_ID) + f"\nClaimed by promoter-bot host `{HOST_ID}`, lease renewed {iso(now())}. "
+            f"It lapses after {claims_cfg(state)['ttl_h']} h without a renewal. To take it back, assign someone or "
+            f"remove the `{claim_label()}` label.")
+
+
+def claim_comments(n: int, host: str) -> list[dict]:
+    mark = CLAIM_MARK.format(host)
+    return [c for c in gh_pages(f"repos/{REPO}/issues/{n}/comments") if mark in str(c.get("body", ""))]
+
+
+def claim_winner(n: int, labels: list[str]) -> str | None:
+    """The host whose claim label (of those still on #n) was added first; ties go to the smaller name."""
+    added: dict[str, str] = {}
+    for e in gh_pages(f"repos/{REPO}/issues/{n}/events"):
+        name = str((e.get("label") or {}).get("name", ""))
+        if e.get("event") == "labeled" and name in labels:
+            added[name] = str(e.get("created_at", ""))  # events run oldest first: keep the latest add
+    if not added:
+        return None
+    return min(added, key=lambda k: (added[k], k))[len(CLAIM_PREFIX):]
+
+
+def claim_age_h(n: int, host: str) -> float | None:
+    """Hours since `host` last renewed its claim on #n (its lease comment), or since the label went on if it has none
+    (a person tagged it by hand); None if neither is readable."""
+    stamps = [parse_iso(c.get("updated_at")) for c in claim_comments(n, host)]
+    if not any(stamps):
+        stamps = [parse_iso(e.get("created_at")) for e in gh_pages(f"repos/{REPO}/issues/{n}/events")
+                  if e.get("event") == "labeled" and (e.get("label") or {}).get("name") == claim_label(host)]
+    stamps = [t for t in stamps if t]
+    return (now() - max(stamps)).total_seconds() / 3600 if stamps else None
+
+
+def claim(state: dict, n: int, dry_run: bool = False) -> tuple[bool, str, dict | None]:
+    """Take issue #n for this host: (True, note, new lease or None) when it is ours, (False, why, None) when it is closed
+    or a person or another host has it. Reads GitHub, so call it OUTSIDE the state lock; store the lease after."""
+    if not claims_cfg(state)["enabled"] or claim_exempt(state, n) or str(n) in (state.get("claims") or {}).get("held", {}):
+        return True, "", None
+    i = gh_json(f"repos/{REPO}/issues/{n}")
+    if i.get("state") == "closed":
+        return False, "closed", None
+    if who := foreign_claim(i):
+        return False, who, None
+    if dry_run:
+        return True, "would claim", None
+    gh_label(n, add=claim_label())
+    labels = [str(lab.get("name", "")) for lab in gh_json(f"repos/{REPO}/issues/{n}").get("labels") or []]
+    rivals = [x for x in labels if x.startswith(CLAIM_PREFIX)]
+    if len(rivals) > 1 and (win := claim_winner(n, rivals)) and win != HOST_ID:
+        gh_label(n, remove=claim_label())
+        return False, f"lost the claim race to {win}", None
+    mine = claim_comments(n, HOST_ID)
+    return True, "claimed", {"comment": gh_comment(n, claim_body(state), mine[0]["id"] if mine else None), "t": iso(now())}
+
+
+def release(n: int, lease: dict | None = None) -> None:
+    """Give issue #n back on GitHub: label and lease comment off (the caller drops state["claims"]["held"][n])."""
+    gh_label(n, remove=claim_label())
+    for cid in {(lease or {}).get("comment")} | {c["id"] for c in claim_comments(n, HOST_ID)}:
+        if cid:
+            gh_uncomment(int(cid))
+
+
+def wanted_claims(state: dict) -> set[int]:
+    """Issues this host is working: queued, running, waiting for review, with a watched PR or a followup."""
+    out = {x.get("issue") for k in ("queue", "running", "reports_pending", "followups") for x in state.get(k, [])
+           if isinstance(x, dict)}
+    out |= {p.get("issue") for p in state.get("prs", []) if isinstance(p, dict)}
+    return {int(n) for n in out if n and not claim_exempt(state, n)}
+
+
+def claimed_here() -> set[int]:
+    """Open issues that carry this host's claim label on GitHub."""
+    r = run(["gh", "issue", "list", "--repo", REPO, "--state", "open", "--label", claim_label(), "--limit", "500",
+             "--json", "number"], timeout=120)
+    if r.returncode:
+        raise RuntimeError(f"gh issue list: {r.stderr.strip()[:160]}")
+    return {int(i["number"]) for i in json.loads(r.stdout)}
+
+
+def sync_claims(dry_run: bool = False) -> list[str]:
+    """Level-triggered, once per tick: claim what this host works on (per_tick at most), renew leases older than
+    refresh_h, release what it dropped. A queued item someone else holds leaves the queue; a running one only gets a
+    CLAIM line for the owner. GitHub is read and written outside the state lock; the results are merged in after.
+    An issue that could not be claimed (closed, someone else's) is asked about again only after refresh_h."""
+    st = load_state()
+    cfg = claims_cfg(st)
+    if not cfg["enabled"]:
+        return []
+    cl = st.get("claims") or {}
+    held, skip = dict(cl.get("held") or {}), dict(cl.get("skip") or {})
+    fresh = lambda t: (ts := parse_iso(t)) and now() - ts < dt.timedelta(hours=float(cfg["refresh_h"]))
+    want, have = wanted_claims(st), claimed_here()
+    gone = [k for k in held if int(k) not in have]  # a person took the label off: claim it again if still ours
+    for k in gone:
+        held.pop(k)
+    running = {r.get("issue") for r in st.get("running", [])}
+    notes, got, lost, renewed = [], {}, {}, {}
+    todo = [n for n in sorted(want - set(map(int, held))) if not fresh(skip.get(str(n)))][:int(cfg["per_tick"])]
+    for n in todo:
+        ok, why, lease = claim({**st, "claims": {**cl, "held": held}}, n, dry_run)
+        if ok:
+            if lease:
+                got[str(n)] = lease
+            if why:
+                notes.append(f"#{n} {why}")
+        else:
+            lost[n] = why
+            if why != "closed" and n in running:
+                notes.append(f"CLAIM #{n}: {why}, but a worker of ours is on it -- owner: settle who keeps it")
+    for k, lease in held.items():
+        if int(k) in want and not fresh(lease.get("t")) and not dry_run:
+            renewed[k] = {"comment": gh_comment(int(k), claim_body(st), lease.get("comment")), "t": iso(now())}
+    released = sorted(have - want)
+    for n in released:
+        if not dry_run:
+            release(n, held.get(str(n)))
+        notes.append(f"released #{n}")
+    if dry_run:
+        return notes
+    with edit_state() as cur:
+        c = cur.setdefault("claims", {})
+        h = c.setdefault("held", {})
+        for k in gone + [str(n) for n in released]:
+            h.pop(k, None)
+        h.update(got)
+        h.update(renewed)
+        c["skip"] = {k: t for k, t in (c.get("skip") or {}).items() if fresh(t)} | {str(n): iso(now()) for n in lost}
+        for n, why in lost.items():
+            before = len(cur.get("queue", []))
+            cur["queue"] = [x for x in cur.get("queue", []) if x.get("issue") != n]
+            if len(cur["queue"]) < before:
+                notes.append(f"dropped #{n} from the queue: {why}")
+    return notes
+
+
+def expire_claims(state: dict, issues: list[dict]) -> list[str]:
+    """Take the label off claims another host stopped renewing (ttl_h), so refill sees those issues as free. At most
+    expire_checks issues per call (each costs a GitHub read). `issues` (from open_issues) is updated in place."""
+    cfg, notes = claims_cfg(state), []
+    claimed = [(i, n[len(CLAIM_PREFIX):]) for i in issues if not i.get("assignees")
+               for n in (str(lab.get("name", "")) for lab in i.get("labels") or [])
+               if n.startswith(CLAIM_PREFIX) and n != claim_label()]
+    for i, host in claimed[:int(cfg["expire_checks"])]:
+        age = claim_age_h(i["number"], host)
+        if age is not None and age >= float(cfg["ttl_h"]):
+            gh_label(i["number"], remove=claim_label(host))
+            i["labels"] = [lab for lab in i.get("labels") or [] if lab.get("name") != claim_label(host)]
+            notes.append(f"expired {claim_label(host)} on #{i['number']} (not renewed for {age:.0f} h)")
+    for line in notes:
+        log(line)
+    return notes
+
+
+def cmd_claims(a) -> int:
+    """status (default): this host's id and leases; sync [--dry-run]; on / off; release N."""
+    if a.action in ("on", "off"):
+        with edit_state() as st:
+            st.setdefault("claims", {})["enabled"] = a.action == "on"
+        log(f"claims {a.action} (owner)")
+        return 0
+    if a.action == "release":
+        if not a.issue:
+            raise SystemExit("claims release needs an issue number")
+        release(a.issue, (load_state().get("claims") or {}).get("held", {}).get(str(a.issue)))
+        with edit_state() as st:
+            st.setdefault("claims", {}).setdefault("held", {}).pop(str(a.issue), None)
+        log(f"released #{a.issue} (owner)")
+        return 0
+    if a.action == "sync":
+        for line in sync_claims(dry_run=a.dry_run):
+            print(line)
+        return 0
+    state = load_state()
+    cfg = claims_cfg(state)
+    print(f"host {HOST_ID} (label {claim_label()}), claims {'on' if cfg['enabled'] else 'off'}, "
+          f"ttl {cfg['ttl_h']} h, renew every {cfg['refresh_h']} h")
+    for k, lease in sorted((state.get("claims") or {}).get("held", {}).items(), key=lambda kv: int(kv[0])):
+        print(f"  #{k} renewed {lease.get('t')}")
     return 0
 
 
@@ -3866,6 +4118,11 @@ def cmd_tick(a) -> int:
                 refill_stage, _ = refill(state, snap)
             except (RuntimeError, OSError, ValueError) as e:  # GitHub unreadable: try again next tick
                 log(f"refill skipped: {str(e)[:160]}", quiet=True)
+            try:
+                for note in sync_claims():
+                    log(note, quiet=not note.startswith(("CLAIM", "dropped")))
+            except (RuntimeError, OSError, ValueError, SystemExit) as e:
+                log(f"claims sync skipped: {str(e)[:160]}", quiet=True)
             state = load_state()
         did = lanes(b, snap, False, a.dry_run)
         if direct := direct_launches(b, snap, a.dry_run):
@@ -4085,7 +4342,7 @@ def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, q
         prs += batch
         if not batch or not (u := parse_iso(batch[-1].get("updated_at"))) or u < lo:
             break
-    is_churn = lambda p: str(p.get("head", {}).get("ref", "")).startswith("churn/")  # noqa: E731
+    is_churn = lambda p: str(p.get("head", {}).get("ref", "")).startswith("churn/")
     merged = [p for p in prs if p.get("merged_at") and within(p["merged_at"])]
     opened = [p for p in prs if within(p.get("created_at"))]
 
@@ -4169,7 +4426,7 @@ def scorecard_md(c: dict) -> str:
     ]
     if fa := c.get("factory"):
         wh = fa["worker_hours"]
-        pct = lambda v: f"{100 * v:.0f}%" if v is not None else "-"  # noqa: E731
+        pct = lambda v: f"{100 * v:.0f}%" if v is not None else "-"
         lines.append(
             f"- Factory: {sum(wh.values()):.1f} worker-hours, {pct(fa['new_work_share'])} new work (PR fixes {wh['pr_fix']:.1f}h, "
             f"send-backs {wh['send_back'] + wh['precheck_retry']:.1f}h); slots {pct(fa['slot_use'])} used of "
@@ -4837,6 +5094,10 @@ def main() -> int:
     rt.add_argument("value", nargs="?")
     nt = sub.add_parser("notify", help="phone alerts (ntfy): status (default) or send a test")
     nt.add_argument("action", nargs="?", choices=["status", "test", "boot"], default="status")
+    cl = sub.add_parser("claims", help="this host's issue claims: status (default) / sync [--dry-run] / on / off / release N")
+    cl.add_argument("action", nargs="?", default="status", choices=["status", "sync", "on", "off", "release"])
+    cl.add_argument("issue", nargs="?", type=int)
+    cl.add_argument("--dry-run", action="store_true")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
     r = sub.add_parser("_run")
     r.add_argument("run_id")
@@ -4906,6 +5167,8 @@ def main() -> int:
         return cmd_factory(a)
     if a.cmd == "refill":
         return cmd_refill(a)
+    if a.cmd == "claims":
+        return cmd_claims(a)
     if a.cmd == "scorecard":
         return cmd_scorecard(a)
     return 2

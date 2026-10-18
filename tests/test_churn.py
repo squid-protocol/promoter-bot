@@ -35,6 +35,7 @@ def churn(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "ci_triage", lambda n: None)  # unreadable triage: queue as before
     monkeypatch.setattr(mod, "start_precheck", lambda rid: None)
     monkeypatch.setitem(mod.REFILL_DEFAULT, "enabled", False)  # refill tests turn it on; it reads GitHub
+    monkeypatch.setitem(mod.CLAIMS_DEFAULT, "enabled", False)  # claim tests turn it on with a fake GitHub
     monkeypatch.setattr(mod, "open_issues", lambda: [])
     monkeypatch.setattr(mod, "issues_with_open_prs", lambda: set())
     monkeypatch.setitem(mod.WT_GC_DEFAULT, "enabled", False)  # gc tests call gc_worktrees directly; it reads GitHub
@@ -2192,3 +2193,177 @@ def test_retro_cli_sets_issue_and_size_budgets(churn, capsys):
     cfg = churn.retro_cfg(churn.load_state())
     assert cfg["issue"] == 5399 and cfg["size_budget_kb"] == {".claude/agents/gitgalaxy-pr-worker.md": 16.0}
     assert "now: due" in capsys.readouterr().out
+
+
+class FakeGH:
+    """GitHub issues, labels, label events and comments for the claim tests."""
+
+    def __init__(self, churn, monkeypatch):
+        self.churn, self.issues, self.events, self.comments, self.calls, self.next_id = churn, {}, {}, {}, [], 100
+        monkeypatch.setattr(churn, "gh_json", self.gh_json)
+        monkeypatch.setattr(churn, "gh_pages", self.gh_pages)
+        monkeypatch.setattr(churn, "gh_label", self.gh_label)
+        monkeypatch.setattr(churn, "gh_comment", self.gh_comment)
+        monkeypatch.setattr(churn, "gh_uncomment", self.gh_uncomment)
+        monkeypatch.setattr(churn, "claimed_here", lambda: {n for n, i in self.issues.items() if i["state"] == "open"
+                                                           and churn.claim_label() in self.labels(n)})
+
+    def issue(self, n, labels=(), assignees=(), state="open"):
+        self.issues[n] = {"number": n, "state": state, "labels": [{"name": x} for x in labels],
+                          "assignees": [{"login": x} for x in assignees]}
+        for x in labels:
+            self.events.setdefault(n, []).append({"event": "labeled", "label": {"name": x}, "created_at": "2026-10-18T00:00:00Z"})
+
+    def labels(self, n):
+        return [lab["name"] for lab in self.issues[n]["labels"]]
+
+    def gh_json(self, path):
+        self.calls.append(path)
+        return self.issues[int(path.rsplit("/", 1)[1])]
+
+    def gh_pages(self, path):
+        n = int(path.split("/issues/")[1].split("/")[0])
+        return list(self.events.get(n, [])) if path.endswith("/events") else list(self.comments.get(n, {}).values())
+
+    def gh_label(self, n, add=None, remove=None):
+        if add and add not in self.labels(n):
+            self.issues[n]["labels"].append({"name": add})
+            self.events.setdefault(n, []).append({"event": "labeled", "label": {"name": add},
+                                                  "created_at": "2026-10-18T12:00:00Z"})
+        if remove:
+            self.issues[n]["labels"] = [lab for lab in self.issues[n]["labels"] if lab["name"] != remove]
+
+    def gh_comment(self, n, body, cid=None):
+        if cid is None:
+            cid, self.next_id = self.next_id, self.next_id + 1
+        n = next((k for k, cs in self.comments.items() if cid in cs), n)
+        self.comments.setdefault(n, {})[cid] = {"id": cid, "body": body, "updated_at": "2026-10-18T12:00:00Z"}
+        return cid
+
+    def gh_uncomment(self, cid):
+        for cs in self.comments.values():
+            cs.pop(cid, None)
+
+
+@pytest.fixture
+def gh(churn, monkeypatch):
+    monkeypatch.setitem(churn.CLAIMS_DEFAULT, "enabled", True)
+    return FakeGH(churn, monkeypatch)
+
+
+def test_foreign_claim_sees_people_and_other_hosts_but_not_this_host(churn):
+    assert churn.foreign_claim({"assignees": [{"login": "ann"}], "labels": []}) == "assigned to ann"
+    assert churn.foreign_claim({"labels": [{"name": "claim:box2"}]}) == "claimed by box2"
+    assert churn.foreign_claim({"labels": [{"name": churn.claim_label()}, {"name": "bug"}]}) is None
+    assert churn.HOST_ID.startswith("h") and len(churn.HOST_ID) == 7  # a hash: the hostname never reaches a public repo
+
+
+def test_claim_labels_and_comments_a_free_issue(churn, gh):
+    gh.issue(7)
+    ok, why, lease = churn.claim(churn.load_state(), 7)
+    assert (ok, why) == (True, "claimed") and lease["comment"] in gh.comments[7]
+    assert gh.labels(7) == [churn.claim_label()]
+    assert churn.CLAIM_MARK.format(churn.HOST_ID) in gh.comments[7][lease["comment"]]["body"]
+
+
+def test_claim_refuses_assigned_claimed_and_closed_issues(churn, gh):
+    gh.issue(1, assignees=["ann"])
+    gh.issue(2, labels=["claim:box2"])
+    gh.issue(3, state="closed")
+    st = churn.load_state()
+    assert [churn.claim(st, n)[:2] for n in (1, 2, 3)] == [
+        (False, "assigned to ann"), (False, "claimed by box2"), (False, "closed")]
+    assert all(churn.claim_label() not in gh.labels(n) for n in (1, 2, 3)) and not gh.comments
+
+
+def test_claim_race_goes_to_the_earliest_label_and_the_loser_backs_off(churn, gh, monkeypatch):
+    gh.issue(9)
+    # box2 labels the issue between our check and our add, but its label went on first
+    real = gh.gh_label
+
+    def racing(n, add=None, remove=None):
+        if add:
+            gh.issues[n]["labels"].append({"name": "claim:box2"})
+            gh.events.setdefault(n, []).append({"event": "labeled", "label": {"name": "claim:box2"},
+                                                "created_at": "2026-10-18T00:00:00Z"})
+        real(n, add, remove)
+    monkeypatch.setattr(churn, "gh_label", racing)
+    assert churn.claim(churn.load_state(), 9) == (False, "lost the claim race to box2", None)
+    assert gh.labels(9) == ["claim:box2"] and not gh.comments
+
+
+def test_claim_skips_standing_issues_and_disabled_claims(churn, gh, monkeypatch):
+    assert churn.claim(churn.load_state(), churn.CALLGRAPH_EPIC) == (True, "", None)
+    monkeypatch.setitem(churn.CLAIMS_DEFAULT, "enabled", False)
+    gh.issue(5, assignees=["ann"])
+    assert churn.claim(churn.load_state(), 5) == (True, "", None) and not gh.calls
+
+
+def test_sync_claims_takes_wanted_issues_and_drops_queue_items_someone_else_holds(churn, gh):
+    put(churn, queue=[item(10), item(11)], running=[{"run_id": "12-x", "pid": 1, "issue": 12}],
+        prs=[{"number": 500, "issue": 13}])
+    gh.issue(10)
+    gh.issue(11, assignees=["ann"])
+    gh.issue(12, labels=["claim:box2"])
+    gh.issue(13)
+    notes = churn.sync_claims()
+    st = churn.load_state()
+    assert sorted(st["claims"]["held"]) == ["10", "13"]
+    assert [x["issue"] for x in st["queue"]] == [10]  # 11 is ann's now
+    assert "dropped #11 from the queue: assigned to ann" in notes
+    assert any(n.startswith("CLAIM #12: claimed by box2") for n in notes)  # a running worker is never pulled
+    assert [x["issue"] for x in st["running"]] == [12]
+    gh.calls.clear()
+    churn.sync_claims()
+    assert not gh.calls  # held needs no read; 11 and 12 wait refresh_h before they are asked about again
+
+
+def test_sync_claims_renews_old_leases_and_releases_dropped_issues(churn, gh):
+    gh.issue(20, labels=[churn.claim_label()])
+    gh.issue(21, labels=[churn.claim_label()])
+    gh.comments[20] = {1: {"id": 1, "body": "x", "updated_at": "2026-10-18T00:00:00Z"}}
+    gh.comments[21] = {2: {"id": 2, "body": churn.CLAIM_MARK.format(churn.HOST_ID), "updated_at": "2026-10-18T00:00:00Z"}}
+    put(churn, queue=[item(20)], claims={"held": {"20": {"comment": 1, "t": "2026-10-17T00:00Z"},
+                                                   "21": {"comment": 2, "t": "2026-10-17T00:00Z"}}})
+    assert churn.sync_claims() == ["released #21"]
+    st = churn.load_state()
+    assert list(st["claims"]["held"]) == ["20"] and st["claims"]["held"]["20"]["t"] != "2026-10-17T00:00Z"
+    assert gh.labels(21) == [] and not gh.comments[21]
+    assert churn.claim_body(st).split("\n")[0] in gh.comments[20][1]["body"]
+
+
+def test_sync_claims_reclaims_when_a_person_removed_the_label(churn, gh):
+    gh.issue(30)
+    put(churn, queue=[item(30)], claims={"held": {"30": {"comment": 5, "t": churn.iso(churn.now())}}})
+    assert churn.sync_claims() == ["#30 claimed"] and churn.claim_label() in gh.labels(30)
+
+
+def test_expire_claims_takes_off_only_leases_past_the_ttl(churn, gh, monkeypatch):
+    monkeypatch.setattr(churn, "now", lambda: dt.datetime(2026, 10, 18, 12, 0, tzinfo=dt.timezone.utc))
+    gh.issue(40, labels=["claim:old"])
+    gh.issue(41, labels=["claim:live"])
+    gh.comments[40] = {1: {"id": 1, "body": churn.CLAIM_MARK.format("old"), "updated_at": "2026-10-18T05:00:00Z"}}
+    gh.comments[41] = {2: {"id": 2, "body": churn.CLAIM_MARK.format("live"), "updated_at": "2026-10-18T11:00:00Z"}}
+    issues = [dict(gh.issues[40], labels=list(gh.issues[40]["labels"])), dict(gh.issues[41], labels=list(gh.issues[41]["labels"]))]
+    assert churn.expire_claims(churn.load_state(), issues) == ["expired claim:old on #40 (not renewed for 7 h)"]
+    assert gh.labels(40) == [] and gh.labels(41) == ["claim:live"]
+    assert churn.foreign_claim(issues[0]) is None and churn.foreign_claim(issues[1]) == "claimed by live"
+
+
+def test_refill_skips_issues_people_or_other_hosts_hold(churn, monkeypatch):
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
+    monkeypatch.setattr(churn, "recently_worked", lambda n, h: False)
+    issues = [{"number": n, "title": "t", "labels": [{"name": "scope:core"}, *extra], "assignees": who}
+              for n, extra, who in ((1, [], []), (2, [{"name": "claim:box2"}], []), (3, [], [{"login": "ann"}]),
+                                    (4, [{"name": churn.claim_label()}], []))]
+    assert [i["number"] for i in churn.refill_candidates(churn.load_state(), issues, set())] == [1, 4]
+
+
+def test_worker_will_not_start_on_an_issue_someone_else_holds(churn, gh, monkeypatch):
+    gh.issue(50, labels=["claim:box2"])
+    monkeypatch.setattr(churn, "make_worktree", lambda *a: pytest.fail("no worktree for a claimed issue"))
+    a = argparse.Namespace(resume_run=None, issue=50, model="sonnet", task="", brief_file=None, brief="go", worktree=None,
+                           repo=None, force=False)
+    monkeypatch.setattr(churn, "crucible_repo_of", lambda n: None)
+    with pytest.raises(SystemExit, match="claimed by box2"):
+        churn.cmd_worker(a)
