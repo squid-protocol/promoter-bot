@@ -1749,6 +1749,25 @@ def test_core_parts_counts_lines_and_core_linked_merges(churn):
     assert c["core_per_hour"] == 0.5 and c["eta_hours"] == 6
 
 
+def test_core_counts_follow_this_hosts_lane(churn, monkeypatch):  # owner 2026-10-18: DOOM is the other box's core
+    lo = churn.dt.datetime(2026, 10, 13, tzinfo=churn.dt.timezone.utc)
+    doom = {"title": "DOOM Port Speedrun"}
+
+    def gh(path):
+        if path.startswith(f"repos/{churn.REPO}/issues?labels=scope:core"):
+            return [{"number": 4, "body": BODY}, {"number": 8, "body": "x", "milestone": doom}] if "page=1" in path else []
+        return {"items": [{"number": 9, "milestone": doom}]}
+    merged = [{"number": 1, "head": {"ref": "churn/8-a"}}, {"number": 2, "head": {"ref": "churn/9-a"}},
+              {"number": 3, "head": {"ref": "churn/4-a"}}]
+    monkeypatch.setattr(churn, "HOST", {"exclude_milestones": ["DOOM Port Speedrun"]})
+    c = churn.core_parts(gh, merged, lo, lo + churn.dt.timedelta(hours=4))
+    assert (c["parts"], c["parts_left"], c["merged_core"]) == (3, 2, 1)  # #8 / #9 and their PRs are not this host's
+    assert churn.host_search() == ' -milestone:"DOOM Port Speedrun"'
+    monkeypatch.setattr(churn, "HOST", {"milestones": ["DOOM Port Speedrun"]})
+    assert churn.host_search() == ' milestone:"DOOM Port Speedrun"'
+    assert churn.core_parts(gh, merged, lo, lo + churn.dt.timedelta(hours=4))["merged_core"] == 2
+
+
 # --- worktree gc (owner 2026-10-17) -----------------------------------------------------------------------------------
 
 def test_gc_removes_only_finished_unused_worktrees_and_keeps_dirty_ones(churn, tmp_path, monkeypatch):
