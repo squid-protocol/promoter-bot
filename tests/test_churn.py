@@ -589,6 +589,22 @@ def test_stale_gitgalaxy_containers_are_removed(churn):
     assert removed == ["a1"] and "fervent_matsumoto" in notes[0]
 
 
+def test_reap_containers_without_docker_is_a_no_op(churn, monkeypatch):
+    monkeypatch.setattr(churn.shutil, "which", lambda name: None)
+    assert churn.reap_containers(4) == []
+
+
+def test_agy_lane_is_off_on_a_host_without_the_wrapper(churn, monkeypatch):
+    monkeypatch.setattr(churn, "agy_installed", lambda: True)
+    assert churn.agy_cfg({"agy": {"enabled": True}})["enabled"] is True
+    monkeypatch.setattr(churn, "agy_installed", lambda: False)
+    cfg = churn.agy_cfg({"agy": {"enabled": True}})
+    assert cfg["enabled"] is False and "not installed" in cfg["off_why"]
+    put(churn)
+    with pytest.raises(SystemExit, match="agy lane unavailable"):
+        churn.cmd_agy(argparse.Namespace(issue=1, task="t", model=None, brief_file=None, force=True))
+
+
 def test_free_slots_are_filled_in_one_tick(churn, monkeypatch):
     monkeypatch.setattr(churn, "pace_allows", lambda s, m: (True, "pace off"))
     st = {"max_workers": 3, "ci_mode": "calm", "running": [],
