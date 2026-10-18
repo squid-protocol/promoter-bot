@@ -1158,6 +1158,74 @@ def test_factory_history_keeps_30_days_and_publishes_one_file(churn, monkeypatch
     assert "branch=dashboard" in puts[0] and puts[0][4] == f"repos/{churn.DASH_REPO}/contents/factory.json"
 
 
+def _published(cmd):
+    import base64
+    return json.loads(base64.b64decode(next(a for a in cmd if a.startswith("content="))[8:]))
+
+
+def _day(merged, usd, new, fix, mw, slot, wait):
+    return {"churn_merged": merged, "usd": usd, "loop_runs": 1, "max_workers": mw, "slot_use": slot,
+            "worker_hours": {"new_work": new, "pr_fix": fix}, "precheck": {"passed": 2}, "ci_busy_hours": 1.0,
+            "review_wait_min_median": wait, "pr_open_to_merge_h_median": 1.0, "idle_causes": {"owner": 3}}
+
+
+def test_factory_days_of_two_hosts_add_up_and_one_host_stays_exact():
+    import importlib.machinery as m, importlib.util as u  # noqa: E401
+    loader = m.SourceFileLoader("churn_combine", str(SCRIPT))
+    mod = u.module_from_spec(u.spec_from_loader("churn_combine", loader))
+    loader.exec_module(mod)
+    a, b = _day(6, 12.0, 3.0, 1.0, 2, 0.5, 10.0), _day(2, 8.0, 1.0, 1.0, 1, 0.25, 30.0)
+    out = mod.combine_factory_days({"melek": {"d1": a, "d2": a}, "nyx": {"d2": b}})
+    assert out["d1"] == a  # one host: unchanged
+    c = out["d2"]
+    assert c["churn_merged"] == 8 and c["usd"] == 20.0 and c["usd_per_merged_churn_pr"] == 2.5
+    assert c["worker_hours"] == {"new_work": 4.0, "pr_fix": 2.0} and c["new_work_share"] == round(4 / 6, 3)
+    assert c["max_workers"] == 3 and c["slot_use"] == round((0.5 * 2 + 0.25) / 3, 3) and c["loops_per_merged_pr"] == 0.25
+    assert c["precheck"] == {"passed": 4} and c["idle_causes"] == {"owner": 6} and c["ci_busy_hours"] == 1.0
+    assert c["review_wait_min_median"] == 15.0 and c["hosts"] == 2
+
+
+def test_publishing_replaces_only_this_hosts_days(churn, monkeypatch):
+    import base64
+    remote = {"hosts": {"melek": {"d1": _day(6, 12.0, 3.0, 1.0, 2, 0.5, 10.0)}}, "days": {}}
+    cur = {"sha": "s1", "content": base64.b64encode(json.dumps(remote).encode()).decode()}
+    puts = []
+    monkeypatch.setattr(churn, "HOST_ID", "nyx")
+    monkeypatch.setattr(churn, "gh_json", lambda path: cur)
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: puts.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    assert churn.push_factory({"updated": "t", "days": {"d1": _day(2, 8.0, 1.0, 1.0, 1, 0.25, 30.0)}})
+    out = _published(puts[0])
+    assert set(out["hosts"]) == {"melek", "nyx"} and out["hosts"]["melek"] == remote["hosts"]["melek"]
+    assert out["days"]["d1"]["churn_merged"] == 8 and "sha=s1" in puts[0]
+
+
+def test_a_pre_host_file_is_kept_as_legacy_and_a_lost_race_is_retried(churn, monkeypatch):
+    import base64
+    flat = {"days": {"d0": _day(1, 1.0, 1.0, 0.0, 2, 0.1, 5.0)}}
+    reads = iter([{"sha": "s1", "content": base64.b64encode(json.dumps(flat).encode()).decode()}] * 2)
+    puts = []
+    monkeypatch.setattr(churn, "HOST_ID", "nyx")
+    monkeypatch.setattr(churn, "gh_json", lambda path: next(reads))
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: puts.append(cmd) or subprocess.CompletedProcess(
+        cmd, 1 if len(puts) == 1 else 0, "", "HTTP 409: factory.json does not match s1"))
+    assert churn.push_factory({"updated": "t", "days": {}})
+    assert len(puts) == 2 and _published(puts[1])["hosts"]["_legacy"] == flat["days"]
+
+
+def test_with_a_host_id_the_scorecard_counts_only_this_hosts_churn_prs(churn, monkeypatch, tmp_path):
+    (tmp_path / "churn-runs" / "1-a").mkdir(parents=True)
+    (tmp_path / "churn-runs" / "1-a" / "meta.json").write_text(json.dumps({"branch": "churn/1-a"}))
+    monkeypatch.setattr(churn, "RUNS", tmp_path / "churn-runs")
+    monkeypatch.setitem(churn._CFG, "host_id", "nyx")
+    t = "2026-10-13T03:00:00Z"
+    pulls = [{"number": n, "head": {"ref": ref}, "merged_at": t, "created_at": t, "updated_at": t}
+             for n, ref in ((1, "churn/1-a"), (2, "churn/2-other-host"))]
+    gh = lambda path: (pulls if path.endswith("&page=1") else []) if "/pulls" in path else (  # noqa: E731
+        {"total_count": 0} if path.startswith("search") else [])
+    c = churn.scorecard(dt.date(2026, 10, 13), {"usage": {"log": []}}, gh=gh, log_text="")
+    assert c["merged"] == [1, 2] and c["churn_merged"] == [1]
+
+
 def test_a_send_back_at_the_current_head_requeues_its_fix_until_the_head_moves(churn):
     # 2026-10-16: #5204 was sent back, its fix item was dropped as "clean", the head never moved -> 5 items idled ~20 h
     st = {"prs": [{"number": 5204, "issue": 5092, "reviewed_head": "97b44ae8a6f1aa", "verdict": "send-back",

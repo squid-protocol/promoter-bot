@@ -4375,6 +4375,18 @@ def factory(day: dt.date, state: dict, log_text: str, quiet_text: str, merged_pr
     }
 
 
+def own_branches(runs_dir: Path | None = None) -> set[str]:
+    """The churn/* branches this host's runs worked on (meta.json `branch`, else churn/<run_id>)."""
+    out = set()
+    for m in (runs_dir or RUNS).glob("*/meta.json"):
+        try:
+            meta = json.loads(m.read_text())
+        except (OSError, ValueError):
+            continue
+        out.add(meta.get("branch") or f"churn/{m.parent.name}")
+    return out
+
+
 def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, quiet_text: str | None = None) -> dict:
     gh = gh or gh_json
     lo = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
@@ -4390,7 +4402,11 @@ def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, q
         prs += batch
         if not batch or not (u := parse_iso(batch[-1].get("updated_at"))) or u < lo:
             break
-    is_churn = lambda p: str(p.get("head", {}).get("ref", "")).startswith("churn/")
+    own = own_branches() if _CFG.get("host_id") else None  # several hosts: each counts only its own churn PRs
+
+    def is_churn(p):
+        ref = str(p.get("head", {}).get("ref", ""))
+        return ref.startswith("churn/") and (own is None or ref in own)
     merged = [p for p in prs if p.get("merged_at") and within(p["merged_at"])]
     opened = [p for p in prs if within(p.get("created_at"))]
 
@@ -4513,19 +4529,79 @@ def record_factory(c: dict, push: bool = True) -> bool:
     return push_factory(data) if push else True
 
 
-def push_factory(data: dict) -> bool:
-    """One commit of factory.json to the dashboard branch through the contents API (gh's auth; no clone, no ssh)."""
+# Fields of a factory day that add up across hosts (counts, hours, dollars, worker slots); the ratios are recomputed
+# from these sums, so a combined day is exact. ci_busy_hours is each host's view of the same CI queue: the max.
+FACTORY_SUM = ("churn_merged", "usd", "loop_runs", "idle_ticks", "idle_hours", "paused_hours", "max_workers",
+               "worker_hours", "precheck", "holds", "idle_causes", "idle_blockers")
+
+
+def _add(a, b):
+    if isinstance(a, dict) or isinstance(b, dict):
+        a, b = a or {}, b or {}
+        return {k: _add(a.get(k), b.get(k)) for k in {*a, *b}}
+    return round((a or 0) + (b or 0), 3)
+
+
+def combine_factory_days(hosts: dict[str, dict]) -> dict[str, dict]:
+    """Owner 2026-10-18: two hosts published factory.json in turn and each push replaced the other's numbers. Each host
+    now owns hosts[<host_id>]; the top-level `days` the Fleet CI report reads is their sum. A day only one host has is
+    that host's day unchanged. The two medians become a churn_merged-weighted mean of the hosts' medians (approximate)."""
+    out = {}
+    for day in sorted({d for days in hosts.values() for d in days}):
+        rows = [days[day] for days in hosts.values() if day in days]
+        if len(rows) == 1:
+            out[day] = dict(rows[0])
+            continue
+        c: dict = {}
+        for k in FACTORY_SUM:
+            for r in rows:
+                if k in r:
+                    c[k] = _add(c.get(k), r[k])
+        c["idle_blockers"] = dict(sorted((c.get("idle_blockers") or {}).items(), key=lambda kv: -kv[1])[:5])
+        merged, worked = c.get("churn_merged") or 0, sum((c.get("worker_hours") or {}).values())
+        c["usd_per_merged_churn_pr"] = round(c.get("usd", 0) / merged, 2) if merged else None
+        c["loops_per_merged_pr"] = round(c.get("loop_runs", 0) / merged, 2) if merged else None
+        c["new_work_share"] = round((c.get("worker_hours") or {}).get("new_work", 0) / worked, 3) if worked else None
+        slots = sum(r.get("max_workers") or 0 for r in rows)
+        c["slot_use"] = (round(sum((r.get("slot_use") or 0) * (r.get("max_workers") or 0) for r in rows) / slots, 3)
+                         if slots else None)
+        c["ci_busy_hours"] = max((r.get("ci_busy_hours") or 0) for r in rows)
+        for k in ("review_wait_min_median", "pr_open_to_merge_h_median"):
+            w = [(r[k], r.get("churn_merged") or 1) for r in rows if r.get(k) is not None]
+            c[k] = round(sum(v * n for v, n in w) / sum(n for _, n in w), 2) if w else None
+        c["hosts"] = len(rows)
+        out[day] = c
+    return out
+
+
+def push_factory(data: dict, tries: int = 3) -> bool:
+    """Commit this host's factory days to the dashboard branch through the contents API (gh's auth; no clone, no ssh):
+    read the published file, replace only hosts[HOST_ID], recompute the combined `days`, write with the read sha. A
+    write that lost the race (the other host committed in between) is retried on the new file."""
     path = f"repos/{DASH_REPO}/contents/{DASH_FILE}"
-    try:
-        sha = gh_json(f"{path}?ref={DASH_BRANCH}").get("sha")
-    except RuntimeError:
-        sha = None  # not there yet
-    content = base64.b64encode(json.dumps(data, indent=1, sort_keys=True).encode()).decode()
-    r = run(["gh", "api", "-X", "PUT", path, "-f", f"message=churn: agent factory metrics {data['updated']}",
-             "-f", f"content={content}", "-f", f"branch={DASH_BRANCH}", *(["-f", f"sha={sha}"] if sha else [])])
-    if r.returncode:
-        log(f"factory metrics not published: {r.stderr.strip()[:200]}")
-    return r.returncode == 0
+    err = ""
+    for _ in range(tries):
+        try:
+            cur = gh_json(f"{path}?ref={DASH_BRANCH}")
+            sha, remote = cur.get("sha"), json.loads(base64.b64decode(cur.get("content") or "e30=") or b"{}")
+        except RuntimeError:
+            sha, remote = None, {}  # not there yet
+        except ValueError:
+            sha, remote = cur.get("sha"), {}
+        hosts = remote.get("hosts") or ({"_legacy": remote["days"]} if remote.get("days") else {})  # pre-2026-10-18 file
+        hosts[HOST_ID] = data["days"]
+        out = {"repo": data.get("repo", REPO), "updated": data["updated"], "hosts": hosts,
+               "days": combine_factory_days(hosts)}
+        content = base64.b64encode(json.dumps(out, indent=1, sort_keys=True).encode()).decode()
+        r = run(["gh", "api", "-X", "PUT", path, "-f", f"message=churn: agent factory metrics {data['updated']} ({HOST_ID})",
+                 "-f", f"content={content}", "-f", f"branch={DASH_BRANCH}", *(["-f", f"sha={sha}"] if sha else [])])
+        if not r.returncode:
+            return True
+        err = r.stderr.strip()
+        if not re.search(r"\b409\b|does not match|sha", err):
+            break
+    log(f"factory metrics not published: {err[:200]}")
+    return False
 
 
 def write_scorecard_if_due(force_day: dt.date | None = None) -> bool:
