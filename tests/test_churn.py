@@ -1630,6 +1630,91 @@ def test_refill_respects_off_paused_and_the_cooldown_log(churn, monkeypatch):
     assert "label unlabelled" in churn.refill_need({"max_workers": 2})
 
 
+# --- checklists (owner 2026-10-18) ------------------------------------------------------------------------------------
+
+BODY = "## Acceptance criteria\n- [ ] first part\n- [x] already done\n* [ ]  second   part \n\ntext [ ] not a box\n"
+
+
+def test_checklist_parses_keys_and_ticks_one_line(churn):
+    items = churn.checklist(BODY)
+    assert [(c["done"], c["text"]) for c in items] == [(False, "first part"), (True, "already done"), (False, "second   part")]
+    assert items[2]["key"] == churn.check_key("Second part")  # whitespace and case do not change the key
+    new = churn.tick_line(BODY, items[2]["key"], 77)
+    assert "* [x] second   part (#77)\n" in new and "- [ ] first part" in new
+    assert churn.tick_line(BODY, churn.check_key("already done"), 77) is None  # only an unchecked line ticks
+    assert churn.PR_CHECK_RE.search("## Notes\n**Checklist:** done [c:0123abcd] -- all of it").groups() == ("done", "0123abcd")
+    assert churn.PR_CHECK_RE.search("Checklist: partial [c:0123abcd] -- WEB SEND left").group(1) == "partial"
+
+
+def test_refill_names_the_next_unclaimed_line_and_skips_a_ticked_issue(churn, monkeypatch):
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
+    first = churn.check_key("first part")
+    issues = [{**_iss(4, "scope:core"), "body": BODY}, {**_iss(5, "scope:core"), "body": "- [x] a\n- [x] b\n"},
+              {**_iss(6, "scope:core"), "body": BODY}]
+    monkeypatch.setattr(churn, "open_issues", lambda: issues)
+    monkeypatch.setattr(churn, "issues_with_open_prs", lambda: set())
+    put(churn, queue=[], running=[{"issue": 6, "task": f"#6 t -- checklist item [c:{first}]", "pid": 1}], max_workers=2)
+    assert [i["number"] for i in churn.refill_candidates(churn.load_state(), issues, set())] == [4]  # 5 all ticked, 6 runs
+    st = churn.load_state()
+    assert churn.next_check(issues[2], st)["text"] == "second   part"  # #6's first line is held by its run
+    assert churn.next_check(issues[0], st)["text"] == "first part"  # the same line text on another issue is free
+    stage, items = churn.refill(st, {})
+    assert stage == "rules" and f"[c:{first}]" in items[0]["task"] and f"Checklist: done [c:{first}]" in items[0]["task"]
+
+
+class _Gh:
+    """A GitHub stand-in for settle_check: one issue, and the PATCHed body it was sent."""
+    def __init__(self, churn, monkeypatch, body, labels=("scope:core",)):
+        self.issue = {"number": 4, "state": "open", "title": "t", "body": body, "labels": [{"name": x} for x in labels]}
+        self.sent = []
+        monkeypatch.setattr(churn, "gh_json", lambda path: dict(self.issue))
+        monkeypatch.setattr(churn, "run", lambda cmd, **kw: self.sent.append(kw.get("input"))
+                            or subprocess.CompletedProcess(cmd, 0, "{}", ""))
+
+
+def test_a_merged_done_pr_ticks_its_line_and_queues_the_core_issues_next(churn, monkeypatch):
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
+    gh = _Gh(churn, monkeypatch, BODY)
+    k = churn.check_key("first part")
+    st = {"prs": [{"number": 9, "issue": 4}], "queue": [], "running": []}
+    snap = {"9": {**pr(state="closed", merged=True), "check": ["done", k]}}
+    notes = churn.settle_closed(st, snap)
+    assert gh.sent and "- [x] first part (#9)" in json.loads(gh.sent[0])["body"]
+    assert "ticked, 1 left" in notes[0] and not st.get("followups") and st["prs"] == []
+    assert len(st["queue"]) == 1 and f"[c:{churn.check_key('second part')}]" in st["queue"][0]["task"]
+
+
+def test_partial_requeues_the_same_line_and_a_finished_list_goes_to_the_tick(churn, monkeypatch):
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
+    k = churn.check_key("first part")
+    gh = _Gh(churn, monkeypatch, BODY)
+    st = {"prs": [{"number": 9, "issue": 4}], "queue": [], "running": []}
+    churn.settle_closed(st, {"9": {**pr(state="closed", merged=True), "check": ["partial", k]}})
+    assert not gh.sent and f"[c:{k}]" in st["queue"][0]["task"]  # nothing ticked; the same line goes on
+    gh = _Gh(churn, monkeypatch, "- [ ] only part\n- [x] other\n")
+    st = {"prs": [{"number": 9, "issue": 4}], "queue": [], "running": []}
+    churn.settle_closed(st, {"9": {**pr(state="closed", merged=True), "check": ["done", churn.check_key("only part")]}})
+    assert gh.sent and st["followups"][0]["pr"] == 9 and st["queue"] == []  # all ticked: the tick closes the issue
+    gh = _Gh(churn, monkeypatch, BODY, labels=("scope:infra",))
+    st = {"prs": [{"number": 9, "issue": 4}], "queue": [], "running": []}
+    notes = churn.settle_closed(st, {"9": {**pr(state="closed", merged=True), "check": ["done", k]}})
+    assert gh.sent and "1 left" in notes[0] and st["queue"] == []  # ticked, but only core queues its next line at once
+
+
+def test_core_parts_counts_lines_and_core_linked_merges(churn):
+    lo = churn.dt.datetime(2026, 10, 13, tzinfo=churn.dt.timezone.utc)
+
+    def gh(path):
+        if path.startswith(f"repos/{churn.REPO}/issues?labels=scope:core"):
+            return [{"number": 4, "body": BODY}, {"number": 5, "body": "no list"}] if "page=1" in path else []
+        return {"items": [{"number": 6}]}  # closed today
+    merged = [{"number": 1, "head": {"ref": "churn/4-a"}}, {"number": 2, "head": {"ref": "x"}, "body": "Part of #6"},
+              {"number": 3, "head": {"ref": "churn/7-a"}, "title": "infra"}]
+    c = churn.core_parts(gh, merged, lo, lo + churn.dt.timedelta(hours=4))
+    assert (c["parts"], c["parts_done"], c["parts_left"], c["merged_core"]) == (4, 1, 3, 2)
+    assert c["core_per_hour"] == 0.5 and c["eta_hours"] == 6
+
+
 # --- worktree gc (owner 2026-10-17) -----------------------------------------------------------------------------------
 
 def test_gc_removes_only_finished_unused_worktrees_and_keeps_dirty_ones(churn, tmp_path, monkeypatch):
