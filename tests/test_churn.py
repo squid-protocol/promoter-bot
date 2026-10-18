@@ -2078,11 +2078,12 @@ def test_only_credit_runs_get_the_key_and_plan_runs_drop_a_stray_one(credit, tmp
     monkeypatch.setattr(churn, "nudge_tick", lambda: None)
     envs = []
     monkeypatch.setattr(churn, "_claude", lambda cmd, cwd, env, o, e: envs.append((cmd, env)) or (0, {}))
-    for rid, extra in (("1-plan", {}), ("2-credit", {"lane": "credit", "budget_usd": 7.5})):
+    for rid, extra in (("1-plan", {"budget_usd": 4.0}), ("2-credit", {"lane": "credit", "budget_usd": 7.5})):
         _run(churn, rid, issue=1, model="sonnet", worktree=str(tmp_path), branch="b", **extra)
         (churn.RUNS / rid / "prompt.md").write_text("go")
         churn.cmd_run(argparse.Namespace(run_id=rid))
-    (_, penv), (ccmd, cenv) = envs
+    (pcmd, penv), (ccmd, cenv) = envs
+    assert pcmd[pcmd.index("--max-budget-usd") + 1] == "4.0"  # a plan run's own cap (the retro)
     assert "ANTHROPIC_API_KEY" not in penv and cenv["ANTHROPIC_API_KEY"] == "sk-ant-test"
     assert ccmd[ccmd.index("--max-budget-usd") + 1] == "7.5"
 
@@ -2129,3 +2130,65 @@ def test_credit_cli_add_sync_and_unblock(credit, capsys):
     st = churn.load_state()
     assert "blocked" not in st["credit"] and churn.credit_balance(st)["balance"] == 105
     assert "balance $105.00" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- weekly retro (owner 2026-10-18)
+def test_retro_is_due_weekly_only_with_a_standing_issue(churn):
+    st = {"running": [], "retro": {}}
+    assert churn.retro_due(st) == (False, "no standing issue (`churn retro set issue N`)")
+    st["retro"]["issue"] = 5399
+    assert churn.retro_due(st) == (True, "due")
+    st["retro"]["last"] = churn.iso(churn.now() - dt.timedelta(days=2))
+    assert churn.retro_due(st)[1].startswith("next after")
+    st["retro"]["last"] = churn.iso(churn.now() - dt.timedelta(days=8))
+    st["running"] = [{"run_id": "5399-x", "pid": 7, "lane": "retro"}]
+    assert churn.retro_due(st) == (False, "a retro is running")
+
+
+def test_retro_data_gathers_the_weeks_facts_without_a_model(churn, tmp_path):
+    t = churn.iso(churn.now() - dt.timedelta(days=1))
+    _run(churn, "1-a", issue=1, started=t, status="budget", cost_usd=15.0, task="slow one")
+    _run(churn, "1-b", issue=1, started=t, status="done", cost_usd=2.0, resume_of="1-a")
+    (churn.RUNS / "1-b" / "prompt.md").write_text("Send-back: the PR body has no class table")
+    (churn.RUNS / "1-b" / "out.json").write_text(json.dumps({"permission_denials": [
+        {"tool_name": "Bash", "tool_input": {"command": "rm -rf build"}}]}))
+    _run(churn, "2-old", issue=2, started="2026-01-01T00:00Z", status="done", cost_usd=99.0)
+    inbox = tmp_path / "inbox.md"
+    inbox.write_text("- [x] old (PR #1)\n- [ ] new lesson (PR #2)\n")
+    log_text = ("# Scorecard 2026-10-17 (UTC day)\n- Spend: $7\n- Merged: 3 PRs\n\n- 2026-10-17T01:00Z [churn] noise\n"
+                "# Scorecard 2025-01-01 (UTC day)\n- Spend: $1\n")
+    d = churn.retro_data({}, churn.now() - dt.timedelta(days=7), log_text=log_text, inbox=inbox)
+    assert d["runs"] == 2 and d["cost_usd"] == 17.0 and d["statuses"] == {"budget": 1, "done": 1}
+    assert d["kinds"] == {"new_work": 1, "send_back": 1} and d["budget_hits"][0]["run"] == "1-a"
+    assert "class table" in d["send_backs"][0]["message"] and d["denials"]["Bash"]["n"] == 1
+    assert d["scorecards"] == {"2026-10-17": ["Spend: $7", "Merged: 3 PRs"]}
+    assert d["unticked_lessons"] == ["- [ ] new lesson (PR #2)"]
+
+
+def test_retro_lane_launches_once_a_week_with_its_cap_and_a_deep_audit_every_fourth(churn, monkeypatch):
+    put(churn, retro={"issue": 5399, "count": 2}, max_workers=2)
+    monkeypatch.setattr(churn, "worker_brief_template", lambda: "TEMPLATE")
+    monkeypatch.setattr(churn, "rate_plan", lambda state: None)
+    launched = []
+    monkeypatch.setattr(churn, "cmd_worker", lambda a: launched.append(a))
+    green = {"verdict": "GREEN", "free_slots": 2}
+    assert churn.retro_lane(green, {}) == ["weekly retro #3 (sonnet, cap $4.0)"]
+    [a] = launched
+    assert a.issue == 5399 and a.lane == "retro" and a.budget_usd == 4.0 and not a.plan
+    assert "Part of #5399" in a.brief and "TEMPLATE" in a.brief and "Deep audit" not in a.brief
+    assert json.loads((churn.H / "retro" / f"retro-{churn.now():%Y-%m-%d}.json").read_text())["runs"] == 0
+    assert churn.retro_lane(green, {}) == []  # done for the week
+    with churn.edit_state() as st:
+        st["retro"]["last"] = churn.iso(churn.now() - dt.timedelta(days=8))
+    churn.retro_lane(green, {})
+    assert "Deep audit" in launched[-1].brief and churn.load_state()["retro"]["count"] == 4
+
+
+def test_retro_cli_sets_issue_and_size_budgets(churn, capsys):
+    ns = lambda action, key=None, value=None: argparse.Namespace(action=action, key=key, value=value)  # noqa: E731
+    churn.cmd_retro(ns("set", "issue", "5399"))
+    churn.cmd_retro(ns("size", ".claude/agents/gitgalaxy-pr-worker.md", "16"))
+    churn.cmd_retro(ns("size", "CLAUDE.md", "0"))
+    cfg = churn.retro_cfg(churn.load_state())
+    assert cfg["issue"] == 5399 and cfg["size_budget_kb"] == {".claude/agents/gitgalaxy-pr-worker.md": 16.0}
+    assert "now: due" in capsys.readouterr().out
