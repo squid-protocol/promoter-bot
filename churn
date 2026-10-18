@@ -2509,7 +2509,9 @@ def notify(key: str, title: str, msg: str, priority: str = "default", cooldown_h
     if last and now() - last < dt.timedelta(hours=cooldown_h):
         return False
     url = f"{cfg.get('server', 'https://ntfy.sh').rstrip('/')}/{cfg['topic']}"
-    headers = {"Title": title.encode("ascii", "replace").decode(), "Priority": priority}
+    # several hosts share one topic (#11): name the box. Only a configured host_id; the hashed default means one box.
+    shown = f"{_CFG['host_id']}: {title}" if _CFG.get("host_id") else title
+    headers = {"Title": shown.encode("ascii", "replace").decode(), "Priority": priority}
     if tags:
         headers["Tags"] = tags
     req = urllib.request.Request(url, data=msg[:3500].encode(), headers=headers, method="POST")

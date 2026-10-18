@@ -1882,6 +1882,18 @@ def test_notify_sends_once_per_cooldown_and_never_without_a_topic(churn):
     assert churn.notify("other", "t", "m", post=sent.append) and len(sent) == 2
 
 
+def test_notify_titles_name_the_configured_host(churn, monkeypatch):
+    """#11: two hosts post to one ntfy topic, so an alert says which box sent it; the cooldown key is unchanged."""
+    _topic(churn)
+    sent = []
+    assert churn.notify("k", "watchdog: tick gate stopped", "m", post=sent.append)
+    assert sent[-1].headers["Title"] == "watchdog: tick gate stopped"  # hashed default host_id: no prefix
+    monkeypatch.setitem(churn._CFG, "host_id", "nyx")
+    assert churn.notify("k2", "watchdog: tick gate stopped", "m", post=sent.append)
+    assert sent[-1].headers["Title"] == "nyx: watchdog: tick gate stopped"
+    assert set(churn.notify_cfg()["sent"]) == {"k", "k2"}
+
+
 def test_notify_failure_never_raises(churn):
     _topic(churn)
 
