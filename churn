@@ -829,6 +829,7 @@ def budget_picks(state: dict, snap: dict | None, mode: str, n: int, plan: dict |
     queue = state.get("queue", [])
     slot_models = [r.get("model", "sonnet") for r in claude_slot_holders(state)]
     out, taken = [], set()
+    running = list(state.get("running", []))
     for _ in range(max(0, n)):
         def fits(x, room=room, opus=opus, models=tuple(slot_models)):
             m = x.get("model", "sonnet")
@@ -838,9 +839,10 @@ def budget_picks(state: dict, snap: dict | None, mode: str, n: int, plan: dict |
         q = [(k, x) for k, x in enumerate(queue) if k not in taken and fits(x)]
         if plan and plan["mode"] == "surplus":
             q.sort(key=lambda kx: -MODEL_RANK.get(kx[1].get("model", "sonnet"), 1))  # stable: lane/tier order stays
-        _, x = pick_item({**state, "queue": [x for _, x in q]}, snap, mode)
+        _, x = pick_item({**state, "queue": [x for _, x in q], "running": running}, snap, mode)
         if x is None:
             break
+        running.append({"scope": x.get("scope"), "lane": x.get("lane"), "picked": True})
         k = next(k for k, y in q if y is x)
         taken.add(k)
         out.append((k, x))
@@ -1251,9 +1253,11 @@ def cmd_worker(a) -> int:
     with edit_state() as state:
         lane = getattr(a, "lane", None) or next((q.get("lane") for q in state.get("queue", []) if q.get("issue") == issue
                                                  and not q.get("pr")), None)
+        scope = next((q.get("scope") for q in state.get("queue", []) if q.get("issue") == issue and q.get("scope")), None)
         state.setdefault("running", []).append(
             {"agent": f"churn {run_id}", "run_id": run_id, "pid": meta["pid"], "issue": issue, "model": model,
              "started": meta["started"], "task": task[:200], **({"lane": lane} if lane else {}),
+             **({"scope": scope} if scope else {}),
              **({"cpu_quota": quota} if quota else {})})
         state.setdefault("usage", {}).setdefault("launches", []).append(meta["started"])
         state["usage"]["launches"] = state["usage"]["launches"][-50:]
@@ -3015,16 +3019,58 @@ def issue_tier(n: int, meta: dict | None = None) -> str | None:
     return "followup" if str(d.get("title", "")).lower().startswith("siblings of") else None
 
 
+# Owner 2026-10-18: 20 of 70 merged PRs were core (33 infra). With 2 workers, ci-lane, infra and backfill items could
+# hold both slots while a core item waited (in busy mode normal items never launched at all). `core_reserve` (default
+# 1) Claude workers stay on scope:core whenever a core item can launch; PR fixes still go first (finishing beats starting).
+CORE_RESERVE = 1
+
+
+def core_short(state: dict) -> bool:
+    """Fewer live (or just-picked) Claude workers on scope:core than state.core_reserve."""
+    held = sum(1 for r in state.get("running", []) if r.get("scope") == "core" and r.get("backend") != "agy"
+               and r.get("lane") not in ("backfill", "credit") and (r.get("picked") or pid_alive(r.get("pid"))))
+    return held < int(state.get("core_reserve", CORE_RESERVE))
+
+
+def stamp_scopes(state: dict, limit: int = 6) -> list[str]:
+    """Give queue items without a scope their issue's scope (and tier) label, at most `limit` gh reads a tick; an
+    item is read once (`scope_checked`). Before this, PR-fix and hand-queued items ranked level with sweep."""
+    out, metas = [], {}
+    for x in state.get("queue", []):
+        if x.get("scope") or x.get("scope_checked") or not x.get("issue") or x.get("backend") == "agy":
+            continue
+        if x["issue"] not in metas:
+            if len(metas) >= limit:
+                break
+            metas[x["issue"]] = issue_meta(x["issue"])
+        if (meta := metas[x["issue"]]) is None:
+            continue  # unreadable: try again next tick
+        x["scope_checked"] = True
+        if sc := issue_scope(x["issue"], meta):
+            x["scope"] = sc
+            out.append(f"#{x['issue']} {sc}")
+        if not x.get("tier") and (tier := issue_tier(x["issue"], meta)):
+            x["tier"] = tier
+    return out
+
+
 def pick_item(state: dict, snap: dict | None, mode: str) -> tuple[int, dict] | tuple[None, None]:
-    """The next Claude queue item for this CI mode: PR fixes, then the `ci` lane (both always), then `normal` items
+    """The next Claude queue item for this CI mode: PR fixes (core first), then a core item while core_short, then the
+    `ci` lane (all always), then `normal` items
     when CI is calm (by tier, then position), or `backfill` items when it is busy (at most backfill_max running).
     2026-10-16: calm mode offers backfill too once the slots have sat idle (nothing else launchable) for
     backfill_idle_ticks ticks in a row; the streak keeps a just-unblocked normal item from losing its box to it."""
     q = [(i, x) for i, x in enumerate(state.get("queue", [])) if not x.get("needs_owner") and x.get("backend") != "agy"
          and not blocked_by(x, snap, state) and not waiting(x) and not plan_overlap(state, x) and not scope_held(x)]
+    fix = min(((i, x) for i, x in q if x.get("pr")), key=lambda ix: (scope_rank(ix[1]), ix[0]), default=None)
+    if fix:
+        return fix
     for i, x in q:
-        if x.get("pr"):
-            return i, x
+        if x.get("auto") == "main-red":
+            return i, x  # a red main blocks every PR, core ones too
+    if core_short(state) and (core := next(((i, x) for i, x in q if x.get("scope") == "core"
+                                            and x.get("lane") in (None, "normal", "ci")), None)):
+        return core  # the core slot: at least core_reserve workers on scope:core, in busy mode too
     for i, x in q:
         if x.get("lane") == "ci":
             return i, x
@@ -4215,6 +4261,9 @@ def cmd_tick(a) -> int:
                     log(note)
                 pruned = prune_pr_fixes(st, snap)
                 fixes = queue_pr_fixes(st, snap)
+                with contextlib.suppress(Exception):
+                    if stamped := stamp_scopes(st):
+                        log("scope from labels: " + ", ".join(stamped), quiet=True)
                 reds = queue_main_red(st, red_main_issues(), snap) if host_role("main_red") else []
                 relabelled = fix_merge_labels(st, snap)
             if reds:
@@ -5116,6 +5165,7 @@ def _parse_time(v: str) -> str:
 CONFIG_KEYS = {
     "max_workers": (("max_workers",), int),
     "max_opus": (("max_opus",), int),
+    "core_reserve": (("core_reserve",), int),
     "pace": (("usage", "pace"), _parse_pace),
     "block_start": (("usage", "block_start"), _parse_time),
     **{f"rate.{k}": (("usage", "rate", k), int if isinstance(d, int) else float) for k, d in RATE_DEFAULT.items()},
@@ -5213,7 +5263,8 @@ def cmd_config(a) -> int:
             v = state
             for p in path:
                 v = v.get(p) if isinstance(v, dict) else None
-            dflt = RATE_DEFAULT.get(k[5:]) if k.startswith("rate.") else {"max_workers": 2, "max_opus": 1, "pace": "ledger"}.get(k)
+            dflt = RATE_DEFAULT.get(k[5:]) if k.startswith("rate.") else {"max_workers": 2, "max_opus": 1, "pace": "ledger",
+                                                                                          "core_reserve": CORE_RESERVE}.get(k)
             print(f"{k} = {v if v is not None else dflt}" + (" (default)" if v is None else ""))
         return 0
     if a.key not in CONFIG_KEYS or a.value is None:
@@ -5223,7 +5274,7 @@ def cmd_config(a) -> int:
         val = parse(a.value)
     except (ValueError, TypeError) as e:
         raise SystemExit(f"{a.key}: bad value {a.value!r} ({e})") from None
-    if a.key in ("max_workers", "max_opus", "rate.max_opus_burst", "rate.max_workers_burst") and not 0 <= val <= 4:
+    if a.key in ("max_workers", "max_opus", "core_reserve", "rate.max_opus_burst", "rate.max_workers_burst") and not 0 <= val <= 4:
         raise SystemExit(f"{a.key} must be 0..4")
     if a.key in ("rate.headroom", "rate.surplus_share") and not 0 < val <= 1:
         raise SystemExit(f"{a.key} must be in (0, 1]")

@@ -359,6 +359,40 @@ class TestCiLoadBalancer:
         st["queue"] = [item(2, lane="backfill")]
         assert churn.pick_item(st, {}, "calm") == (None, None)
 
+    def test_the_core_slot_outranks_the_ci_lane_until_a_core_worker_runs(self, churn):  # owner 2026-10-18
+        st = {"running": [], "queue": [item(1, scope="infra"), item(2, lane="ci"), item(3, scope="core"),
+                                       item(4, pr=44, scope="infra"), item(5, pr=55, scope="core")]}
+        assert churn.pick_item(st, {}, "calm")[1]["issue"] == 5   # PR fixes first, core ones before the rest
+        st["queue"] = st["queue"][:3]
+        assert churn.pick_item(st, {}, "calm")[1]["issue"] == 3   # no core worker: the core slot first
+        assert churn.pick_item(st, {}, "busy")[1]["issue"] == 3   # in busy mode too
+        st["queue"].insert(0, item(6, lane="ci", auto="main-red"))
+        assert churn.pick_item(st, {}, "calm")[1]["issue"] == 6   # a red main still comes first
+        st["queue"].pop(0)
+        st["running"] = [{"run_id": "r", "pid": 5, "issue": 9, "scope": "core"}]
+        assert churn.pick_item(st, {}, "calm")[1]["issue"] == 2   # a core worker runs: the usual order
+        assert churn.pick_item(st, {}, "busy")[1]["issue"] == 2
+        st["core_reserve"] = 0
+        st["running"] = []
+        assert churn.pick_item(st, {}, "calm")[1]["issue"] == 2   # core_reserve 0: off
+
+    def test_budget_picks_counts_a_picked_core_item_toward_the_reserve(self, churn):
+        st = {"running": [], "max_workers": 2, "queue": [item(1, lane="ci"), item(2, scope="core"), item(3, scope="core")]}
+        assert [x["issue"] for _, x in churn.budget_picks(st, {}, "calm", 2, None)] == [2, 1]
+
+    def test_stamp_scopes_reads_each_issue_once(self, churn, monkeypatch):
+        reads = []
+        metas = {7: {"title": "Siblings of #3", "labels": [{"name": "scope:core"}]}, 8: {"title": "x", "labels": []}}
+        monkeypatch.setattr(churn, "issue_meta", lambda n: reads.append(n) or metas.get(n))
+        monkeypatch.setattr(churn, "issue_tier", churn.real_issue_tier)
+        st = {"queue": [item(7, pr=70), item(8), item(9), item(10, scope="infra")]}
+        assert churn.stamp_scopes(st) == ["#7 core"]
+        assert st["queue"][0]["scope"] == "core" and st["queue"][0]["tier"] == "followup"
+        assert st["queue"][1]["scope_checked"] and "scope" not in st["queue"][1]
+        assert "scope_checked" not in st["queue"][2]  # #9 unreadable: tried again next tick
+        churn.stamp_scopes(st)
+        assert reads == [7, 8, 9, 9]
+
     def test_backfill_is_capped_and_ignores_the_broken_pr_hold(self, churn, monkeypatch):
         monkeypatch.setattr(churn, "pace_allows", lambda s, m: (True, "pace off"))
         snap = {str(n): pr(labels=["shepherd:needs-fix"]) for n in (1, 2, 3)}
