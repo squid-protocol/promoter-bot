@@ -2030,7 +2030,8 @@ def pr_snapshot(prs: list[int], old: dict) -> dict:
             ms = old.get(str(n), {}).get("mergeable_state", "unknown")
         snap[str(n)] = {"state": p["state"], "merged": p.get("merged", False), "head": p["head"]["sha"][:12],
                         "mergeable_state": ms, "labels": sorted(lbl["name"] for lbl in p.get("labels", [])),
-                        "branch": p["head"].get("ref", ""), "closes": bool(CLOSES_RE.search(p.get("body") or ""))}
+                        "branch": p["head"].get("ref", ""), "closes": bool(CLOSES_RE.search(p.get("body") or "")),
+                        **({"check": [m.group(1).lower(), m.group(2)]} if (m := PR_CHECK_RE.search(p.get("body") or "")) else {})}
     return snap
 
 
@@ -2113,7 +2114,10 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
             keep.append(p)
             continue
         issue = p.get("issue") if isinstance(p, dict) else None
-        if v.get("merged") and v.get("closes"):
+        if v.get("merged") and issue and v.get("check") and not v.get("closes") and (
+                note := settle_check(state, int(issue), n, *v["check"])):
+            notes.append(note)  # the box records it: no followup for the tick
+        elif v.get("merged") and v.get("closes"):
             notes.append(f"merged #{n} (closes its issue itself)")
         elif n not in have:
             kind = "merged" if v.get("merged") else "closed"
@@ -2121,6 +2125,39 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
             notes.append(f"{kind} #{n} -> followup" + (f" (issue #{issue})" if issue else ""))
     state["prs"] = keep
     return notes
+
+
+def settle_check(state: dict, issue: int, pr: int, status: str, key: str) -> str | None:
+    """A merged PR that reported `Checklist: done|partial [c:key]`: tick the line (done), and for a core issue queue its
+    next unclaimed line (or the same one, partial) right away. None = not settled here: the old followup, e.g. every line
+    is now ticked (the tick closes the issue), the line was edited away, or the issue cannot be read."""
+    try:
+        i = gh_json(f"repos/{REPO}/issues/{issue}")
+    except (RuntimeError, ValueError):
+        return None
+    body = i.get("body") or ""
+    if i.get("state") != "open" or not any(c["key"] == key for c in checklist(body)):
+        return None
+    note = f"merged #{pr}: checklist [c:{key}] of #{issue} {status}"
+    if status == "done" and (new := tick_line(body, key, pr)) is not None:
+        r = run(["gh", "api", "-X", "PATCH", f"repos/{REPO}/issues/{issue}", "--input", "-"],
+                input=json.dumps({"body": new}))
+        if r.returncode:
+            return None
+        body = new
+        note += ", ticked"
+    left = [c for c in checklist(body) if not c["done"]]
+    if not left:
+        return None
+    note += f", {len(left)} left"
+    i["body"] = body
+    if (issue_scope(issue, i) == "core" and refill_cfg(state)["enabled"] and not state.get("workers_paused")
+            and not foreign_claim(i) and not host_skips(i)
+            and not any(x.get("issue") == issue for s in ("queue", "running") for x in state.get(s, []))
+            and (c := next_check(i, state))):
+        state.setdefault("queue", []).append(refill_item(i, check=c))
+        note += f"; queued next line [c:{c['key']}]"
+    return note
 
 
 def reviews_needed(state: dict, snap: dict, live: list[dict]) -> dict[str, str]:
@@ -3661,7 +3698,7 @@ def is_callgraph(i: dict) -> bool:
 
 def open_issues() -> list[dict]:
     r = run(["gh", "issue", "list", "--repo", REPO, "--state", "open", "--limit", "500",
-             "--json", "number,title,labels,milestone,assignees"], timeout=120)
+             "--json", "number,title,labels,milestone,assignees,body"], timeout=120)
     if r.returncode:
         raise RuntimeError(f"gh issue list: {r.stderr.strip()[:160]}")
     return json.loads(r.stdout)
@@ -3691,10 +3728,57 @@ def recently_worked(issue: int, hours: float) -> bool:
     return False
 
 
-def refill_item(i: dict, task: str | None = None) -> dict:
+# Owner 2026-10-18: an issue's checklist is its parts list, and the boxes were never ticked (156 merged PRs against the
+# open core issues, 0 of 138 lines checked). A refill item now names ONE unchecked line by a key, the worker writes
+# `Checklist: done|partial [c:<key>]` in the PR body, and on merge the gate ticks that line itself: the boxes count
+# what is left (scorecard), and a core issue's next line is queued at once instead of after the 12 h cooldown.
+CHECK_RE = re.compile(r"^(\s*[-*]\s+)\[([ xX])\]\s+(.*?)\s*$", re.M)
+CHECK_KEY_RE = re.compile(r"\[c:([0-9a-f]{8})\]")
+PR_CHECK_RE = re.compile(r"^\W*Checklist:?\W*(done|partial)\b[^\n]*?\[c:([0-9a-f]{8})\]", re.I | re.M)
+
+
+def check_key(text: str) -> str:
+    return hashlib.sha1(" ".join(text.split()).lower().encode()).hexdigest()[:8]
+
+
+def checklist(body: str | None) -> list[dict]:
+    """[{done, text, key}] for each `- [ ]` / `- [x]` line of an issue body."""
+    return [{"done": m.group(2) != " ", "text": m.group(3), "key": check_key(m.group(3))}
+            for m in CHECK_RE.finditer(body or "")]
+
+
+def tick_line(body: str, key: str, pr: int) -> str | None:
+    """body with the unchecked line `key` ticked and its PR appended; None if no unchecked line has that key."""
+    for m in CHECK_RE.finditer(body):
+        if m.group(2) == " " and check_key(m.group(3)) == key:
+            return body[:m.start()] + f"{m.group(1)}[x] {m.group(3)} (#{pr})" + body[m.end():]
+    return None
+
+
+def claimed_checks(state: dict, issue: int) -> set[str]:
+    """Checklist keys of issue #issue that a queued or running item already holds."""
+    return {k for s in ("queue", "running") for x in state.get(s, []) if x.get("issue") == issue
+            for k in CHECK_KEY_RE.findall(str(x.get("task", "")))}
+
+
+def next_check(i: dict, state: dict) -> dict | None:
+    taken = claimed_checks(state, i["number"])
+    return next((c for c in checklist(i.get("body")) if not c["done"] and c["key"] not in taken), None)
+
+
+def check_task(i: dict, c: dict) -> str:
+    k = c["key"]
+    return (f"#{i['number']} {i.get('title', '')[:120]} -- checklist item [c:{k}]: \"{c['text'][:300]}\". Do this item "
+            "(or its next PR-sized slice); burned estates only, list the rest as sibling gaps. Put one line in the PR "
+            f"body: `Checklist: done [c:{k}]` if this PR completes the item, else `Checklist: partial [c:{k}] -- <what "
+            "is left>`. Never edit the issue: the gate ticks the box when the PR merges.")
+
+
+def refill_item(i: dict, task: str | None = None, check: dict | None = None) -> dict:
     meta = {"title": i.get("title", ""), "labels": i.get("labels") or []}
     item = {"issue": i["number"], "model": "sonnet", "needs_owner": False, "auto": "refill",
-            "task": task or (f"#{i['number']} {i.get('title', '')[:120]} -- take the next unchecked item on the issue; "
+            "task": task or (check_task(i, check) if check else
+                             f"#{i['number']} {i.get('title', '')[:120]} -- take the next unchecked item on the issue; "
                              "burned estates only, list the rest as sibling gaps")}
     if sc := issue_scope(i["number"], meta):
         item["scope"] = sc
@@ -3720,6 +3804,8 @@ def refill_candidates(state: dict, issues: list[dict], in_pr: set[int], callgrap
             continue
         if foreign_claim(i) or host_skips(i):
             continue  # a person or another host has it, or it is not this host's kind of work
+        if (items := checklist(i.get("body"))) and all(c["done"] for c in items):
+            continue  # every line ticked: closing it is the tick's followup, not more work
         out.append(i)
 
     def rank(i):
@@ -3740,7 +3826,7 @@ def refill(state: dict, snap: dict | None, dry_run: bool = False, force: bool = 
     issues, in_pr = open_issues(), issues_with_open_prs()
     if not dry_run:
         expire_claims(state, issues)
-    stage, items = "rules", [refill_item(i) for i in refill_candidates(state, issues, in_pr)]
+    stage, items = "rules", [refill_item(i, check=next_check(i, state)) for i in refill_candidates(state, issues, in_pr)]
     if not items:
         asked = parse_iso((state.get("refill") or {}).get("agent_t"))
         if launchable(state, snap) == 0:
@@ -4387,6 +4473,33 @@ def own_branches(runs_dir: Path | None = None) -> set[str]:
     return out
 
 
+def core_parts(gh, merged: list[dict], lo: dt.datetime, hi: dt.datetime) -> dict:
+    """The core finish line in parts (owner 2026-10-18): checklist lines of the open scope:core issues (an issue with no
+    checklist counts as one part), and the merged PRs that name a core issue (branch churn/<n>- or Part of/Closes #n)
+    per hour of the window, so parts_left / per_hour is the time to the finish line at this pace."""
+    issues = []
+    for page in range(1, 6):
+        batch = [i for i in gh(f"repos/{REPO}/issues?labels=scope:core&state=open&per_page=100&page={page}") or []
+                 if isinstance(i, dict) and "pull_request" not in i]
+        issues += batch
+        if len(batch) < 100:
+            break
+    lines = [checklist(i.get("body")) for i in issues]
+    total = sum(len(x) or 1 for x in lines)
+    done = sum(sum(c["done"] for c in x) for x in lines)
+    closed = gh("search/issues?per_page=100&q=" + urllib.parse.quote(
+        f"repo:{REPO} is:issue label:scope:core closed:>={lo.date()}")).get("items") or []
+    nums = {i.get("number") for i in issues} | {i.get("number") for i in closed}
+    refs = lambda p: {int(x) for x in re.findall(r"^(?:churn|agy|claude)/(\d+)-", str(p.get("head", {}).get("ref", "")))} | {
+        int(x) for x in re.findall(r"(?:Part of|Fixes|Closes|Resolves)\s+#(\d+)", f"{p.get('title', '')} {p.get('body') or ''}", re.I)}
+    linked = [p["number"] for p in merged if refs(p) & nums]
+    hours = max((hi - lo).total_seconds() / 3600, 0.0)
+    rate = len(linked) / hours if hours >= 1 else None
+    left = total - done
+    return {"parts": total, "parts_done": done, "parts_left": left, "merged_core": len(linked),
+            "core_per_hour": round(rate, 2) if rate else None, "eta_hours": round(left / rate) if rate else None}
+
+
 def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, quiet_text: str | None = None) -> dict:
     gh = gh or gh_json
     lo = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
@@ -4420,6 +4533,7 @@ def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, q
             "opened": count(f"repo:{REPO} is:issue label:scope:core created:{day}"),
             "closed": count(f"repo:{REPO} is:issue label:scope:core closed:{day}"),
             "frontier_opened": count(f"repo:{REPO} is:issue label:scope:frontier created:{day}")}
+    core.update(core_parts(gh, merged, lo, min(hi, now())))
     reds = [i for i in gh(f"repos/{REPO}/issues?labels=ci-red-main&state=all&per_page=100&since={iso(lo - dt.timedelta(days=7))}")
             if "pull_request" not in i]
     red = sorted(((round(_hours(lo, hi, parse_iso(i.get("created_at")), parse_iso(i.get("closed_at"))), 1), i["number"],
@@ -4469,6 +4583,10 @@ def scorecard_md(c: dict) -> str:
         *([f"- Core (burned-estate finish line): {c['core']['open']} open; today {c['core']['closed']} closed, "
            f"{c['core']['opened']} opened, net {c['core']['opened'] - c['core']['closed']:+d}; "
            f"{c['core']['frontier_opened']} frontier gaps mapped (Gap Atlas)."] if c.get("core") else []),
+        *([f"- Core parts (checklist lines; an issue with none counts 1): {c['core']['parts_left']} left of "
+           f"{c['core']['parts']}; {c['core']['merged_core']} core-linked PRs merged"
+           + (f" ({c['core']['core_per_hour']}/h, about {c['core']['eta_hours']} h to the finish line at this pace)"
+              if c['core'].get('core_per_hour') else "") + "."] if (c.get("core") or {}).get("parts") is not None else []),
         f"- Merged: {len(c['merged'])} PRs, {len(c['churn_merged'])} from churn"
         + (f" ({', '.join('#' + str(n) for n in c['churn_merged'][:15])})" if c["churn_merged"] else "")
         + f"; opened {c['opened']} ({c['churn_opened']} churn).",
@@ -4637,6 +4755,23 @@ def cmd_scorecard(a) -> int:
         print(scorecard_md(c), end="")
     if a.write:
         write_scorecard_if_due(day)
+    return 0
+
+
+def cmd_checklist(a) -> int:
+    """Checklist parts per open issue of a scope (default core): ticked / total, and the next unclaimed line."""
+    state = load_state()
+    issues = [i for i in gh_pages(f"repos/{REPO}/issues?labels=scope:{a.scope}&state=open&per_page=100")
+              if "pull_request" not in i]
+    total = done = 0
+    for i in sorted(issues, key=lambda i: -sum(not c["done"] for c in checklist(i.get("body")))):
+        items = checklist(i.get("body"))
+        n, d = len(items) or 1, sum(c["done"] for c in items)
+        total, done = total + n, done + d
+        nxt = next_check(i, state)
+        print(f"#{i['number']:<5} {d}/{n:<3} {i.get('title', '')[:70]}"
+              + (f"\n        next [c:{nxt['key']}] {nxt['text'][:90]}" if nxt and a.next else ""))
+    print(f"{len(issues)} open scope:{a.scope} issues: {done}/{total} parts ticked, {total - done} left")
     return 0
 
 
@@ -5192,6 +5327,9 @@ def main() -> int:
     rf.add_argument("--force", action="store_true", help="ignore the low-water mark")
     rf.add_argument("--on", action="store_true")
     rf.add_argument("--off", action="store_true")
+    ck = sub.add_parser("checklist", help="checklist parts per open issue (ticked/total) and the scope's parts left")
+    ck.add_argument("--scope", default="core", choices=list(SCOPES))
+    ck.add_argument("--next", action="store_true", help="also show each issue's next unclaimed line")
     sc = sub.add_parser("scorecard", help="the day's numbers: merged, spend, $/PR, issues net, hours main was red")
     sc.add_argument("--day", help="YYYY-MM-DD (UTC; default today so far)")
     sc.add_argument("--json", action="store_true")
@@ -5295,6 +5433,8 @@ def main() -> int:
         return cmd_claims(a)
     if a.cmd == "scorecard":
         return cmd_scorecard(a)
+    if a.cmd == "checklist":
+        return cmd_checklist(a)
     return 2
 
 
