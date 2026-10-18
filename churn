@@ -1704,8 +1704,16 @@ def retro_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
 
 
 # ---------------------------------------------------------------- agy lane
+def agy_installed() -> bool:
+    return os.access(AGY_WORKER, os.X_OK)
+
+
 def agy_cfg(state: dict) -> dict:
-    return {**AGY_DEFAULT, **state.get("agy", {})}
+    """A host without the agy-worker wrapper (a second host that never set agy up) has the lane off, whatever state says."""
+    cfg = {**AGY_DEFAULT, **state.get("agy", {})}
+    if not agy_installed():
+        cfg["enabled"], cfg["off_why"] = False, f"{AGY_WORKER} not installed on this host"
+    return cfg
 
 
 AGY_BRIEF = """You are fixing GitGalaxy issue #{issue} in the git worktree that is your current directory ({wt}, branch
@@ -1765,6 +1773,8 @@ def cmd_agy(a) -> int:
     with state_lock():
         state = load_state()
         cfg = agy_cfg(state)
+        if not agy_installed():
+            raise SystemExit(f"agy lane unavailable: {cfg['off_why']}")
         live = [r for r in state.get("running", []) if r.get("backend") == "agy" and pid_alive(r.get("pid"))]
         if not a.force and len(live) >= cfg["max_running"]:
             raise SystemExit(f"{len(live)} agy worker(s) already running (cap {cfg['max_running']}); --force to override")
@@ -2293,7 +2303,9 @@ CONTAINER_MAX_AGE_H = 4  # state["container_max_age_h"] overrides; the longest l
 def reap_containers(max_age_h: float, docker=None) -> list[str]:
     """Owner 2026-10-14: a `gitgalaxy-gnucobol:3` container (`cobc ... && ./ndb`) spun one core for 52 h after its worker
     was gone. Remove containers of gitgalaxy-* images running longer than max_age_h. Services from other images (the
-    gitgalaxy-db2 container runs icr.io/db2_community/db2) are never touched."""
+    gitgalaxy-db2 container runs icr.io/db2_community/db2) are never touched. A host without Docker has nothing to reap."""
+    if docker is None and not shutil.which("docker"):
+        return []
     docker = docker or (lambda *args: run(["docker", *args], timeout=60))
     r = docker("ps", "--format", "{{.ID}}\t{{.Image}}\t{{.Names}}")
     if getattr(r, "returncode", 1) != 0:
@@ -4588,7 +4600,7 @@ def cmd_status(a) -> int:
     print("queue head: " + ", ".join(f"#{q['issue']}" + ("*" if q.get("needs_owner") else "") + ("(agy)" if q.get("backend") == "agy" else "")
                                      for q in state.get("queue", [])[:6]))
     cfg = agy_cfg(state)
-    print(f"agy lane: enabled={cfg['enabled']} model={cfg['model']} max_running={cfg['max_running']} "
+    print(f"agy lane: enabled={cfg['enabled']}" + (f" ({cfg['off_why']})" if cfg.get("off_why") else "") + f" model={cfg['model']} max_running={cfg['max_running']} "
           f"paused_until={cfg.get('paused_until')}; plan_first={state.get('features', {}).get('plan_first', False)}")
     ok, why = credit_ready(state, bool((p := parse_iso(state.get("paused_until"))) and now() < p))
     if (state.get("credit") or {}).get("grants"):
