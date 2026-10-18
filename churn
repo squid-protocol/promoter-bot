@@ -116,6 +116,44 @@ CREDIT_DEFAULT = {"enabled": True, "key_file": _CFG.get("credit_key_file", str(P
 CREDIT_OUT_RE = re.compile(r"credit balance is too low|insufficient (?:credit|balance|funds)|spend(?:ing)? limit|"
                            r"billing", re.I)
 API_KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")  # either one moves `claude -p` off the plan onto the API
+# Weekly retro (owner 2026-10-18): lessons were only ever added to the repo's .claude rules (88 promoted by 10-18, none
+# removed; the worker brief reached 20 KB, re-read on every worker request). Once a week the gate gathers the week's facts
+# with no model (retro_data) and launches one capped plan worker that promotes, prunes and size-limits the rules in ONE PR,
+# Part of a standing issue (state retro.issue; no issue, no retro). Every deep_every-th retro also audits for outdated
+# or contradictory instructions. size_budget_kb: repo-relative file -> KB the PR must stay within.
+RETRO_DEFAULT = {"enabled": True, "issue": None, "every_days": 7, "model": "sonnet", "budget_usd": 4.0, "deep_every": 4,
+                 "size_budget_kb": {"CLAUDE.md": 16}}
+RETRO_BRIEF = """# Weekly agent retro {day} (Part of #{issue}){deep_tag}
+
+You maintain the instructions every churn worker reads. churn gathered this week's facts, with no model, in
+{data} (JSON: runs by status and kind, send-back messages, refused tool calls with examples, budget-capped runs,
+daily scorecards, unticked lessons-inbox entries). Read it first and judge from it, not from impressions.
+
+Open ONE draft PR titled "Weekly agent retro {day} (Part of #{issue})" that does, in this order:
+1. Recurring failures: name the 1-2 patterns that cost the most this week (send-back reasons, refusals, budget hits).
+   For each, change the rule, skill or agent brief that should have prevented it, or say in the PR body why no
+   instruction can.
+2. Lessons: promote the unticked lessons-inbox entries that are durable and not already covered. Tick each in {inbox}
+   with `-> <file>` (or `-> dropped: <why>`).
+3. Prune: merge duplicate or overlapping rules, delete rules that the code, tests or gates now enforce, and shorten.
+   Size budgets (repo file: KB): {sizes}. Stay within each, and put origin/main's size and yours in the PR body.
+   Removing text counts as much as adding it.
+4. Numbers: in the PR body, a small table of this week's vs. the previous week's daily scorecard figures ($ per merged
+   churn PR, fix loops per merged PR, idle ticks or hours) from the data file, with one line on what moved and which
+   earlier change it may come from.
+{deep}
+Rules for this PR (they override the file limit in the template below): change only `CLAUDE.md`, `AGENTS.md` and
+files under `.claude/`; at most 8 files. Never change the owner-policy rules (`.claude/rules/mainframe-evidence-policy.md`,
+`.claude/rules/issue-triage.md`) except to point at them, and never loosen a gate or a proof rule. A line that records
+an owner decision ("owner 2026-..") stays unless the code made it moot: then say so in the PR body. Keep the PR body
+short: the table, then one bullet per change (what, why, which data).
+
+{template}
+"""
+RETRO_DEEP = ("5. Deep audit (every {n}th retro): read CLAUDE.md, every .claude/rules file, the skills and the agent briefs end\n"
+              "   to end. Fix instructions that point at code, paths or flags that no longer exist (check each one),\n"
+              "   contradictions between files, and text written for older models (shouting, stacked MUSTs, steps the model\n"
+              "   would take anyway). List what you checked in the PR body.\n")
 TICK_ALLOWED = [
     "Bash(churn *)",
     f"Bash({SELF} *)",
@@ -347,7 +385,7 @@ def normalize_state(state: dict) -> list[str]:
     except ValueError as e:
         quarantine("max_workers", state.get("max_workers"), str(e))
         state["max_workers"] = 2
-    for key in ("agy", "features", "usage", "credit"):
+    for key in ("agy", "features", "usage", "credit", "retro"):
         if not isinstance(state.get(key, {}), dict):
             quarantine(key, state[key], "not an object")
             state[key] = {}
@@ -1188,7 +1226,9 @@ def cmd_worker(a) -> int:
             "check_of": getattr(a, "check_of", None), "repo": getattr(a, "repo", None) or None,
             "allow_workflows": bool(allow_wf), "precheck_of": getattr(a, "precheck_of", None)}
     if credit:
-        meta.update(lane="credit", budget_usd=a.budget_usd, queue_item=getattr(a, "queue_item", None))
+        meta.update(lane="credit", queue_item=getattr(a, "queue_item", None))
+    if getattr(a, "budget_usd", None):  # the credit lane's balance, the retro's cap
+        meta["budget_usd"] = a.budget_usd
     (rd / "meta.json").write_text(json.dumps(meta, indent=2))
     meta["pid"] = spawn_detached(f"churn-{run_id}", [sys.executable, SELF, "_run", run_id], wt, rd / "wrapper.log",
                                  [f"CPUQuota={quota}"] if quota else None)
@@ -1333,9 +1373,8 @@ def cmd_run(a) -> int:
     rd = RUNS / a.run_id
     meta = json.loads((rd / "meta.json").read_text())
     env = plan_env(PYTHONPATH=meta["worktree"])
-    budget = WORKER_BUDGET[meta["model"]]
+    budget = float(meta.get("budget_usd") or WORKER_BUDGET[meta["model"]])
     if meta.get("lane") == "credit":
-        budget = float(meta.get("budget_usd") or budget)
         if not (key := credit_key(credit_cfg(load_state()))):  # removed since launch: fail as a credit-auth, requeued
             (rd / "out.json").write_text(json.dumps({"is_error": True, "result": "credit lane: invalid api key (key file missing)"}))
             (rd / "err.txt").write_text("")
@@ -1535,6 +1574,116 @@ def credit_hold(state: dict, status: str, rid: str, text: str) -> None:
     log(f"credit lane blocked: {c['blocked']}; plan workers are unaffected")
     notify("credit-lane", "churn: credit lane stopped", f"{c['blocked']}. Plan workers keep going. "
            "`churn credit add USD` after a new grant (or a new key) starts it again.", priority="low", cooldown_h=24)
+
+
+# ---------------------------------------------------------------- weekly retro
+def retro_cfg(state: dict) -> dict:
+    return {**RETRO_DEFAULT, **{k: v for k, v in (state.get("retro") or {}).items() if k in RETRO_DEFAULT}}
+
+
+def retro_due(state: dict) -> tuple[bool, str]:
+    cfg, r = retro_cfg(state), state.get("retro") or {}
+    if not cfg["enabled"]:
+        return False, "off (`churn retro on`)"
+    if not cfg["issue"]:
+        return False, "no standing issue (`churn retro set issue N`)"
+    if any(x.get("lane") == "retro" and pid_alive(x.get("pid")) for x in state.get("running", [])):
+        return False, "a retro is running"
+    if (last := parse_iso(r.get("last"))) and now() - last < dt.timedelta(days=float(cfg["every_days"])):
+        return False, f"next after {iso(last + dt.timedelta(days=float(cfg['every_days'])))}"
+    return True, "due"
+
+
+SCORECARD_HEAD = re.compile(r"^# Scorecard (\d{4}-\d\d-\d\d)")
+
+
+def retro_data(state: dict, since: dt.datetime, runs_dir: Path | None = None, log_text: str | None = None,
+               inbox: Path | None = None) -> dict:
+    """The week's facts for the retro worker, from churn's own files (no model, no GitHub)."""
+    statuses: dict[str, int] = {}
+    kinds: dict[str, int] = {}
+    denied: dict[str, dict] = {}
+    send_backs, budget_hits = [], []
+    cost = 0.0
+    for m in sorted((runs_dir or RUNS).glob("*/meta.json")):
+        try:
+            meta = json.loads(m.read_text())
+        except (OSError, ValueError):
+            continue
+        if not (t := parse_iso(meta.get("started"))) or t < since or meta.get("lane") == "retro":
+            continue
+        st = "agy-" + str(meta.get("status", "?")) if meta.get("backend") == "agy" else str(meta.get("status", "running"))
+        statuses[st] = statuses.get(st, 0) + 1
+        kind = run_kind(meta, runs_dir)
+        kinds[kind] = kinds.get(kind, 0) + 1
+        cost += float(meta.get("cost_usd") or 0)
+        if st == "budget":
+            budget_hits.append({"run": meta.get("run_id"), "issue": meta.get("issue"), "usd": meta.get("cost_usd"),
+                                "task": str(meta.get("task") or "")[:160]})
+        if kind == "send_back" and (m.parent / "prompt.md").exists():
+            send_backs.append({"run": meta.get("run_id"), "issue": meta.get("issue"),
+                               "message": (m.parent / "prompt.md").read_text()[:400]})
+        with contextlib.suppress(OSError, ValueError):
+            for d in json.loads((m.parent / "out.json").read_text()).get("permission_denials") or []:
+                e = denied.setdefault(str(d.get("tool_name")), {"n": 0, "examples": []})
+                e["n"] += 1
+                if len(e["examples"]) < 3:
+                    e["examples"].append(json.dumps(d.get("tool_input"))[:200])
+    text = log_text if log_text is not None else (LOG.read_text() if LOG.exists() else "")
+    cards: dict[str, list[str]] = {}
+    day = None
+    for line in text.splitlines():
+        if mh := SCORECARD_HEAD.match(line):
+            day = mh.group(1) if mh.group(1) >= str((since - dt.timedelta(days=7)).date()) and mh.group(1) not in cards else None
+            if day:
+                cards[day] = []
+        elif day and line.startswith("- "):
+            cards[day].append(line[2:])
+        else:
+            day = None
+    inbox = inbox or H / "lessons-inbox.md"
+    lessons = [x for x in (inbox.read_text().splitlines() if inbox.exists() else []) if x.startswith("- [ ]")]
+    return {"since": iso(since), "until": iso(now()), "runs": sum(statuses.values()), "cost_usd": round(cost, 2),
+            "statuses": statuses, "kinds": kinds, "budget_hits": budget_hits, "send_backs": send_backs[-25:],
+            "denials": dict(sorted(denied.items(), key=lambda kv: -kv[1]["n"])), "scorecards": dict(sorted(cards.items())),
+            "unticked_lessons": lessons}
+
+
+def retro_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
+    """Launch the weekly retro as a normal plan worker (it takes a slot) when it is due and a slot is free."""
+    state = load_state()
+    ok, _ = retro_due(state)
+    if not ok or state.get("workers_paused") or b.get("verdict") != "GREEN":
+        return []
+    if worker_slots(b, len(claude_slot_holders(state)), slot_ceiling(state, rate_plan(state))) <= 0:
+        return []
+    cfg, r = retro_cfg(state), state.get("retro") or {}
+    n = int(r.get("count", 0)) + 1
+    deep = n % int(cfg["deep_every"]) == 0
+    did = [f"weekly retro #{n} ({cfg['model']}, cap ${cfg['budget_usd']}{', deep audit' if deep else ''})"]
+    if dry_run:
+        return did
+    day = now().strftime("%Y-%m-%d")
+    data = H / "retro" / f"retro-{day}.json"
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.write_text(json.dumps(retro_data(state, now() - dt.timedelta(days=float(cfg["every_days"]))), indent=1))
+    brief = RETRO_BRIEF.format(day=day, issue=cfg["issue"], deep_tag=", deep audit" if deep else "", data=data,
+                               inbox=H / "lessons-inbox.md",
+                               sizes=", ".join(f"{k}: {v}" for k, v in cfg["size_budget_kb"].items()) or "none set",
+                               deep=RETRO_DEEP.format(n=cfg["deep_every"]) if deep else "",
+                               template=worker_brief_template() or "")
+    try:
+        with contextlib.redirect_stdout(open(os.devnull, "w")):
+            cmd_worker(argparse.Namespace(resume_run=None, issue=int(cfg["issue"]), model=cfg["model"],
+                                          task=f"weekly retro {day}", brief=brief, brief_file=None, force=False,
+                                          plan=False, worktree=None, branch=None, check_of=None, repo=None,
+                                          lane="retro", budget_usd=float(cfg["budget_usd"])))
+    except (SystemExit, OSError, RuntimeError) as e:
+        log(f"weekly retro launch refused: {str(e)[:200]}")
+        return []
+    with edit_state() as st:
+        st.setdefault("retro", {}).update(last=iso(now()), count=n)
+    return did
 
 
 # ---------------------------------------------------------------- agy lane
@@ -3722,6 +3871,7 @@ def cmd_tick(a) -> int:
         if direct := direct_launches(b, snap, a.dry_run):
             did += [f"direct launch {d}" for d in direct]
         did += credit_lane(b, snap, False, a.dry_run)  # when=always, or credit about to expire
+        did += retro_lane(b, snap, a.dry_run)
         if did:
             if not a.dry_run:
                 log("lanes: " + ", ".join(did))
@@ -4150,6 +4300,7 @@ def cmd_status(a) -> int:
     ok, why = credit_ready(state, bool((p := parse_iso(state.get("paused_until"))) and now() < p))
     if (state.get("credit") or {}).get("grants"):
         print(f"credit lane: ${credit_balance(state)['balance']:.2f} left; {'launches next tick' if ok else why}")
+    print(f"weekly retro: {retro_due(state)[1]}")
     usage = state.get("usage", {})
     cq = state.get("ci_queue", {})
     print(f"CI mode: {state.get('ci_mode', 'calm')} ({cq.get('queued', '?')} runs queued, median wait "
@@ -4495,6 +4646,39 @@ def cmd_credit(a) -> int:
     return 0
 
 
+def cmd_retro(a) -> int:
+    """`churn retro` (status), `now` (due at the next tick), `on`, `off`, `set issue|every_days|model|budget_usd|deep_every V`,
+    `size FILE KB` (0 removes the budget)."""
+    with edit_state() as st:
+        r = st.setdefault("retro", {})
+        if a.action == "now":
+            r.pop("last", None)
+        elif a.action in ("on", "off"):
+            r["enabled"] = a.action == "on"
+        elif a.action == "set":
+            casts = {"issue": int, "every_days": float, "model": str, "budget_usd": float, "deep_every": int}
+            if a.key not in casts or a.value is None:
+                raise SystemExit(f"retro set: one of {sorted(casts)} and a value")
+            if a.key == "model" and a.value not in WORKER_BUDGET:
+                raise SystemExit(f"retro model: one of {sorted(WORKER_BUDGET)}")
+            r[a.key] = casts[a.key](a.value)
+        elif a.action == "size":
+            if not a.key or a.value is None:
+                raise SystemExit("retro size FILE KB")
+            sizes = dict(retro_cfg(st)["size_budget_kb"])
+            if float(a.value) > 0:
+                sizes[a.key] = float(a.value)
+            else:
+                sizes.pop(a.key, None)
+            r["size_budget_kb"] = sizes
+        state = st
+    cfg, r = retro_cfg(state), state.get("retro") or {}
+    print(f"weekly retro: {'on' if cfg['enabled'] else 'off'}, issue #{cfg['issue']}, every {cfg['every_days']} days, "
+          f"{cfg['model']} cap ${cfg['budget_usd']}, deep audit every {cfg['deep_every']}; done {r.get('count', 0)}, last "
+          f"{r.get('last')}; size budgets {cfg['size_budget_kb']}; now: {retro_due(state)[1]}")
+    return 0
+
+
 def cmd_worktrees(a) -> int:
     """`churn worktrees` removes finished worktrees now (what the gate does every worktree_gc.every_h); --dry-run lists."""
     notes = gc_worktrees(load_state(), dry_run=a.dry_run, limit=a.limit, grace_h=a.grace_h)
@@ -4647,6 +4831,10 @@ def main() -> int:
     cr.add_argument("value", nargs="?")
     cr.add_argument("--expires", help="add: the grant's expiry date (YYYY-MM-DD)")
     cr.add_argument("--note")
+    rt = sub.add_parser("retro", help="weekly retro: status (default) / now / on / off / set KEY V / size FILE KB")
+    rt.add_argument("action", nargs="?", default="status", choices=["status", "now", "on", "off", "set", "size"])
+    rt.add_argument("key", nargs="?")
+    rt.add_argument("value", nargs="?")
     nt = sub.add_parser("notify", help="phone alerts (ntfy): status (default) or send a test")
     nt.add_argument("action", nargs="?", choices=["status", "test", "boot"], default="status")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
@@ -4710,6 +4898,8 @@ def main() -> int:
         return cmd_notify(a)
     if a.cmd == "credit":
         return cmd_credit(a)
+    if a.cmd == "retro":
+        return cmd_retro(a)
     if a.cmd == "watchdog":
         return cmd_watchdog(a)
     if a.cmd == "factory":
