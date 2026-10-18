@@ -4522,15 +4522,24 @@ def own_branches(runs_dir: Path | None = None) -> set[str]:
     return out
 
 
+def host_search() -> str:
+    """Issue-search qualifiers for this host's lane: its excluded milestones, or its one milestone. Label and
+    `lane:` routing can't be said in a search, so counts made this way only follow milestones."""
+    q = "".join(f' -milestone:"{m}"' for m in HOST.get("exclude_milestones") or [])
+    if len(ms := HOST.get("milestones") or []) == 1:
+        q += f' milestone:"{ms[0]}"'
+    return q
+
+
 def core_parts(gh, merged: list[dict], lo: dt.datetime, hi: dt.datetime) -> dict:
-    """The core finish line in parts (owner 2026-10-18): checklist lines of the open scope:core issues (an issue with no
+    """The core finish line in parts (owner 2026-10-18): checklist lines of this host's open scope:core issues (an issue with no
     checklist counts as one part), and the merged PRs that name a core issue (branch churn/<n>- or Part of/Closes #n)
     per hour of the window, so parts_left / per_hour is the time to the finish line at this pace."""
     issues = []
     for page in range(1, 6):
         batch = [i for i in gh(f"repos/{REPO}/issues?labels=scope:core&state=open&per_page=100&page={page}") or []
                  if isinstance(i, dict) and "pull_request" not in i]
-        issues += batch
+        issues += [i for i in batch if not host_skips(i)]
         if len(batch) < 100:
             break
     lines = [checklist(i.get("body")) for i in issues]
@@ -4538,6 +4547,7 @@ def core_parts(gh, merged: list[dict], lo: dt.datetime, hi: dt.datetime) -> dict
     done = sum(sum(c["done"] for c in x) for x in lines)
     closed = gh("search/issues?per_page=100&q=" + urllib.parse.quote(
         f"repo:{REPO} is:issue label:scope:core closed:>={lo.date()}")).get("items") or []
+    closed = [i for i in closed if not host_skips(i)]
     nums = {i.get("number") for i in issues} | {i.get("number") for i in closed}
     refs = lambda p: {int(x) for x in re.findall(r"^(?:churn|agy|claude)/(\d+)-", str(p.get("head", {}).get("ref", "")))} | {
         int(x) for x in re.findall(r"(?:Part of|Fixes|Closes|Resolves)\s+#(\d+)", f"{p.get('title', '')} {p.get('body') or ''}", re.I)}
@@ -4578,9 +4588,10 @@ def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, q
     created = count(f"repo:{REPO} is:issue created:{day}")
     closed = count(f"repo:{REPO} is:issue closed:{day}")
     # owner 2026-10-16: lead with the fixed finish line, the scope:core burn-down (frontier growth is discovery, not debt)
-    core = {"open": count(f"repo:{REPO} is:issue is:open label:scope:core"),
-            "opened": count(f"repo:{REPO} is:issue label:scope:core created:{day}"),
-            "closed": count(f"repo:{REPO} is:issue label:scope:core closed:{day}"),
+    lane = host_search()  # owner 2026-10-18: core here = this host's lane (the DOOM box counts its own)
+    core = {"open": count(f"repo:{REPO} is:issue is:open label:scope:core{lane}"),
+            "opened": count(f"repo:{REPO} is:issue label:scope:core created:{day}{lane}"),
+            "closed": count(f"repo:{REPO} is:issue label:scope:core closed:{day}{lane}"),
             "frontier_opened": count(f"repo:{REPO} is:issue label:scope:frontier created:{day}")}
     core.update(core_parts(gh, merged, lo, min(hi, now())))
     reds = [i for i in gh(f"repos/{REPO}/issues?labels=ci-red-main&state=all&per_page=100&since={iso(lo - dt.timedelta(days=7))}")
@@ -4810,8 +4821,9 @@ def cmd_scorecard(a) -> int:
 def cmd_checklist(a) -> int:
     """Checklist parts per open issue of a scope (default core): ticked / total, and the next unclaimed line."""
     state = load_state()
-    issues = [i for i in gh_pages(f"repos/{REPO}/issues?labels=scope:{a.scope}&state=open&per_page=100")
-              if "pull_request" not in i]
+    every = [i for i in gh_pages(f"repos/{REPO}/issues?labels=scope:{a.scope}&state=open&per_page=100")
+             if "pull_request" not in i]
+    issues = [i for i in every if not host_skips(i)]  # this host's lane only; the other host counts its own
     total = done = 0
     for i in sorted(issues, key=lambda i: -sum(not c["done"] for c in checklist(i.get("body")))):
         items = checklist(i.get("body"))
@@ -4820,7 +4832,8 @@ def cmd_checklist(a) -> int:
         nxt = next_check(i, state)
         print(f"#{i['number']:<5} {d}/{n:<3} {i.get('title', '')[:70]}"
               + (f"\n        next [c:{nxt['key']}] {nxt['text'][:90]}" if nxt and a.next else ""))
-    print(f"{len(issues)} open scope:{a.scope} issues: {done}/{total} parts ticked, {total - done} left")
+    print(f"{len(issues)} open scope:{a.scope} issues: {done}/{total} parts ticked, {total - done} left"
+          + (f" ({len(every) - len(issues)} in another host's lane not counted)" if len(every) > len(issues) else ""))
     return 0
 
 
