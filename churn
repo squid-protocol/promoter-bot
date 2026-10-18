@@ -73,6 +73,7 @@ STOP = H / "churn.stop"
 DIRTY = H / "churn.dirty"
 SNAP = H / "churn-snapshot.json"
 RUNS = H / "churn-runs"
+TICK_STATUS = RUNS / "ticks" / "status.md"  # one fixed path: the tick prompt names it, so the prompt never changes
 TICK_LOCK = H / ".churn-tick.lock"
 STATE_LOCK = H / ".churn-state.lock"
 V6 = Path(_CFG.get("repo_dir", str(ROOT / "repo")))  # the primary checkout
@@ -105,6 +106,9 @@ WORKER_ENV = {
     # Owner 2026-10-16: auto-compact against a 160k window (fires ~145k). 25% of worker requests ran over 150k and
     # cost 45% of worker spend: every request re-sends the whole context.
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "160000",
+    # 2026-10-18 cost audit: the owner's claude.ai connectors (Claude Docs, Gmail, ...) joined every worker mid-session
+    # as tool lists + server instructions no worker uses; with --strict-mcp-config the sessions load no MCP at all.
+    "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
 }
 SELFSCAN_PY = _CFG.get("python", sys.executable)  # the repo's own venv
 AGY_WORKER = shutil.which("agy-worker") or str(Path.home() / ".local/bin/agy-worker")
@@ -626,10 +630,23 @@ def existing_pr_note(n: int, branch: str) -> str:
 
 # ---------------------------------------------------------------- usage / pace
 def run_cost(out: dict) -> tuple[float, int]:
-    """List-price USD and fresh tokens (input + output + cache writes; cache reads excluded)."""
+    """List-price USD and fresh tokens (input + output + cache writes; cache reads excluded). The USD is the SESSION's
+    total: `claude -p --resume` reports the cost since the session began, not since the resume (see session_cost_at)."""
     u = out.get("usage") or {}
     tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens"))
     return float(out.get("total_cost_usd") or 0.0), tokens
+
+
+def session_cost_at(prev: dict) -> float:
+    """The session's total cost when run `prev` ended: what a run resuming it already carries. 2026-10-18 audit: each
+    send-back logged its whole session again (one $0.95 session logged as $3.29), so the ledger ran ~1.9x high and
+    --max-budget-usd on a resume was checked against the earlier runs' spend too. Runs from before the fix have no
+    session_cost_usd: read their out.json."""
+    if "session_cost_usd" in prev:
+        return float(prev["session_cost_usd"])
+    with contextlib.suppress(OSError, ValueError):
+        return run_cost(json.loads((RUNS / prev["run_id"] / "out.json").read_text()))[0]
+    return 0.0
 
 
 def window_usd(state: dict, at: dt.datetime | None = None) -> float:
@@ -1073,7 +1090,7 @@ SESSION_SETTINGS = json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hoo
 
 def claude_cmd(prompt: str, model: str, budget: float, resume: str | None = None, allowed: list[str] | None = None) -> list[str]:
     cmd = [CLAUDE, "-p", prompt, "--model", model, "--permission-mode", "auto", "--output-format", "json",
-           "--max-budget-usd", str(budget), "--settings", SESSION_SETTINGS]
+           "--max-budget-usd", str(budget), "--settings", SESSION_SETTINGS, "--strict-mcp-config"]
     if resume:
         cmd += ["--resume", resume]
     if allowed:
@@ -1240,6 +1257,7 @@ def cmd_worker(a) -> int:
     meta = {"run_id": run_id, "issue": issue, "model": model, "task": task, "worktree": str(wt), "branch": branch,
             "started": iso(now()), "resume_session": resume_of["session_id"] if resume_of else None,
             "resume_of": resume_of["run_id"] if resume_of else None, "plan": plan,
+            "resume_base_usd": round(session_cost_at(resume_of), 4) if resume_of else 0.0,
             "check_of": getattr(a, "check_of", None), "repo": getattr(a, "repo", None) or None,
             "allow_workflows": bool(allow_wf), "precheck_of": getattr(a, "precheck_of", None)}
     if credit:
@@ -1392,7 +1410,8 @@ def cmd_run(a) -> int:
     rd = RUNS / a.run_id
     meta = json.loads((rd / "meta.json").read_text())
     env = plan_env(PYTHONPATH=meta["worktree"])
-    budget = float(meta.get("budget_usd") or WORKER_BUDGET[meta["model"]])
+    # --max-budget-usd is checked against the session's total, which on a resume includes the earlier runs
+    budget = float(meta.get("budget_usd") or WORKER_BUDGET[meta["model"]]) + float(meta.get("resume_base_usd") or 0)
     if meta.get("lane") == "credit":
         if not (key := credit_key(credit_cfg(load_state()))):  # removed since launch: fail as a credit-auth, requeued
             (rd / "out.json").write_text(json.dumps({"is_error": True, "result": "credit lane: invalid api key (key file missing)"}))
@@ -1428,7 +1447,7 @@ def cmd_run(a) -> int:
                 (rd / "err.txt").write_text("")
                 return 0
             resume = pout["session_id"]
-            budget = max(1.0, round(budget - pcost, 2))
+            budget = max(round(pcost + 1.0, 2), budget)  # phase 2 resumes the plan session: its total includes pcost
             prompt = ("PHASE 2: churn's gate accepted your plan. Impact check from the self-scan DB and the in-flight "
                       f"branches:\n```json\n{json.dumps({k: impact[k] for k in ('stats', 'direct_overlap', 'near_overlap')}, indent=1)[:3000]}\n```\n"
                       "Overlap with an open PR means that PR will likely merge first: merge origin/main before you push "
@@ -1920,9 +1939,10 @@ def reap(state: dict) -> list[dict]:
         meta = json.loads((rd / "meta.json").read_text())
         held = (rd / "plan_held").exists()
         credit = r.get("lane") == "credit"
-        if held:  # out.json is the plan phase's; don't count it twice
-            cost = 0.0
-        cost += float(meta.get("plan_cost_usd") or 0)
+        # out.json is the session's total: it includes the plan phase (phase 2 resumes it; a held or failed plan's
+        # out.json IS the plan's) and, on a resume, the runs before. Keep the total, log only this run's part.
+        session_cost = max(cost, float(meta.get("plan_cost_usd") or 0))
+        cost = max(0.0, session_cost - float(meta.get("resume_base_usd") or 0))
         denials = out.get("permission_denials") or []
         if (rd / "preempted").exists():
             status = "preempted"
@@ -1955,7 +1975,8 @@ def reap(state: dict) -> list[dict]:
             # the branch the worker really used (it may rename it) and its open PR: a requeue or relaunch must name them
             branch, pr = worktree_pr(meta["worktree"], r["issue"])
             meta["branch"] = branch or meta["branch"]
-        meta.update(session_id=out.get("session_id"), status=status, cost_usd=round(cost, 2), finished=iso(now()), pr=pr)
+        meta.update(session_id=out.get("session_id"), status=status, cost_usd=round(cost, 2), finished=iso(now()), pr=pr,
+                    session_cost_usd=round(session_cost, 4))
         if pr and not meta.get("repo") and all(pr_num(p) != pr for p in state.get("prs", [])):
             # 2026-10-16 audit: only the model's `pr watch` made a PR visible; a review that skipped it left the PR with no
             # fix items, review needs or followups
@@ -3666,8 +3687,7 @@ def model_tick(reasons: list[str], model: str, state: dict, b: dict) -> dict:
     td = RUNS / "ticks"
     td.mkdir(parents=True, exist_ok=True)
     stamp = now().strftime("%Y%m%dT%H%M%SZ")
-    prompt = (
-        "/night-shift tick\n\n"
+    status = (
         f"Headless tick started by `churn tick` at {iso(now())}. The gate already reaped finished workers, "
         "refreshed the PR snapshot and checked the box; don't redo those. Why this tick runs:\n"
         + "\n".join(f"- {r}" for r in reasons)
@@ -3681,7 +3701,17 @@ def model_tick(reasons: list[str], model: str, state: dict, b: dict) -> dict:
         + f"Claude workers running: {sum(1 for r in state.get('running', []) if r.get('run_id') and r.get('backend') != 'agy' and r.get('lane') != 'credit')} "
         f"of {state.get('max_workers', 2)} (agy-lane runs: {sum(1 for r in state.get('running', []) if r.get('backend') == 'agy')}, "
         "they do NOT count toward the cap).\n"
-        + "Launch workers ONLY with `churn worker` (never the Agent tool); send one back with `churn send-back`.\n"
+    )
+    # 2026-10-18 cost audit: the skill's ~37 KB body lands AFTER the command args, so a per-tick status in the args made
+    # every tick re-write ~22k cache tokens (~79% of a tick's cost). The prompt is now byte-identical across ticks (the
+    # skill body stays cached for the hour) and this tick's status is a file the tick reads first.
+    (td / f"{stamp}-{model}-status.md").write_text(status)
+    TICK_STATUS.write_text(status)
+    prompt = (
+        "/night-shift tick\n\n"
+        f"Start by reading {TICK_STATUS}: when this headless tick started and why it runs, the box, spend and "
+        "running workers.\n"
+        "Launch workers ONLY with `churn worker` (never the Agent tool); send one back with `churn send-back`.\n"
         + TICK_CLI
         + "Reply in 2-4 lines."
     )

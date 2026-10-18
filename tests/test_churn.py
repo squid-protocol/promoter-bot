@@ -1468,6 +1468,39 @@ def test_reap_watches_the_workers_pr(churn, monkeypatch):
     assert len(st["prs"]) == 1  # already watched
 
 
+def _reaped_cost(churn, rid, meta, out, held=False):
+    rd = churn.RUNS / rid
+    rd.mkdir(parents=True)
+    (rd / "meta.json").write_text(json.dumps({"run_id": rid, "worktree": str(rd), "branch": "b", "issue": 1,
+                                              "model": "sonnet", **meta}))
+    (rd / "exit").write_text("0\n")
+    (rd / "out.json").write_text(json.dumps({"result": "done", "session_id": "s", **out}))
+    if held:
+        (rd / "plan_held").write_text("{}")
+    st = {"prs": [], "running": [{"run_id": rid, "pid": 0, "issue": 1, "model": "sonnet"}]}
+    churn.reap(st)
+    return st["usage"]["log"][-1]["cost_usd"], json.loads((rd / "meta.json").read_text())
+
+
+def test_a_resumed_session_logs_only_its_own_cost(churn):
+    """2026-10-18: `claude -p --resume` reports the session's total, so a send-back logged the whole session again."""
+    cost, meta = _reaped_cost(churn, "1-a", {}, {"total_cost_usd": 0.69})
+    assert cost == 0.69 and meta["session_cost_usd"] == 0.69
+    assert churn.session_cost_at(meta) == 0.69
+    cost, meta = _reaped_cost(churn, "1-b", {"resume_base_usd": 0.69}, {"total_cost_usd": 0.95})
+    assert cost == 0.26 and meta["session_cost_usd"] == 0.95
+    assert churn.session_cost_at({"run_id": "1-a"}) == 0.69  # a run from before the fix: its out.json
+
+
+def test_a_plan_first_run_counts_its_plan_once(churn):
+    cost, _ = _reaped_cost(churn, "1-p", {"plan": True, "plan_cost_usd": 0.4}, {"total_cost_usd": 1.5})
+    assert cost == 1.5  # phase 2 resumed the plan session: its total already holds the plan
+    cost, _ = _reaped_cost(churn, "1-h", {"plan": True, "plan_cost_usd": 0.4}, {"total_cost_usd": 0.4}, held=True)
+    assert cost == 0.4
+    cost, _ = _reaped_cost(churn, "1-c", {"plan": True, "plan_cost_usd": 0.4}, {})  # phase 2 crashed: no out total
+    assert cost == 0.4
+
+
 def test_parked_flaked_and_clean_prs_do_not_hold_normal_churn(churn):
     snap = {str(n): pr(head=f"h{n}", labels=["shepherd:needs-fix"]) for n in (1, 2, 3)}
     st = {"prs": [{"number": 1}, {"number": 2, "flake_head": "h2", "flake_at": churn.iso(churn.now())},
@@ -2638,3 +2671,17 @@ def test_refill_queues_only_this_hosts_lanes_and_no_callgraph_fallback(churn, mo
     monkeypatch.setitem(churn.REFILL_DEFAULT, "agent_every_h", 10 ** 6)
     monkeypatch.setitem(churn.REFILL_DEFAULT, "agent_empty_min", 10 ** 8)
     assert churn.refill(churn.load_state(), {}, force=True) == ("callgraph", [])  # not the standing call-graph epic
+
+
+def test_the_tick_prompt_is_the_same_every_tick(churn, monkeypatch):
+    """2026-10-18: the status rode in the command args, before the skill body, so no tick ever reused the cache."""
+    cmds = []
+    monkeypatch.setattr(churn.subprocess, "run", lambda cmd, **kw: cmds.append(cmd))
+    box = {"verdict": "GREEN", "free_slots": 1, "reasons": []}
+    churn.model_tick(["review: run A"], "sonnet", {}, box)
+    assert "review: run A" in churn.TICK_STATUS.read_text()
+    churn.model_tick(["PR needs review: #7"], "sonnet", {"usage": {"pace": "off"}}, box)
+    assert "PR needs review: #7" in churn.TICK_STATUS.read_text()
+    prompts = [c[c.index("-p") + 1] for c in cmds]
+    assert prompts[0] == prompts[1] and str(churn.TICK_STATUS) in prompts[0] and "run A" not in prompts[0]
+    assert "--strict-mcp-config" in cmds[0]
