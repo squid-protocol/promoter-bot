@@ -105,6 +105,17 @@ AGY_DEFAULT = {"enabled": True, "model": "gemini-3.8-flash-high", "max_running":
                "checker_model": "sonnet"}
 AGY_LIMIT_RE = re.compile(r"quota|RESOURCE_EXHAUSTED|rate.?limit|\b429\b|usage limit|exhausted", re.I)
 PLAN_SHARE = 0.25  # share of the worker budget the plan phase may use
+# Credit lane (owner 2026-10-17): prepaid API credits are windfalls (a monthly allotment, random free grants), so they buy
+# extra issue throughput and never infrastructure: ticks, the gate and every other worker stay on the Claude plan and work
+# the same at a $0 balance. A credit worker is a normal worker whose `claude -p` bills the API (ANTHROPIC_API_KEY read from
+# key_file at run time) instead of the plan. It takes no plan slot and launches while the plan is at its limit
+# (when "paused"), or any time (when "always", or while a grant is about to expire). Overridable in state["credit"].
+CREDIT_DEFAULT = {"enabled": True, "key_file": _CFG.get("credit_key_file", str(Path.home() / ".config/promoter-bot/anthropic-credit.key")),
+                  "model": "sonnet", "max_running": 1, "when": "paused", "floor_usd": 1.0, "min_run_usd": 3.0,
+                  "expiry_rush_days": 3}
+CREDIT_OUT_RE = re.compile(r"credit balance is too low|insufficient (?:credit|balance|funds)|spend(?:ing)? limit|"
+                           r"billing", re.I)
+API_KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")  # either one moves `claude -p` off the plan onto the API
 TICK_ALLOWED = [
     "Bash(churn *)",
     f"Bash({SELF} *)",
@@ -336,7 +347,7 @@ def normalize_state(state: dict) -> list[str]:
     except ValueError as e:
         quarantine("max_workers", state.get("max_workers"), str(e))
         state["max_workers"] = 2
-    for key in ("agy", "features", "usage"):
+    for key in ("agy", "features", "usage", "credit"):
         if not isinstance(state.get(key, {}), dict):
             quarantine(key, state[key], "not an object")
             state[key] = {}
@@ -707,7 +718,8 @@ def rate_plan(state: dict, at: dt.datetime | None = None) -> dict | None:
         start, end, spent, left_h = at - dt.timedelta(hours=WINDOW_H), None, window_usd(state, at), float(WINDOW_H)
     rate = {m: model_rate(state, m) for m in MODELS}
     cost = {m: min(expected_usd(state, m), rate[m] * left_h) for m in MODELS}  # what one more run bills in THIS block
-    live = [r for r in state.get("running", []) if r.get("run_id") and r.get("backend") != "agy" and pid_alive(r.get("pid"))]
+    live = [r for r in state.get("running", []) if r.get("run_id") and r.get("backend") != "agy" and r.get("lane") != "credit"
+            and pid_alive(r.get("pid"))]
     committed = 0.0
     for r in live:
         m = r.get("model", "sonnet")
@@ -758,7 +770,7 @@ def slot_ceiling(state: dict, plan: dict | None) -> int:
 
 def live_opus_count(state: dict) -> int:
     return sum(1 for r in state.get("running", []) if r.get("run_id") and r.get("backend") != "agy"
-               and r.get("model") == "opus" and pid_alive(r.get("pid")))
+               and r.get("lane") != "credit" and r.get("model") == "opus" and pid_alive(r.get("pid")))
 
 
 def budget_picks(state: dict, snap: dict | None, mode: str, n: int, plan: dict | None) -> list[tuple[int, dict]]:
@@ -1150,11 +1162,12 @@ def cmd_worker(a) -> int:
             isinstance(p, dict) and p.get("allow_workflows") and p.get("issue") == issue for p in state.get("prs", []))
         backfill = (getattr(a, "lane", None) or next((q.get("lane") for q in state.get("queue", []) if q.get("issue") == issue
                                                      and not q.get("pr")), None)) == "backfill"
-        if not a.force and not backfill and len(live) >= cap:
+        credit = getattr(a, "lane", None) == "credit"
+        if not a.force and not backfill and not credit and len(live) >= cap:
             raise SystemExit(f"{len(live)} Claude worker(s) already running (cap {cap} for this mix: state.max_workers, or "
                              "rate.max_workers_burst with no Opus while the block can carry it); --force to override")
         # A send-back finishes work in hand: never capped. Approving a held plan starts the implementation: capped.
-        if model == "opus" and not a.force and (not resume_of or resume_of.get("status") == "plan-held"):
+        if model == "opus" and not a.force and not credit and (not resume_of or resume_of.get("status") == "plan-held"):
             ocap = plan["opus_cap"] if plan else int(state.get("max_opus", 1))
             if live_opus_count(state) >= ocap:
                 raise SystemExit(f"{live_opus_count(state)} Opus worker(s) already running (opus cap {ocap}: "
@@ -1174,6 +1187,8 @@ def cmd_worker(a) -> int:
             "resume_of": resume_of["run_id"] if resume_of else None, "plan": plan,
             "check_of": getattr(a, "check_of", None), "repo": getattr(a, "repo", None) or None,
             "allow_workflows": bool(allow_wf), "precheck_of": getattr(a, "precheck_of", None)}
+    if credit:
+        meta.update(lane="credit", budget_usd=a.budget_usd, queue_item=getattr(a, "queue_item", None))
     (rd / "meta.json").write_text(json.dumps(meta, indent=2))
     meta["pid"] = spawn_detached(f"churn-{run_id}", [sys.executable, SELF, "_run", run_id], wt, rd / "wrapper.log",
                                  [f"CPUQuota={quota}"] if quota else None)
@@ -1298,6 +1313,12 @@ def self_scan(wt: str, rd: Path) -> bool:
     return rc == 0
 
 
+def plan_env(**extra) -> dict:
+    """Environment for a Claude run billed to the plan: any API key in the caller's environment is dropped, so a stray
+    `export ANTHROPIC_API_KEY` can never move the fleet onto paid API usage."""
+    return {**{k: v for k, v in os.environ.items() if k not in API_KEY_VARS}, **WORKER_ENV, **extra}
+
+
 def _claude(cmd: list[str], cwd: str, env: dict, out_path: Path, err_path: Path) -> tuple[int, dict]:
     with open(out_path, "w") as out, open(err_path, "w") as err:
         rc = subprocess.call(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
@@ -1311,8 +1332,18 @@ def cmd_run(a) -> int:
     """Detached body of one worker: (plan, impact check,) run claude, save its JSON, then nudge a tick."""
     rd = RUNS / a.run_id
     meta = json.loads((rd / "meta.json").read_text())
-    env = {**os.environ, **WORKER_ENV, "PYTHONPATH": meta["worktree"]}
+    env = plan_env(PYTHONPATH=meta["worktree"])
     budget = WORKER_BUDGET[meta["model"]]
+    if meta.get("lane") == "credit":
+        budget = float(meta.get("budget_usd") or budget)
+        if not (key := credit_key(credit_cfg(load_state()))):  # removed since launch: fail as a credit-auth, requeued
+            (rd / "out.json").write_text(json.dumps({"is_error": True, "result": "credit lane: invalid api key (key file missing)"}))
+            (rd / "err.txt").write_text("")
+            (rd / "exit").write_text(f"1\n{iso(now())}\n")
+            DIRTY.touch()
+            nudge_tick()
+            return 0
+        env["ANTHROPIC_API_KEY"] = key
     prompt = (rd / "prompt.md").read_text()
     resume = meta.get("resume_session")
     rc = 0
@@ -1354,6 +1385,156 @@ def cmd_run(a) -> int:
         DIRTY.touch()
         nudge_tick()
     return 0
+
+
+# ---------------------------------------------------------------- credit lane
+def credit_cfg(state: dict) -> dict:
+    return {**CREDIT_DEFAULT, **{k: v for k, v in (state.get("credit") or {}).items() if k in CREDIT_DEFAULT}}
+
+
+def credit_key(cfg: dict) -> str | None:
+    with contextlib.suppress(OSError):
+        return Path(cfg["key_file"]).expanduser().read_text().strip() or None
+    return None
+
+
+def credit_balance(state: dict, at: dt.datetime | None = None) -> dict:
+    """The lane's own ledger: grants (`churn credit add`) minus the list-price cost of credit runs, which is what the API
+    bills. Spend draws on the grants live at that moment, earliest expiry first; what a grant has left when it expires
+    is lost. `churn credit sync` corrects drift against the Console's balance with an adjustment grant."""
+    at = at or now()
+    c = state.get("credit") or {}
+    grants = sorted(({"usd": float(g.get("usd") or 0), "left": float(g.get("usd") or 0),
+                      "expires": parse_iso(g.get("expires"))} for g in c.get("grants", [])),
+                    key=lambda g: g["expires"] or dt.datetime.max.replace(tzinfo=dt.timezone.utc))
+    spent = over = 0.0
+    for e in sorted(c.get("log", []), key=lambda e: e.get("t", "")):
+        cost, t = float(e.get("cost_usd") or 0), parse_iso(e.get("t")) or at
+        spent += cost
+        for g in grants:
+            if cost <= 0:
+                break
+            if g["left"] > 0 and not (g["expires"] and g["expires"] <= t):
+                take = min(g["left"], cost)
+                g["left"] -= take
+                cost -= take
+        over += cost
+    live = [g for g in grants if not (g["expires"] and g["expires"] <= at)]
+    soon = [g for g in live if g["expires"] and g["left"] > 0]
+    return {"granted": round(sum(g["usd"] for g in grants), 2), "spent": round(spent, 2),
+            "expired": round(sum(g["left"] for g in grants if g not in live), 2), "over": round(over, 2),
+            "balance": round(max(0.0, sum(g["left"] for g in live) - over), 2),
+            "next_expiry": iso(min(g["expires"] for g in soon)) if soon else None}
+
+
+def credit_ready(state: dict, plan_paused: bool) -> tuple[bool, str]:
+    """Whether the credit lane may launch now, and why not (for `churn credit status`)."""
+    cfg, c = credit_cfg(state), state.get("credit") or {}
+    if not cfg["enabled"]:
+        return False, "off (`churn credit on`)"
+    if not c.get("grants"):
+        return False, "no credit recorded (`churn credit add USD`)"
+    if c.get("blocked"):
+        return False, f"blocked: {c['blocked']} (`churn credit add` or `churn credit on` clears it)"
+    if (p := parse_iso(c.get("paused_until"))) and now() < p:
+        return False, f"API rate limit, paused until {iso(p)}"
+    if not credit_key(cfg):
+        return False, f"no API key in {cfg['key_file']}"
+    bal = credit_balance(state)
+    if bal["balance"] - credit_committed(state) - float(cfg["floor_usd"]) < float(cfg["min_run_usd"]):
+        return False, f"balance ${bal['balance']:.2f} is below floor ${cfg['floor_usd']} + one run ${cfg['min_run_usd']}"
+    live = [r for r in state.get("running", []) if r.get("lane") == "credit" and pid_alive(r.get("pid"))]
+    if len(live) >= int(cfg["max_running"]):
+        return False, f"{len(live)} credit worker(s) running (max_running {cfg['max_running']})"
+    rush = (e := parse_iso(bal["next_expiry"])) and e - now() <= dt.timedelta(days=float(cfg["expiry_rush_days"]))
+    if cfg["when"] == "paused" and not plan_paused and not rush:
+        return False, "waiting for a plan limit pause (when=paused)"
+    return True, "expiring credit" if rush and not plan_paused else "ready"
+
+
+def credit_committed(state: dict) -> float:
+    """Budget caps of the credit runs still going: not in the ledger yet, but already promised."""
+    out = 0.0
+    for r in state.get("running", []):
+        if r.get("lane") == "credit" and r.get("run_id") and pid_alive(r.get("pid")):
+            out += float(_run_meta(r["run_id"]).get("budget_usd") or 0)
+    return out
+
+
+def credit_pick(state: dict, snap: dict, cfg: dict) -> tuple[dict, dict] | tuple[None, None]:
+    """The first queue item the credit lane can run with no model tick (direct_spec): PR fixes first, then normal and
+    ci items by scope and tier. Items queued for Opus stay with the plan unless the lane itself runs Opus."""
+    q = [(i, x) for i, x in enumerate(state.get("queue", [])) if not x.get("needs_owner") and x.get("backend") != "agy"
+         and x.get("lane", "normal") in ("normal", "ci") and not blocked_by(x, snap, state) and not waiting(x)
+         and not plan_overlap(state, x) and not scope_held(x)
+         and (x.get("model", "sonnet") != "opus" or cfg["model"] == "opus")]
+    q.sort(key=lambda ix: (not ix[1].get("pr"), scope_rank(ix[1]), TIER_RANK[item_tier(ix[1])], ix[0]))
+    for _, x in q:
+        if (spec := direct_spec(state, snap, x)) is not None:
+            return x, spec
+    return None, None
+
+
+def credit_lane(b: dict, snap: dict, plan_paused: bool, dry_run: bool = False) -> list[str]:
+    """Launch credit workers while credit_ready says so (one per call): same box rule as the agy lane."""
+    state = load_state()
+    ok, _ = credit_ready(state, plan_paused)
+    if not ok or state.get("workers_paused") or b.get("verdict") != "GREEN" or b.get("free_slots", 0) < 1:
+        return []
+    cfg = credit_cfg(state)
+    x, spec = credit_pick(state, snap, cfg)
+    if x is None:
+        return []
+    if not x.get("pr") and len(prs_needing_work(snap, claude_slot_holders(state), state)) >= 3:
+        return []  # the gate's "finish those first" hold
+    budget = round(min(WORKER_BUDGET[cfg["model"]],
+                       credit_balance(state)["balance"] - credit_committed(state) - float(cfg["floor_usd"])), 2)
+    did = [f"credit worker for #{x['issue']} ({cfg['model']}, cap ${budget:.2f})"]
+    if dry_run:
+        return did
+    try:
+        with contextlib.redirect_stdout(open(os.devnull, "w")):
+            cmd_worker(argparse.Namespace(resume_run=None, issue=x["issue"], model=cfg["model"], task=x.get("task"),
+                                          brief=spec["brief"], brief_file=None, force=False, plan=spec["plan"],
+                                          worktree=spec["worktree"], branch=spec.get("branch"), check_of=None,
+                                          repo=spec.get("repo"), lane="credit", budget_usd=budget, queue_item=x))
+    except (SystemExit, OSError, RuntimeError) as e:
+        log(f"credit launch of #{x['issue']} refused, left queued: {str(e)[:200]}")
+        return []
+    with edit_state() as st:
+        with contextlib.suppress(ValueError):
+            st.get("queue", []).remove(x)
+        if spec.get("held_plan"):
+            st.get("held_plans", {}).pop(spec["held_plan"], None)
+    return did
+
+
+def credit_failure(out: dict, text: str) -> str | None:
+    """A credit run that failed on billing, not on the work: the credit ran out, the key was refused, or the API's own
+    rate limit. None for any other outcome (those take the normal statuses)."""
+    if not out.get("is_error") and out.get("api_error_status") != 429:
+        return None
+    if CREDIT_OUT_RE.search(text):
+        return "credit-out"
+    if AUTH_RE.search(text):
+        return "credit-auth"
+    if out.get("api_error_status") == 429 or limit_reset(text) or re.search(r"rate.?limit|\b429\b|overloaded", text, re.I):
+        return "credit-limit"
+    return None
+
+
+def credit_hold(state: dict, status: str, rid: str, text: str) -> None:
+    """Hold only the credit lane: a billing failure never pauses the plan's workers or pages a Claude login failure."""
+    c = state.setdefault("credit", {})
+    if status == "credit-limit":
+        reset = limit_reset(text)
+        c["paused_until"] = iso(reset if reset and reset > now() else now() + dt.timedelta(hours=1))
+        log(f"credit lane: API rate limit on {rid}; paused until {c['paused_until']}")
+        return
+    c["blocked"] = ("API credit ran out" if status == "credit-out" else "API key refused") + f" ({rid}, {iso(now())})"
+    log(f"credit lane blocked: {c['blocked']}; plan workers are unaffected")
+    notify("credit-lane", "churn: credit lane stopped", f"{c['blocked']}. Plan workers keep going. "
+           "`churn credit add USD` after a new grant (or a new key) starts it again.", priority="low", cooldown_h=24)
 
 
 # ---------------------------------------------------------------- agy lane
@@ -1446,7 +1627,7 @@ def cmd_agyrun(a) -> int:
     rd = RUNS / a.run_id
     meta = json.loads((rd / "meta.json").read_text())
     cfg = agy_cfg(load_state())
-    env = {**os.environ, **WORKER_ENV, "PYTHONPATH": meta["worktree"], "AGY_MODEL": meta["model"],
+    env = {**plan_env(), "PYTHONPATH": meta["worktree"], "AGY_MODEL": meta["model"],
            "AGY_MODE": "accept-edits", "AGY_ADD_DIR": meta["worktree"], "AGY_TIMEOUT": str(cfg["timeout_s"]),
            "AGY_RUN_DIR": str(rd)}
     rc = 1
@@ -1558,6 +1739,7 @@ def reap(state: dict) -> list[dict]:
         cost, tokens = run_cost(out)
         meta = json.loads((rd / "meta.json").read_text())
         held = (rd / "plan_held").exists()
+        credit = r.get("lane") == "credit"
         if held:  # out.json is the plan phase's; don't count it twice
             cost = 0.0
         cost += float(meta.get("plan_cost_usd") or 0)
@@ -1568,6 +1750,9 @@ def reap(state: dict) -> list[dict]:
             status = "crashed"
         elif held:
             status = "plan-held"
+        elif credit and (cf := credit_failure(out, result + "\n" + err)):
+            status = cf
+            credit_hold(state, status, rid, result + "\n" + err)
         elif out.get("is_error") and AUTH_RE.search(result + "\n" + err):
             status = "crashed"
             auth_alert(result + "\n" + err, f"worker {rid}")
@@ -1610,7 +1795,8 @@ def reap(state: dict) -> list[dict]:
             + (f"\n## Permission denials\n```\n{json.dumps(denials, indent=1)[:4000]}\n```\n" if denials else "")
             + (f"\n## stderr (tail)\n```\n{err[-2000:]}\n```\n" if err.strip() and status != 'done' else "")
             + f"\n## Worker's final report\n\n{result or '(none)'}\n")
-        state.setdefault("usage", {}).setdefault("log", []).append(
+        # a credit run's cost is API credit, not plan usage: its own ledger, so pacing never learns from it
+        (state.setdefault("credit", {}) if credit else state.setdefault("usage", {})).setdefault("log", []).append(
             {"t": iso(now()), "model": r["model"], "tokens": tokens, "cost_usd": round(cost, 2), "issue": r["issue"], "run_id": rid,
              **({"started": r["started"]} if r.get("started") else {})})
         entry = {"run_id": rid, "issue": r["issue"], "model": r["model"], "status": status, "report": str(rd / "report.md"),
@@ -1624,7 +1810,17 @@ def reap(state: dict) -> list[dict]:
             start_precheck(rid)
         if meta.get("check_of"):  # agy work checked by Sonnet: a Sonnet tick does the merge review (owner 2026-10-12)
             entry.update(check_of=meta["check_of"], review_model="sonnet")
-        if status == "offline":  # nothing to review: the same work goes back to the front of the queue
+        if status.startswith("credit-"):  # billing, not the work: the item goes back for the plan (or credit) to run
+            orig = dict(meta.get("queue_item") or {"issue": r["issue"], "model": "sonnet", "needs_owner": False,
+                                                     "task": str(r.get("task") or "")})
+            if Path(meta["worktree"]).is_dir() and branch_files(meta["worktree"]):
+                orig["task"] = (f"RESUME credit run {rid} ({status} {iso(now())}): same worktree {meta['worktree']} / "
+                                f"branch {meta['branch']}; read its handoff note, keep uncommitted edits, continue. "
+                                f"{str(orig.get('task') or '')[:300]}")
+            if pr:
+                orig["pr"] = pr
+            state.setdefault("queue", []).insert(0, orig)
+        elif status == "offline":  # nothing to review: the same work goes back to the front of the queue
             item = {"issue": r["issue"], "model": r.get("model", "sonnet"), "needs_owner": False,
                     "task": (f"RESUME run {rid} (lost the network {iso(now())}): same worktree {meta['worktree']} / "
                              f"branch {meta['branch']}; read its handoff note, keep uncommitted edits, continue. "
@@ -1883,9 +2079,9 @@ def yield_backfill(state: dict, snap: dict | None, b: dict, stop=None, mode: str
 
 def claude_slot_holders(state: dict) -> list[dict]:
     """Live Claude workers that count toward max_workers: not agy, not backfill (owner 2026-10-14: backfill uses only
-    capacity normal churn can't use -- it never takes one of the slots)."""
+    capacity normal churn can't use -- it never takes one of the slots), not credit (billed to API credit, not the plan)."""
     return [r for r in state.get("running", []) if r.get("run_id") and r.get("backend") != "agy"
-            and r.get("lane") != "backfill" and pid_alive(r.get("pid"))]
+            and r.get("lane") not in ("backfill", "credit") and pid_alive(r.get("pid"))]
 
 
 def preempt_backfill(state: dict, mode: str, stop=None, why: str = "CI calm: normal churn gets the box",
@@ -3221,7 +3417,7 @@ def model_tick(reasons: list[str], model: str, state: dict, b: dict) -> dict:
            if state.get("usage", {}).get("pace") == "off" else
            f" -- {plan['why']}. The gate already sized the launches to this block: launch exactly what it named.\n"
            if (plan := rate_plan(state)) else ".\n")
-        + f"Claude workers running: {sum(1 for r in state.get('running', []) if r.get('run_id') and r.get('backend') != 'agy')} "
+        + f"Claude workers running: {sum(1 for r in state.get('running', []) if r.get('run_id') and r.get('backend') != 'agy' and r.get('lane') != 'credit')} "
         f"of {state.get('max_workers', 2)} (agy-lane runs: {sum(1 for r in state.get('running', []) if r.get('backend') == 'agy')}, "
         "they do NOT count toward the cap).\n"
         + "Launch workers ONLY with `churn worker` (never the Agent tool); send one back with `churn send-back`.\n"
@@ -3234,7 +3430,7 @@ def model_tick(reasons: list[str], model: str, state: dict, b: dict) -> dict:
     try:
         with open(out_path, "w") as out, open(td / f"{stamp}-{model}.err", "w") as err:
             subprocess.run(cmd, cwd=TICK_CWD, stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=TICK_TIMEOUT_S,
-                           env={**os.environ, **WORKER_ENV})
+                           env=plan_env())
     except subprocess.TimeoutExpired:
         log(f"model tick ({model}) timed out after {TICK_TIMEOUT_S // 60} min; see {out_path}")
     try:
@@ -3450,12 +3646,14 @@ def cmd_tick(a) -> int:
             with contextlib.suppress(Exception):
                 flush_outbox()
         paused = parse_iso(state.get("paused_until"))
-        if paused and now() < paused:  # Claude's limit; agy has its own quota and keeps going
+        if paused and now() < paused:  # Claude's limit; agy has its own quota and API credit its own bill: both go on
             did = []
-            if any(q.get("backend") == "agy" for q in state.get("queue", [])):
+            agy_items = any(q.get("backend") == "agy" for q in state.get("queue", []))
+            if agy_items or credit_ready(state, True)[0]:
                 refresh_tools()
-                did = lanes(box(), json.loads(SNAP.read_text()) if SNAP.exists() else {}, True, a.dry_run)
-            log(f"paused until {iso(paused)}" + (f"; agy lane: {', '.join(did)}" if did else ""), quiet=not did)
+                b, snap = box(), (json.loads(SNAP.read_text()) if SNAP.exists() else {})
+                did = (lanes(b, snap, True, a.dry_run) if agy_items else []) + credit_lane(b, snap, True, a.dry_run)
+            log(f"paused until {iso(paused)}" + (f"; lanes: {', '.join(did)}" if did else ""), quiet=not did)
             if a.dry_run:
                 print(json.dumps({"paused_until": iso(paused), "lanes": did}, indent=1))
             return 0
@@ -3523,6 +3721,7 @@ def cmd_tick(a) -> int:
         did = lanes(b, snap, False, a.dry_run)
         if direct := direct_launches(b, snap, a.dry_run):
             did += [f"direct launch {d}" for d in direct]
+        did += credit_lane(b, snap, False, a.dry_run)  # when=always, or credit about to expire
         if did:
             if not a.dry_run:
                 log("lanes: " + ", ".join(did))
@@ -3765,6 +3964,7 @@ def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, q
         runs_n[lane] += 1
         if lane != "agy":
             spend[lane] += float(e.get("cost_usd") or 0)
+    credit_runs = [e for e in (state.get("credit") or {}).get("log", []) if within(e.get("t"))]
     statuses: dict[str, int] = {}
     text = log_text if log_text is not None else (LOG.read_text() if LOG.exists() else "")
     for line in text.splitlines():
@@ -3780,6 +3980,8 @@ def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, q
         "opened": len(opened), "churn_opened": sum(1 for p in opened if is_churn(p)),
         "spend": {k: round(v, 2) for k, v in spend.items()}, "runs": runs_n, "total_usd": round(total, 2),
         "usd_per_merged_churn_pr": round(total / len(churn_merged), 2) if churn_merged else None,
+        "credit": {"usd": round(sum(float(e.get("cost_usd") or 0) for e in credit_runs), 2), "runs": len(credit_runs),
+                   "balance": credit_balance(state)["balance"]},
         "issues_created": created, "issues_closed": closed, "issues_net": created - closed, "core": core,
         "red_main_hours": round(sum(r[0] for r in red), 1), "red_main": red[:3], "statuses": statuses,
         "agy_trial": {v: sum(1 for r in trial if r.get("verdict") == v) for v in ("PASS", "FIXED", "REJECT")},
@@ -3801,7 +4003,9 @@ def scorecard_md(c: dict) -> str:
         + f"; opened {c['opened']} ({c['churn_opened']} churn).",
         f"- Spend: ${c['total_usd']:.2f} = workers ${c['spend']['workers']:.2f} ({c['runs']['workers']} runs) + ticks "
         f"${c['spend']['ticks']:.2f} ({c['runs']['ticks']}); agy {c['runs']['agy']} runs (Google quota)"
-        + (f"; ${c['usd_per_merged_churn_pr']:.2f} per merged churn PR." if c["usd_per_merged_churn_pr"] is not None else "."),
+        + (f"; ${c['usd_per_merged_churn_pr']:.2f} per merged churn PR" if c["usd_per_merged_churn_pr"] is not None else "")
+        + (f"; API credit ${c['credit']['usd']:.2f} ({c['credit']['runs']} runs, ${c['credit']['balance']:.2f} left)"
+           if (c.get("credit") or {}).get("runs") else "") + ".",
         f"- Issues: {c['issues_created']} opened, {c['issues_closed']} closed, net {c['issues_net']:+d}"
         + (" (backlog growing)" if c["issues_net"] > 0 else " (burning down)" if c["issues_net"] < 0 else "") + ".",
         f"- Main red: {c['red_main_hours']}h" + (": " + "; ".join(f"#{n} {h}h ({t.replace('main is red: ', '')[:40]})"
@@ -3943,6 +4147,9 @@ def cmd_status(a) -> int:
     cfg = agy_cfg(state)
     print(f"agy lane: enabled={cfg['enabled']} model={cfg['model']} max_running={cfg['max_running']} "
           f"paused_until={cfg.get('paused_until')}; plan_first={state.get('features', {}).get('plan_first', False)}")
+    ok, why = credit_ready(state, bool((p := parse_iso(state.get("paused_until"))) and now() < p))
+    if (state.get("credit") or {}).get("grants"):
+        print(f"credit lane: ${credit_balance(state)['balance']:.2f} left; {'launches next tick' if ok else why}")
     usage = state.get("usage", {})
     cq = state.get("ci_queue", {})
     print(f"CI mode: {state.get('ci_mode', 'calm')} ({cq.get('queued', '?')} runs queued, median wait "
@@ -4248,6 +4455,46 @@ CONFIG_KEYS = {
 }
 
 
+def cmd_credit(a) -> int:
+    """`churn credit` (status), `add USD [--expires D] [--note N]`, `sync USD` (the Console's balance), `on`, `off`,
+    `when paused|always`, `model haiku|sonnet|opus`."""
+    if a.action in ("add", "sync") and a.value is None:
+        raise SystemExit(f"credit {a.action} needs an amount in USD")
+    with edit_state() as st:
+        c = st.setdefault("credit", {})
+        if a.action == "add":
+            c.setdefault("grants", []).append({"t": iso(now()), "usd": round(float(a.value), 2),
+                                               **({"expires": iso(parse_iso(a.expires) or now())} if a.expires else {}),
+                                               **({"note": a.note} if a.note else {})})
+            c.pop("blocked", None)
+            log(f"credit: +${float(a.value):.2f} granted" + (f", expires {a.expires}" if a.expires else ""))
+        elif a.action == "sync":
+            delta = round(float(a.value) - credit_balance(st)["balance"], 2)
+            c.setdefault("grants", []).append({"t": iso(now()), "usd": delta, "note": f"sync to Console balance ${a.value}"})
+            log(f"credit: synced to ${float(a.value):.2f} (adjustment {delta:+.2f})")
+        elif a.action in ("on", "off"):
+            c["enabled"] = a.action == "on"
+            if a.action == "on":
+                c.pop("blocked", None)
+        elif a.action == "when":
+            if a.value not in ("paused", "always"):
+                raise SystemExit("credit when: paused | always")
+            c["when"] = a.value
+        elif a.action == "model":
+            if a.value not in WORKER_BUDGET:
+                raise SystemExit(f"credit model: one of {sorted(WORKER_BUDGET)}")
+            c["model"] = a.value
+        state = st
+    cfg, bal = credit_cfg(state), credit_balance(state)
+    ok, why = credit_ready(state, bool((p := parse_iso(state.get("paused_until"))) and now() < p))
+    print(f"credit lane: {'on' if cfg['enabled'] else 'off'}, when={cfg['when']}, model={cfg['model']}, "
+          f"key {'present' if credit_key(cfg) else 'MISSING'} ({cfg['key_file']})")
+    print(f"balance ${bal['balance']:.2f} = granted ${bal['granted']:.2f} - spent ${bal['spent']:.2f} - expired "
+          f"${bal['expired']:.2f}" + (f"; next expiry {bal['next_expiry']}" if bal["next_expiry"] else ""))
+    print(f"runs: {len((state.get('credit') or {}).get('log', []))}; now: {'ready' if ok else why}")
+    return 0
+
+
 def cmd_worktrees(a) -> int:
     """`churn worktrees` removes finished worktrees now (what the gate does every worktree_gc.every_h); --dry-run lists."""
     notes = gc_worktrees(load_state(), dry_run=a.dry_run, limit=a.limit, grace_h=a.grace_h)
@@ -4395,6 +4642,11 @@ def main() -> int:
     wg.add_argument("--dry-run", action="store_true")
     wg.add_argument("--limit", type=int)
     wg.add_argument("--grace-h", type=float)
+    cr = sub.add_parser("credit", help="API-credit lane: status (default) / add USD / sync USD / on / off / when / model")
+    cr.add_argument("action", nargs="?", default="status", choices=["status", "add", "sync", "on", "off", "when", "model"])
+    cr.add_argument("value", nargs="?")
+    cr.add_argument("--expires", help="add: the grant's expiry date (YYYY-MM-DD)")
+    cr.add_argument("--note")
     nt = sub.add_parser("notify", help="phone alerts (ntfy): status (default) or send a test")
     nt.add_argument("action", nargs="?", choices=["status", "test", "boot"], default="status")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
@@ -4456,6 +4708,8 @@ def main() -> int:
         return cmd_worktrees(a)
     if a.cmd == "notify":
         return cmd_notify(a)
+    if a.cmd == "credit":
+        return cmd_credit(a)
     if a.cmd == "watchdog":
         return cmd_watchdog(a)
     if a.cmd == "factory":

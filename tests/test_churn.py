@@ -2006,3 +2006,126 @@ def test_bot_pr_with_an_uncomputed_merge_state_waits_a_tick(bot):
     g.state = "dirty"
     [line] = churn.tend_bot_prs(g.gh, g.sh)
     assert "conflicts with main" in line and g.calls == [["gh", "workflow", "run"]]
+
+
+# ---------------------------------------------------------------- credit lane (owner 2026-10-17)
+@pytest.fixture
+def credit(churn, tmp_path, monkeypatch):
+    key = tmp_path / "credit.key"
+    key.write_text("sk-ant-test\n")
+    monkeypatch.setitem(churn.CREDIT_DEFAULT, "key_file", str(key))
+    pages = []
+    monkeypatch.setattr(churn, "notify", lambda k, *a, **kw: pages.append(k))
+    return churn, key, pages
+
+
+def _later(churn, **kw):
+    return churn.iso(churn.now() + dt.timedelta(**kw))
+
+
+def test_credit_balance_spends_the_earliest_expiry_first_and_drops_what_expires(churn):
+    st = {"credit": {"grants": [{"t": "2026-10-01T00:00Z", "usd": 100}, {"t": "2026-10-01T00:00Z", "usd": 20,
+                                                                         "expires": _later(churn, days=2)}],
+                     "log": [{"t": churn.iso(churn.now()), "cost_usd": 30}]}}
+    b = churn.credit_balance(st)
+    assert b["balance"] == 90 and b["spent"] == 30 and b["next_expiry"] is None  # the expiring $20 went first
+    st["credit"]["log"] = [{"t": churn.iso(churn.now()), "cost_usd": 5}]
+    b = churn.credit_balance(st, at=churn.now() + dt.timedelta(days=3))
+    assert b["expired"] == 15 and b["balance"] == 100  # $15 of the short grant lapsed unspent
+
+
+def test_credit_ready_needs_grant_key_balance_and_a_plan_pause(credit):
+    churn, key, _ = credit
+    st = {"running": [], "credit": {}}
+    assert churn.credit_ready(st, True) == (False, "no credit recorded (`churn credit add USD`)")
+    st["credit"]["grants"] = [{"t": "2026-10-01T00:00Z", "usd": 100}]
+    assert churn.credit_ready(st, False)[1].startswith("waiting for a plan limit pause")
+    assert churn.credit_ready(st, True) == (True, "ready")
+    st["credit"]["when"] = "always"
+    assert churn.credit_ready(st, False)[0]
+    st["credit"].update(when="paused", log=[{"t": churn.iso(churn.now()), "cost_usd": 97}])
+    assert "below floor" in churn.credit_ready(st, True)[1]  # $3 left: not a whole run above the $1 floor
+    st["credit"]["log"] = []
+    key.unlink()
+    assert "no API key" in churn.credit_ready(st, True)[1]
+
+
+def test_expiring_credit_launches_without_a_plan_pause(credit):
+    churn, _, _ = credit
+    st = {"running": [], "credit": {"grants": [{"t": "2026-10-01T00:00Z", "usd": 50, "expires": _later(churn, days=1)}]}}
+    assert churn.credit_ready(st, False) == (True, "expiring credit")
+
+
+def test_credit_lane_launches_a_sonnet_item_outside_the_plan_slots(credit, monkeypatch):
+    churn, _, _ = credit
+    put(churn, queue=[item(9, model="opus"), item(5)], credit={"grants": [{"t": "2026-10-01T00:00Z", "usd": 10}]},
+        features={"plan_first": True})
+    monkeypatch.setattr(churn, "worker_brief_template", lambda: "BRIEF")
+    launched = []
+    monkeypatch.setattr(churn, "cmd_worker", lambda a: launched.append(a))
+    assert churn.credit_lane({"verdict": "GREEN", "free_slots": 1}, {}, False) == []  # plan not paused
+    did = churn.credit_lane({"verdict": "GREEN", "free_slots": 1}, {}, True)
+    [a] = launched
+    assert did == ["credit worker for #5 (sonnet, cap $9.00)"] and a.lane == "credit" and a.budget_usd == 9.0
+    assert a.queue_item["issue"] == 5 and [q["issue"] for q in churn.load_state()["queue"]] == [9]  # Opus stays with the plan
+    assert churn.credit_lane({"verdict": "YELLOW", "free_slots": 1}, {}, True) == []
+    assert churn.claude_slot_holders({"running": [{"run_id": "5-x", "pid": 4, "lane": "credit"}]}) == []
+
+
+def test_only_credit_runs_get_the_key_and_plan_runs_drop_a_stray_one(credit, tmp_path, monkeypatch):
+    churn, _, _ = credit
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-stray")
+    monkeypatch.setattr(churn, "nudge_tick", lambda: None)
+    envs = []
+    monkeypatch.setattr(churn, "_claude", lambda cmd, cwd, env, o, e: envs.append((cmd, env)) or (0, {}))
+    for rid, extra in (("1-plan", {}), ("2-credit", {"lane": "credit", "budget_usd": 7.5})):
+        _run(churn, rid, issue=1, model="sonnet", worktree=str(tmp_path), branch="b", **extra)
+        (churn.RUNS / rid / "prompt.md").write_text("go")
+        churn.cmd_run(argparse.Namespace(run_id=rid))
+    (_, penv), (ccmd, cenv) = envs
+    assert "ANTHROPIC_API_KEY" not in penv and cenv["ANTHROPIC_API_KEY"] == "sk-ant-test"
+    assert ccmd[ccmd.index("--max-budget-usd") + 1] == "7.5"
+
+
+def _credit_run(churn, tmp_path, rid, out, cost=0.4):
+    _run(churn, rid, issue=5, model="sonnet", worktree=str(tmp_path / "gone"), branch="churn/5-x", lane="credit",
+         queue_item=item(5, task="the original task"))
+    (churn.RUNS / rid / "out.json").write_text(json.dumps({**out, "total_cost_usd": cost}))
+    (churn.RUNS / rid / "exit").write_text("1\n")
+    return {"running": [{"run_id": rid, "pid": 0, "issue": 5, "model": "sonnet", "lane": "credit"}], "queue": [item(8)],
+            "usage": {"log": []}}
+
+
+def test_credit_ran_out_blocks_only_the_credit_lane_and_requeues_the_item(credit, tmp_path):
+    churn, _, pages = credit
+    st = _credit_run(churn, tmp_path, "5-a", {"is_error": True, "result": "Credit balance is too low to access the API"})
+    [e] = churn.reap(st)
+    assert e["status"] == "credit-out" and not st.get("reports_pending") and not st.get("paused_until")
+    assert "ran out" in st["credit"]["blocked"] and pages == ["credit-lane"]
+    assert st["usage"]["log"] == [] and st["credit"]["log"][0]["cost_usd"] == 0.4  # never in the plan's pacing ledger
+    assert [q["issue"] for q in st["queue"]] == [5, 8] and st["queue"][0]["task"] == "the original task"
+
+
+def test_a_credit_rate_limit_pauses_the_lane_not_the_plan(credit, tmp_path):
+    churn, _, pages = credit
+    st = _credit_run(churn, tmp_path, "5-b", {"is_error": True, "api_error_status": 429, "result": "rate_limit_error"})
+    [e] = churn.reap(st)
+    assert e["status"] == "credit-limit" and st["credit"]["paused_until"] and not st.get("paused_until") and pages == []
+    st = _credit_run(churn, tmp_path, "5-c", {"is_error": True, "result": "Invalid API key"})
+    assert churn.reap(st)[0]["status"] == "credit-auth" and "refused" in st["credit"]["blocked"]
+
+
+def test_credit_cli_add_sync_and_unblock(credit, capsys):
+    churn, _, _ = credit
+    ns = lambda action, value=None, **kw: argparse.Namespace(action=action, value=value, expires=kw.get("expires"),  # noqa: E731
+                                                              note=kw.get("note"))
+    churn.cmd_credit(ns("add", "100", note="monthly"))
+    with churn.edit_state() as st:
+        st["credit"].update(blocked="API credit ran out", log=[{"t": churn.iso(churn.now()), "cost_usd": 12.5}])
+    churn.cmd_credit(ns("sync", "80"))  # the Console says $80 left; the ledger said $87.50
+    st = churn.load_state()
+    assert churn.credit_balance(st)["balance"] == 80 and st["credit"]["blocked"]
+    churn.cmd_credit(ns("add", "25", expires="2026-12-01"))
+    st = churn.load_state()
+    assert "blocked" not in st["credit"] and churn.credit_balance(st)["balance"] == 105
+    assert "balance $105.00" in capsys.readouterr().out
