@@ -1076,11 +1076,75 @@ def self_sync(sync: dict, live: int, src: Path | None = None, force: bool = Fals
     return note
 
 
+SKILLS_DIR = Path.home() / ".claude" / "skills"
+# Host-private files (the night-shift skill) live in the private repo, not in this public one (owner 2026-10-19).
+PRIVATE_DIR = Path(_CFG.get("private_dir", str(Path.home() / ".local" / "src" / "promoter-bot-private")))
+
+
+def pull_private(src: Path | None = None) -> str | None:
+    """Fast-forward the private checkout to its upstream (text only: no tests). None = nothing to do or no checkout."""
+    src = src or PRIVATE_DIR
+    if not (src / ".git").exists():
+        return None
+
+    def git(*a, **kw):
+        return run(["git", "-C", str(src), *a], **kw)
+    if git("fetch", "-q", "origin", timeout=120).returncode:
+        return None
+    behind = int(git("rev-list", "--count", "HEAD..@{u}").stdout.strip() or 0)
+    if not behind:
+        return None
+    if git("status", "--porcelain", "--untracked-files=no").stdout.strip() or git("merge", "-q", "--ff-only", "@{u}").returncode:
+        notify(f"private-blocked-{git('rev-parse', '@{u}').stdout.strip()[:8]}", "promoter-bot-private is behind",
+               f"{src} is {behind} commit(s) behind its upstream and has local edits or commits: update it by hand.",
+               cooldown_h=24)
+        return f"private checkout {behind} behind, not updated (local edits or commits)"
+    return f"private checkout updated ({behind} commit(s))"
+
+
+def link_skills(src: Path | None = None, dest: Path | None = None) -> tuple[list[str], list[str]]:
+    """Point each installed skill file at the private repo's copy (skills/<name>/<file>), so the sync pulse keeps the
+    skill current on every host (owner 2026-10-19: night-shift was hand-copied from melek). Only a missing file or a
+    byte-identical copy is replaced by a symlink; a copy that differs is left alone and reported, so a host's own
+    edits are never lost. Returns (linked now, differing)."""
+    src, dest = src or PRIVATE_DIR / "skills", dest or SKILLS_DIR
+    linked, differ = [], []
+    for f in sorted(p for p in src.glob("*/*") if p.is_file()):
+        d = dest / f.parent.name / f.name
+        if d.is_symlink() and d.resolve() == f.resolve():
+            continue
+        if d.exists() and (d.is_symlink() or d.read_bytes() != f.read_bytes()):
+            differ.append(f"{f.parent.name}/{f.name}")
+            continue
+        d.parent.mkdir(parents=True, exist_ok=True)
+        tmp = d.with_name(f".{d.name}.promoter-link")
+        tmp.unlink(missing_ok=True)
+        tmp.symlink_to(f.resolve())
+        os.replace(tmp, d)  # atomic: a reader sees the old file or the link, never neither
+        linked.append(f"{f.parent.name}/{f.name}")
+    return linked, differ
+
+
+def skills_note() -> str | None:
+    pulled = pull_private()
+    linked, differ = link_skills()
+    if differ:
+        notify("skills-differ-" + hashlib.sha1(",".join(differ).encode()).hexdigest()[:8],
+               "promoter-bot: a skill here differs from the repo",
+               f"{', '.join(differ)} under {SKILLS_DIR} is not the repo's copy, so it is not kept current. Put its edits "
+               f"in a promoter-bot PR, then delete the local file (the next pulse links it).", cooldown_h=24)
+    return "; ".join(x for x in ([pulled] if pulled else []) + ([f"skills linked to the repo: {', '.join(linked)}"] if linked else [])
+                     + ([f"skills that differ from the repo (left alone): {', '.join(differ)}"] if differ else [])) or None
+
+
 def run_sync_pulse(force: bool = False) -> str | None:
     """The gate's call: the pulse runs outside the state lock (tests may take minutes), then records its result."""
     state = load_state()
     sync = dict(state.get("sync") or {})
-    note = self_sync(sync, len(claude_slot_holders(state)), force=force)
+    if (note := self_sync(sync, len(claude_slot_holders(state)), force=force)) is not None or force or \
+            sync.get("checked") == iso(now()):  # skills follow on every real pulse, not on the throttled no-op
+        with contextlib.suppress(OSError):
+            note = "; ".join(x for x in (note, skills_note()) if x) or None
     with edit_state() as st:
         st["sync"] = sync
     return note
@@ -5233,6 +5297,15 @@ def cmd_status(a) -> int:
     print(f"promoter-bot: {sy.get('head', '?')} ({sy.get('behind', '?')} behind origin/main, checked {sy.get('checked', 'never')}"
           + (f", last update {sy['applied']}" if sy.get("applied") else "")
           + (f"; main {str(sy['failed'])[:8]} FAILS its tests here" if sy.get("failed") else "") + ")")
+    if not (PRIVATE_DIR / ".git").exists():
+        print(f"private checkout: none at {PRIVATE_DIR} (`gh repo clone {ORG}/promoter-bot-private {PRIVATE_DIR}`): "
+              "skills are not kept current")
+    else:
+        for f in sorted(p for p in (PRIVATE_DIR / "skills").glob("*/*") if p.is_file()):
+            d = SKILLS_DIR / f.parent.name / f.name
+            how = ("linked" if d.is_symlink() and d.resolve() == f.resolve() else "DIFFERS (left alone)" if d.exists()
+                   else "missing (the next pulse links it)")
+            print(f"skill {f.parent.name}/{f.name}: {how}")
     if plan := rate_plan(state):
         print(f"  {plan['why']}")
         print("  $/h measured: " + " ".join(f"{m} {plan['rate'][m]:.1f}" for m in MODELS))
@@ -5777,6 +5850,7 @@ def main() -> int:
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
     sub.add_parser("poll", help="every 2 min: one gh call; start the gate at once when a watched PR changed")
     sub.add_parser("sync", help="sync pulse now: test origin/main and fast-forward this install (the gate does it hourly)")
+    sub.add_parser("skills", help="pull the private repo and link its skills into ~/.claude/skills (missing/identical only)")
     r = sub.add_parser("_run")
     r.add_argument("run_id")
     pc = sub.add_parser("_precheck")
@@ -5844,6 +5918,12 @@ def main() -> int:
     if a.cmd == "sync":
         note = run_sync_pulse(force=True)
         print(note or f"promoter-bot is on origin/main ({(load_state().get('sync') or {}).get('head', '?')})")
+        if note:
+            log(note)
+        return 0
+    if a.cmd == "skills":
+        note = skills_note()
+        print(note or "skills: all linked to the private repo (or no private checkout; see `churn status`)")
         if note:
             log(note)
         return 0
