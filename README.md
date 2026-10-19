@@ -42,4 +42,10 @@ Between gate ticks, `churn poll` (every 2 min, `systemd/churn-poll.timer`) makes
 once when a watched PR changed (a red check labelled needs-fix, a push, a merge), so a fix starts within minutes.
 Install: `cp systemd/churn-poll.* ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now churn-poll.timer`.
 
+Sync pulse: hourly, the gate fetches this install's own checkout and, when origin/main is ahead, runs origin/main's
+tests (config `python`, which needs pytest) in a temp worktree, fast-forwards, and installs new or changed
+`systemd/` units (enabling new timers). It waits up to 3 h for running workers, never touches a dirty or diverged
+checkout (it alerts instead), and alerts once when a main fails its tests here. `churn sync` runs it now; `churn
+status` shows the install's version and how far behind it is.
+
 Tests: `python3 -m pytest -q tests` (each test runs against a tmp `CHURN_HOME`, never the live state).
