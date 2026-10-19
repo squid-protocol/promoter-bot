@@ -33,6 +33,9 @@ def churn(tmp_path, monkeypatch):
     mod.real_worktree_pr = mod.worktree_pr
     monkeypatch.setattr(mod, "worktree_pr", lambda wt, issue=None: ("", None))
     monkeypatch.setattr(mod, "ci_triage", lambda n: None)  # unreadable triage: queue as before
+    mod.real_checklist_note = mod.checklist_note
+    monkeypatch.setattr(mod, "checklist_note", lambda n: "")
+    monkeypatch.setattr(mod, "update_branch", lambda n: False)  # a real conflict: queue the Claude fix as before
     monkeypatch.setattr(mod, "start_precheck", lambda rid: None)
     monkeypatch.setitem(mod.REFILL_DEFAULT, "enabled", False)  # refill tests turn it on; it reads GitHub
     monkeypatch.setitem(mod.CLAIMS_DEFAULT, "enabled", False)  # claim tests turn it on with a fake GitHub
@@ -240,7 +243,8 @@ def test_scorecard_counts_the_day(churn):
     day = dt.date(2026, 10, 13)
     t = lambda h: f"2026-10-13T{h:02d}:00:00Z"  # noqa: E731
     pulls = [
-        {"number": 1, "head": {"ref": "churn/1-a"}, "merged_at": t(3), "created_at": t(1), "updated_at": t(3)},
+        {"number": 1, "head": {"ref": "churn/1-a"}, "merged_at": t(3), "created_at": t(1), "updated_at": t(3),
+         "body": "Part of #1. Checklist: done [c:0123abcd]\nChecklist: partial [c:4567abcd] -- rest"},
         {"number": 2, "head": {"ref": "dependabot/x"}, "merged_at": t(4), "created_at": "2026-10-10T00:00:00Z", "updated_at": t(4)},
         {"number": 3, "head": {"ref": "churn/3-b"}, "merged_at": None, "created_at": t(5), "updated_at": t(5)},
         {"number": 4, "head": {"ref": "churn/4-c"}, "merged_at": "2026-10-12T23:00:00Z", "created_at": "2026-10-12T20:00:00Z",
@@ -267,8 +271,10 @@ def test_scorecard_counts_the_day(churn):
     assert (c["issues_created"], c["issues_closed"], c["issues_net"]) == (5, 7, -2)
     assert c["red_main_hours"] == 6.0 and c["statuses"] == {"done": 1, "crashed": 1}
     assert (c["queue"], c["queue_owner"]) == (2, 1)
+    assert (c["slices_merged"], c["items_done"]) == (1, 1)  # #20: epic progress, not only issues closed
     md = churn.scorecard_md(c)
     assert "burning down" in md and "$4.00 per merged churn PR" in md and "1 crashed" in md
+    assert "1 reported checklist slices, 1 lines done" in md
 
 
 def test_scorecard_is_written_once_a_day_on_top_of_the_log(churn, monkeypatch):
@@ -1709,8 +1715,35 @@ def test_checklist_parses_keys_and_ticks_one_line(churn):
     new = churn.tick_line(BODY, items[2]["key"], 77)
     assert "* [x] second   part (#77)\n" in new and "- [ ] first part" in new
     assert churn.tick_line(BODY, churn.check_key("already done"), 77) is None  # only an unchecked line ticks
-    assert churn.PR_CHECK_RE.search("## Notes\n**Checklist:** done [c:0123abcd] -- all of it").groups() == ("done", "0123abcd")
+    assert churn.PR_CHECK_RE.search("## Notes\n**Checklist:** done [c:0123abcd] -- all of it").groups()[:2] == ("done", "0123abcd")
     assert churn.PR_CHECK_RE.search("Checklist: partial [c:0123abcd] -- WEB SEND left").group(1) == "partial"
+
+
+def test_pr_checks_reads_mid_line_and_several_markers(churn):  # #20: #5587's marker followed "Part of #4047."
+    body = ("Part of #4047. Checklist: partial [c:0f9790f1] -- default not flipped\n"
+            "- Checklist: done [c:b1335d47]\nno marker [c:deadbeef]\n")
+    c = churn.pr_checks(body)
+    assert c["checks"] == [["partial", "0f9790f1", "default not flipped"], ["done", "b1335d47", ""]]
+    assert c["check"] == ["partial", "0f9790f1"] and churn.pr_checks("Part of #1.") == {}
+
+
+def test_a_merged_pr_settles_every_line_and_without_an_issue_on_its_entry(churn, monkeypatch):
+    gh = _Gh(churn, monkeypatch, BODY)
+    k1, k2 = churn.check_key("first part"), churn.check_key("second part")
+    st = {"prs": [9], "queue": [], "running": []}  # a legacy int entry: the issue comes from churn/4-
+    snap = {"9": {**pr(state="closed", merged=True, branch="churn/4-x"), "checks": [["done", k1, ""], ["partial", k2, "b"]]}}
+    notes = churn.settle_closed(st, snap)
+    assert len(gh.sent) == 1 and len(gh.comments) == 1 and not st.get("followups")
+    assert f"[c:{k1}] of #4 done, ticked" in notes[0] and f"[c:{k2}] of #4 partial" in notes[0]
+
+
+def test_checklist_note_lists_unticked_keys(churn, monkeypatch):
+    monkeypatch.setattr(churn, "gh_json", lambda path: {"body": BODY})
+    note = churn.real_checklist_note(4)
+    assert f"[c:{churn.check_key('first part')}] first part" in note and "already done" not in note
+    assert "Checklist: done [c:<key>]" in note
+    monkeypatch.setattr(churn, "gh_json", lambda path: {"body": "no list"})
+    assert churn.real_checklist_note(4) == ""
 
 
 def test_refill_names_the_next_unclaimed_line_and_skips_a_ticked_issue(churn, monkeypatch):
@@ -1733,9 +1766,10 @@ class _Gh:
     """A GitHub stand-in for settle_check: one issue, and the PATCHed body it was sent."""
     def __init__(self, churn, monkeypatch, body, labels=("scope:core",)):
         self.issue = {"number": 4, "state": "open", "title": "t", "body": body, "labels": [{"name": x} for x in labels]}
-        self.sent = []
+        self.sent, self.comments = [], []
         monkeypatch.setattr(churn, "gh_json", lambda path: dict(self.issue))
-        monkeypatch.setattr(churn, "run", lambda cmd, **kw: self.sent.append(kw.get("input"))
+        monkeypatch.setattr(churn, "run", lambda cmd, **kw: (self.comments.append(cmd[-1]) if "POST" in cmd else
+                                                             self.sent.append(kw.get("input")))
                             or subprocess.CompletedProcess(cmd, 0, "{}", ""))
 
 
@@ -1756,8 +1790,10 @@ def test_partial_requeues_the_same_line_and_a_finished_list_goes_to_the_tick(chu
     k = churn.check_key("first part")
     gh = _Gh(churn, monkeypatch, BODY)
     st = {"prs": [{"number": 9, "issue": 4}], "queue": [], "running": []}
-    churn.settle_closed(st, {"9": {**pr(state="closed", merged=True), "check": ["partial", k]}})
+    notes = churn.settle_closed(st, {"9": {**pr(state="closed", merged=True), "checks": [["partial", k, "WEB SEND"]]}})
     assert not gh.sent and f"[c:{k}]" in st["queue"][0]["task"]  # nothing ticked; the same line goes on
+    assert gh.comments == [f'body=#9 merged: a partial slice of [c:{k}] "first part"; left: WEB SEND (promoter-bot)']
+    assert "commented" in notes[0]  # #20: the issue says what the slice delivered
     gh = _Gh(churn, monkeypatch, "- [ ] only part\n- [x] other\n")
     st = {"prs": [{"number": 9, "issue": 4}], "queue": [], "running": []}
     churn.settle_closed(st, {"9": {**pr(state="closed", merged=True), "check": ["done", churn.check_key("only part")]}})
@@ -2697,3 +2733,92 @@ def test_the_tick_prompt_is_the_same_every_tick(churn, monkeypatch):
     prompts = [c[c.index("-p") + 1] for c in cmds]
     assert prompts[0] == prompts[1] and str(churn.TICK_STATUS) in prompts[0] and "run A" not in prompts[0]
     assert "--strict-mcp-config" in cmds[0]
+
+
+# --- epic work (#20): update-branch, no overlapping runs, rescue counts real fixes -----------------------------------
+def test_a_conflict_is_first_handed_to_update_branch_once_per_head(churn):
+    st = {"prs": [{"number": 5180, "issue": 5176}], "queue": [], "running": []}
+    snap = {"5180": pr(ms="dirty", head="h1", branch="churn/5176-x")}
+    calls = []
+    assert churn.queue_pr_fixes(st, snap, update=lambda n: calls.append(n) or True) == ["updated:#5180"]
+    assert st["queue"] == [] and st["prs"][0]["updated_from"] == "h1" and calls == [5180]
+    assert churn.queue_pr_fixes(st, snap, update=lambda n: 1 / 0) == ["#5180"]  # still dirty at h1: a real conflict
+    st = {"prs": [{"number": 5180, "issue": 5176}], "queue": [], "running": []}
+    assert churn.queue_pr_fixes(st, snap, update=lambda n: False) == ["#5180"]  # GitHub refused (422): Claude fixes it
+
+
+def test_a_red_from_main_takes_main_instead_of_waiting(churn):
+    st = {"prs": [{"number": 7, "issue": 70}], "queue": [], "running": []}
+    added = churn.queue_pr_fixes(st, {"7": SNAP_RED["7"]}, triage=lambda n: ["main"], update=lambda n: True)
+    assert added == ["updated:#7"] and "flake_head" not in st["prs"][0]
+    st = {"prs": [{"number": 7, "issue": 70}], "queue": [], "running": []}
+    added = churn.queue_pr_fixes(st, {"7": SNAP_RED["7"]}, triage=lambda n: ["main"], update=lambda n: False)
+    assert added == ["noise:#7 (main)"]  # update refused: the old flake path
+
+
+def test_the_review_survives_the_gates_own_update_branch(churn):
+    st = {"prs": [{"number": 7, "issue": 70, "reviewed_head": "h1", "verdict": "merge", "updated_from": "h1"}]}
+    merge = {"commits": [{"parents": [{}, {}]}]}
+    assert churn.carry_reviews(st, {"7": pr(head="h1")}, compare=lambda p: 1 / 0) == []  # head not moved yet
+    assert churn.carry_reviews(st, {"7": pr(head="h2")}, compare=lambda p: merge) == ["#7 merge -> h2"]
+    assert st["prs"][0]["reviewed_head"] == "h2" and "updated_from" not in st["prs"][0]
+    st = {"prs": [{"number": 7, "reviewed_head": "h1", "verdict": "merge", "updated_from": "h1"}]}
+    worker = {"commits": [{"parents": [{}]}, {"parents": [{}, {}]}]}  # someone pushed more than GitHub's merge
+    assert churn.carry_reviews(st, {"7": pr(head="h3")}, compare=lambda p: worker) == []
+    assert st["prs"][0]["reviewed_head"] == "h1"
+
+
+def test_no_fix_item_while_a_run_on_the_pr_settles(churn):
+    snap = {"5180": pr(ms="dirty", branch="churn/5176-x")}
+    st = {"prs": [{"number": 5180, "issue": 5176}], "queue": [], "running": [], "reports_pending": [{"issue": 5176}]}
+    assert churn.queue_pr_fixes(st, snap) == []  # its report waits for review
+    _run(churn, "5176-a", issue=5176, branch="churn/5176-x", finished=churn.iso(churn.now()))
+    st["reports_pending"] = []
+    assert churn.queue_pr_fixes(st, snap) == []  # finished a minute ago: CI on its push has not reported
+    _run(churn, "5176-a", issue=5176, branch="churn/5176-x",
+         finished=churn.iso(churn.now() - dt.timedelta(minutes=churn.FIX_SETTLE_MIN + 1)))
+    assert churn.queue_pr_fixes(st, snap) == ["#5180"]
+
+
+def test_a_worker_is_refused_on_a_pr_or_tree_a_live_run_holds(churn, monkeypatch, tmp_path):
+    monkeypatch.setattr(churn, "spawn_detached", lambda *a, **k: 4242)
+    _run(churn, "4049-a", issue=4049, worktree=str(tmp_path), branch="churn/4049-x")
+    put(churn, running=[{"run_id": "4049-a", "pid": 1, "issue": 4049, "model": "opus",
+                         "task": "RESCUE (Fix PR #5552, Opus) (churn/4049-x)"}], max_workers=3)
+    ns = argparse.Namespace(resume_run=None, issue=4049, model="sonnet", task="Fix PR #5552 (b): needs-fix", brief="b",
+                            brief_file=None, worktree=str(tmp_path), branch="churn/4049-x", repo=None, force=False,
+                            lane=None, plan=False, check_of=None)
+    with pytest.raises(SystemExit, match="4049-a already works"):
+        churn.cmd_worker(ns)
+    assert churn.held_by_live(churn.load_state(), tmp_path / "other", "Fix PR #5552") == "4049-a"  # by the PR it names
+    assert churn.held_by_live(churn.load_state(), tmp_path / "other", "#4049 next slice") is None
+
+
+def test_merge_only_fix_runs_do_not_bring_the_rescue(churn):
+    for i in range(2):
+        _run(churn, f"5176-{i}", issue=5176, task="Fix PR #5180 (b): conflicts with main", started=churn.iso(churn.now()),
+             code_changed=False)
+    assert churn.recent_fix_runs(5180, 5176) == 0
+    _run(churn, "5176-1", issue=5176, task="Fix PR #5180 (b): needs-fix", started=churn.iso(churn.now()), code_changed=True)
+    _run(churn, "5176-2", issue=5176, task="Fix PR #5180 (b): needs-fix", started=churn.iso(churn.now()))  # legacy: counts
+    assert churn.recent_fix_runs(5180, 5176) == 2
+
+
+def test_own_commits_ignores_merges_of_main(churn, tmp_path):
+    def git(*a):
+        return subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    git("init", "-q", "-b", "main")
+    git("commit", "-q", "--allow-empty", "-m", "base")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("checkout", "-q", "-b", "pr")
+    start = git("rev-parse", "HEAD")
+    git("checkout", "-q", "main")
+    git("commit", "-q", "--allow-empty", "-m", "main moved")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("checkout", "-q", "pr")
+    git("merge", "-q", "--no-ff", "-m", "merge main", "origin/main")
+    assert churn.own_commits(str(tmp_path), start) is False
+    git("commit", "-q", "--allow-empty", "-m", "real fix")
+    assert churn.own_commits(str(tmp_path), start) is True
+    assert churn.own_commits(str(tmp_path), None) is None and churn.own_commits(str(tmp_path), "0" * 40) is None
