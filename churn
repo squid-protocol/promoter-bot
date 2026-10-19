@@ -41,6 +41,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -975,6 +976,114 @@ def refresh_tools() -> None:
         run(["git", "-C", str(V6), "worktree", "add", "-q", "--detach", str(TOOLS), "origin/main"])
     else:
         run(["git", "-C", str(TOOLS), "checkout", "-q", "--detach", "origin/main"])
+
+
+# Sync pulse (owner 2026-10-19): the install itself drifted off main (nyx ran 5 merged commits behind, its new timer
+# never installed). Hourly the gate checks the install's own checkout against origin/main and fast-forwards it once
+# origin/main's tests pass, installing new or changed systemd units; it never touches a dirty or diverged checkout.
+SYNC_EVERY_MIN, SYNC_MAX_DEFER_H, SYNC_TEST_TIMEOUT_S = 60, 3, 600
+UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
+
+
+def install_units(src: Path, dest: Path | None = None) -> tuple[list[str], list[str]]:
+    """Copy the repo's systemd/*.service|*.timer that are new or changed into dest: (copied, new timers). The repo's
+    units must be host-neutral (%h, no host paths): the pulse overwrites an installed unit of the same name."""
+    dest = dest or UNIT_DIR
+    copied, new_timers = [], []
+    for f in sorted(src.glob("*.service")) + sorted(src.glob("*.timer")):
+        d = dest / f.name
+        if d.exists() and d.read_bytes() == f.read_bytes():
+            continue
+        if not d.exists() and f.suffix == ".timer":
+            new_timers.append(f.name)
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(f, d)
+        copied.append(f.name)
+    return copied, new_timers
+
+
+def sync_units(src: Path) -> str:
+    """Install the checkout's new or changed units under systemd (enabling new timers): what changed, or ""."""
+    if not use_systemd() or not (src / "systemd").is_dir():
+        return ""
+    copied, timers = install_units(src / "systemd")
+    if copied:
+        run(["systemctl", "--user", "daemon-reload"])
+        for t in timers:
+            run(["systemctl", "--user", "enable", "--now", t])
+    return ", ".join(copied) + (f" (enabled {', '.join(timers)})" if timers else "")
+
+
+def self_sync(sync: dict, live: int, src: Path | None = None, force: bool = False,
+              test_cmd: list[str] | None = None, units: bool = True) -> str | None:
+    """One sync pulse: update `sync` (the state's record) in place and return a note when something happened."""
+    src = src or Path(SELF).parent
+    if not force and (t := parse_iso(sync.get("checked"))) and now() - t < dt.timedelta(minutes=SYNC_EVERY_MIN):
+        return None
+    sync["checked"] = iso(now())
+
+    def git(*a, **kw):
+        return run(["git", "-C", str(src), *a], **kw)
+    if git("fetch", "-q", "origin", timeout=120).returncode:
+        return None  # offline or no remote: the next pulse tries again
+    head, target = git("rev-parse", "HEAD").stdout.strip(), git("rev-parse", "origin/main").stdout.strip()
+    behind = int(git("rev-list", "--count", "HEAD..origin/main").stdout.strip() or 0)
+    ahead = int(git("rev-list", "--count", "origin/main..HEAD").stdout.strip() or 0)
+    sync.update(head=head[:12], behind=behind, ahead=ahead)
+    if not behind:
+        sync.pop("behind_since", None)  # on main: still make the installed units match it (a host pulled by hand)
+        clean = not git("status", "--porcelain", "--untracked-files=no").stdout.strip()
+        return (f"sync: units {installed}" if clean and units and (installed := sync_units(src)) else None)
+    sync.setdefault("behind_since", iso(now()))
+    dirty = git("status", "--porcelain", "--untracked-files=no").stdout.strip()
+    if ahead or dirty:
+        why = f"{ahead} local commit(s) not on main" if ahead else "uncommitted edits"
+        notify(f"sync-blocked-{target[:8]}", "promoter-bot is behind main",
+               f"{behind} commit(s) behind origin/main and not updated: {why} in {src}. Update it by hand.", cooldown_h=24)
+        return f"sync: {behind} behind main, not updated ({why})"
+    if sync.get("failed") == target:
+        return None  # this main already failed its tests here; the alert went out
+    since = parse_iso(sync.get("behind_since"))
+    if live and since and now() - since < dt.timedelta(hours=SYNC_MAX_DEFER_H):
+        return f"sync: {behind} behind main, waiting for {live} worker(s) to finish"
+    tmp = Path(tempfile.mkdtemp(prefix="promoter-sync-", dir=str(H)))
+    try:
+        if git("worktree", "add", "-q", "--detach", str(tmp / "t"), target).returncode:
+            return None
+        try:
+            r = run(test_cmd or [SELFSCAN_PY, "-m", "pytest", "-q", "-x", "tests"], cwd=str(tmp / "t"),
+                    timeout=SYNC_TEST_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            r = subprocess.CompletedProcess([], 1, "", "tests timed out")
+    finally:
+        git("worktree", "remove", "--force", str(tmp / "t"))
+        shutil.rmtree(tmp, ignore_errors=True)
+    if r.returncode:
+        sync["failed"] = target
+        tail = " ".join((r.stdout + r.stderr).split())[-300:]
+        notify(f"sync-tests-{target[:8]}", "promoter-bot: main fails its tests here",
+               f"Not updating {head[:8]} -> {target[:8]}: {tail}", priority="high", cooldown_h=24)
+        return f"sync: origin/main {target[:8]} fails its tests here; staying on {head[:8]}"
+    if git("merge", "-q", "--ff-only", target).returncode:
+        return f"sync: fast-forward to {target[:8]} failed; staying on {head[:8]}"
+    note = f"sync: promoter-bot {head[:8]} -> {target[:8]} ({behind} commit(s))"
+    if units and (installed := sync_units(src)):
+        note += f"; units {installed}"
+    sync.update(head=target[:12], behind=0, ahead=0, applied=iso(now()))
+    sync.pop("behind_since", None)
+    sync.pop("failed", None)
+    notify(f"sync-applied-{target[:8]}", "promoter-bot updated", note[6:], priority="low")
+    return note
+
+
+def run_sync_pulse(force: bool = False) -> str | None:
+    """The gate's call: the pulse runs outside the state lock (tests may take minutes), then records its result."""
+    state = load_state()
+    sync = dict(state.get("sync") or {})
+    note = self_sync(sync, len(claude_slot_holders(state)), force=force)
+    with edit_state() as st:
+        st["sync"] = sync
+    return note
 
 
 CGROUP_APP = Path(f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice")
@@ -4446,6 +4555,9 @@ def cmd_tick(a) -> int:
                 state = load_state()
             with contextlib.suppress(Exception):
                 flush_outbox()
+            with contextlib.suppress(Exception):  # the install follows origin/main (sync pulse, hourly)
+                if note := run_sync_pulse():
+                    log(note)
         paused = parse_iso(state.get("paused_until"))
         if paused and now() < paused:  # Claude's limit; agy has its own quota and API credit its own bill: both go on
             did = []
@@ -5117,6 +5229,10 @@ def cmd_status(a) -> int:
           f"{cq.get('median_wait_min', '?')} min at {cq.get('t', '?')}); backfill: busy, or calm with idle slots")
     print(f"window ${window_usd(state):.2f} / {WINDOW_H}h; learned budget ${usage.get('learned_budget_usd')}; last model tick {state.get('last_model_tick')}")
     print(f"pace: {usage.get('pace') or 'ledger'}; max_workers {state.get('max_workers', 2)}, max_opus {state.get('max_opus', 1)}")
+    sy = state.get("sync") or {}
+    print(f"promoter-bot: {sy.get('head', '?')} ({sy.get('behind', '?')} behind origin/main, checked {sy.get('checked', 'never')}"
+          + (f", last update {sy['applied']}" if sy.get("applied") else "")
+          + (f"; main {str(sy['failed'])[:8]} FAILS its tests here" if sy.get("failed") else "") + ")")
     if plan := rate_plan(state):
         print(f"  {plan['why']}")
         print("  $/h measured: " + " ".join(f"{m} {plan['rate'][m]:.1f}" for m in MODELS))
@@ -5660,6 +5776,7 @@ def main() -> int:
     cl.add_argument("--dry-run", action="store_true")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
     sub.add_parser("poll", help="every 2 min: one gh call; start the gate at once when a watched PR changed")
+    sub.add_parser("sync", help="sync pulse now: test origin/main and fast-forward this install (the gate does it hourly)")
     r = sub.add_parser("_run")
     r.add_argument("run_id")
     pc = sub.add_parser("_precheck")
@@ -5724,6 +5841,12 @@ def main() -> int:
         return cmd_retro(a)
     if a.cmd == "poll":
         return cmd_poll(a)
+    if a.cmd == "sync":
+        note = run_sync_pulse(force=True)
+        print(note or f"promoter-bot is on origin/main ({(load_state().get('sync') or {}).get('head', '?')})")
+        if note:
+            log(note)
+        return 0
     if a.cmd == "watchdog":
         return cmd_watchdog(a)
     if a.cmd == "factory":

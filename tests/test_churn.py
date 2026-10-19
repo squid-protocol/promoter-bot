@@ -32,6 +32,9 @@ def churn(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "issue_meta", lambda n: None)
     mod.real_worktree_pr = mod.worktree_pr
     monkeypatch.setattr(mod, "worktree_pr", lambda wt, issue=None: ("", None))
+    monkeypatch.setattr(mod, "run_sync_pulse", lambda force=False: None)  # never fetch or update this checkout
+    mod.real_sync_units = mod.sync_units
+    monkeypatch.setattr(mod, "sync_units", lambda src: "")  # never touch ~/.config/systemd from a test
     monkeypatch.setattr(mod, "ci_triage", lambda n: None)  # unreadable triage: queue as before
     mod.real_checklist_note = mod.checklist_note
     monkeypatch.setattr(mod, "checklist_note", lambda n: "")
@@ -2898,3 +2901,97 @@ def test_a_send_back_verdict_makes_the_running_tick_loop_once_more(churn, monkey
     churn.DIRTY.unlink()
     churn.cmd_pr(argparse.Namespace(number=8, action="reviewed", head="h1", verdict="merge", note=None, issue=80))
     assert not churn.DIRTY.exists()
+
+
+# --- sync pulse: the install follows origin/main once its tests pass -----------------------------------------------
+def _sync_repos(tmp_path):
+    """(origin bare repo, install clone, git helper); the clone starts on origin/main with a systemd/ dir."""
+    def git(cwd, *a):
+        return subprocess.run(["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    origin, seed, install = tmp_path / "origin.git", tmp_path / "seed", tmp_path / "install"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "clone", "-q", str(origin), str(seed)], check=True, capture_output=True)
+    (seed / "systemd").mkdir()
+    (seed / "systemd" / "churn-tick.timer").write_text("[Timer]\nOnCalendar=*:00/10\n")
+    git(seed, "add", ".")
+    git(seed, "commit", "-q", "-m", "base")
+    git(seed, "push", "-q", "origin", "HEAD:main")
+    subprocess.run(["git", "clone", "-q", str(origin), str(install)], check=True, capture_output=True)
+    return origin, seed, install, git
+
+
+def _land_on_main(seed, git, name="churn-poll.timer"):
+    (seed / "systemd" / name).write_text("[Timer]\nOnUnitActiveSec=2min\n")
+    git(seed, "add", ".")
+    git(seed, "commit", "-q", "-m", "new timer")
+    git(seed, "push", "-q", "origin", "HEAD:main")
+    return git(seed, "rev-parse", "HEAD")
+
+
+def test_sync_fast_forwards_once_main_passes_its_tests(churn, tmp_path, monkeypatch):
+    _, seed, install, git = _sync_repos(tmp_path)
+    sync = {}
+    assert churn.self_sync(sync, 0, src=install, test_cmd=["true"], units=False) is None  # already on main
+    assert sync["behind"] == 0 and "checked" in sync
+    target = _land_on_main(seed, git)
+    assert churn.self_sync(sync, 0, src=install, test_cmd=["true"], units=False) is None  # checked < 1 h ago
+    note = churn.self_sync(sync, 0, src=install, force=True, test_cmd=["true"], units=False)
+    assert note.startswith("sync: promoter-bot") and "(1 commit(s))" in note
+    assert git(install, "rev-parse", "HEAD") == target and sync["behind"] == 0 and "applied" in sync
+    assert not list(churn.H.glob("promoter-sync-*"))  # the test worktree is gone
+
+
+def test_sync_stays_put_when_main_fails_its_tests(churn, tmp_path):
+    _, seed, install, git = _sync_repos(tmp_path)
+    head = git(install, "rev-parse", "HEAD")
+    target = _land_on_main(seed, git)
+    sync = {}
+    note = churn.self_sync(sync, 0, src=install, force=True, test_cmd=["false"], units=False)
+    assert "fails its tests" in note and sync["failed"] == target and git(install, "rev-parse", "HEAD") == head
+    assert churn.self_sync(sync, 0, src=install, force=True, test_cmd=["true"], units=False) is None  # not retested
+
+
+def test_sync_never_touches_a_dirty_or_diverged_install(churn, tmp_path):
+    _, seed, install, git = _sync_repos(tmp_path)
+    head = git(install, "rev-parse", "HEAD")
+    _land_on_main(seed, git)
+    (install / "systemd" / "churn-tick.timer").write_text("hand edit\n")
+    note = churn.self_sync({}, 0, src=install, force=True, test_cmd=["true"], units=False)
+    assert "uncommitted edits" in note and git(install, "rev-parse", "HEAD") == head
+    git(install, "commit", "-q", "-am", "local fix")
+    note = churn.self_sync({}, 0, src=install, force=True, test_cmd=["true"], units=False)
+    assert "1 local commit(s)" in note
+
+
+def test_sync_waits_for_workers_but_not_forever(churn, tmp_path):
+    _, seed, install, git = _sync_repos(tmp_path)
+    head = git(install, "rev-parse", "HEAD")
+    _land_on_main(seed, git)
+    sync = {}
+    assert "waiting for 2 worker(s)" in churn.self_sync(sync, 2, src=install, force=True, test_cmd=["true"], units=False)
+    assert git(install, "rev-parse", "HEAD") == head
+    sync["behind_since"] = churn.iso(churn.now() - dt.timedelta(hours=churn.SYNC_MAX_DEFER_H + 1))
+    assert churn.self_sync(sync, 2, src=install, force=True, test_cmd=["true"], units=False).startswith("sync: promoter-bot")
+
+
+def test_an_install_already_on_main_still_gets_its_units(churn, tmp_path, monkeypatch):  # a host pulled by hand
+    _, seed, install, git = _sync_repos(tmp_path)
+    calls = []
+    monkeypatch.setattr(churn, "sync_units", lambda src: calls.append(src) or "churn-poll.timer (enabled churn-poll.timer)")
+    assert churn.self_sync({}, 0, src=install, force=True) == "sync: units churn-poll.timer (enabled churn-poll.timer)"
+    (install / "systemd" / "churn-tick.timer").write_text("hand edit\n")
+    assert churn.self_sync({}, 0, src=install, force=True) is None and len(calls) == 1  # dirty: units left alone
+    monkeypatch.setattr(churn, "use_systemd", lambda: False)
+    assert churn.real_sync_units(install) == ""
+
+
+def test_install_units_copies_new_and_changed_units_only(churn, tmp_path):
+    src, dest = tmp_path / "systemd", tmp_path / "user"
+    src.mkdir()
+    (src / "churn-tick.service").write_text("a\n")
+    (src / "churn-poll.timer").write_text("b\n")
+    assert churn.install_units(src, dest) == (["churn-tick.service", "churn-poll.timer"], ["churn-poll.timer"])
+    assert churn.install_units(src, dest) == ([], [])  # unchanged: nothing to do
+    (src / "churn-poll.timer").write_text("c\n")
+    assert churn.install_units(src, dest) == (["churn-poll.timer"], [])  # changed, but not new: no enable
