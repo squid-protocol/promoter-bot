@@ -505,6 +505,15 @@ SMALL_CODE_LINES = 30  # own non-test lines since the reviewed head that a Sonne
 TEST_OR_DATA = re.compile(r"(^|/)(test_[^/]*\.py|conftest\.py)$|^\.test_durations$|baseline[^/]*\.json$|^docs/")
 
 
+def own_commits(wt: str, start: str | None) -> bool | None:
+    """Did the run commit anything of its own since `start` (non-merge commits not on origin/main)? None = unknown.
+    #20: fix runs that only merged origin/main counted toward the Opus rescue like real fixes."""
+    if not start or run(["git", "-C", wt, "cat-file", "-e", f"{start}^{{commit}}"]).returncode:
+        return None
+    r = run(["git", "-C", wt, "log", "--no-merges", "--format=%H", "HEAD", f"^{start}", "^origin/main"])
+    return None if r.returncode else bool(r.stdout.strip())
+
+
 def small_delta(wt: str, reviewed_head: str) -> str | None:
     """Why the PR's own change since `reviewed_head` is small enough for a Sonnet re-review, or None (Opus). Own change =
     non-merge commits since that head that are not on origin/main, so a merge of main counts for nothing. 2026-10-16:
@@ -1180,6 +1189,35 @@ def crucible_repo_of(issue: int) -> str | None:
     return next(iter(repos)) if len(repos) == 1 else None
 
 
+def held_by_live(state: dict, wt: Path, task: str) -> str | None:
+    """The live run already on this worktree, or on the PR this task names (`PR #n`), else None. #20: an Opus rescue
+    and a Sonnet fix launched on #5552 a minute apart, and resumes started on work a live peer had just finished."""
+    prs = set(re.findall(r"PR #(\d+)\b", task or ""))
+    for r in state.get("running", []):
+        if not r.get("run_id") or not pid_alive(r.get("pid")):
+            continue
+        if str(_run_meta(r["run_id"]).get("worktree") or "") == str(wt) or any(
+                re.search(rf"#{n}\b", r.get("task") or "") for n in prs):
+            return r["run_id"]
+    return None
+
+
+def checklist_note(issue: int) -> str:
+    """The issue's unticked checklist lines with their keys, for a brief that names none (#20: workers on keyless items
+    -- `queue add`, a tick's own brief -- wrote no `Checklist:` line, so #5552 and #5579 merged and ticked nothing)."""
+    try:
+        lines = [c for c in checklist(gh_json(f"repos/{REPO}/issues/{issue}").get("body")) if not c["done"]]
+    except (RuntimeError, ValueError, AttributeError):
+        return ""
+    if not lines:
+        return ""
+    return ("\n\nIssue checklist (unticked lines and their keys):\n"
+            + "".join(f"- [c:{c['key']}] {c['text'][:200]}\n" for c in lines)
+            + "For each line this PR works on, put one line in the PR body: `Checklist: done [c:<key>]` if the PR "
+              "completes it, else `Checklist: partial [c:<key>] -- <what is left>`. Never edit the issue: the gate "
+              "ticks the box when the PR merges.\n")
+
+
 def cmd_worker(a) -> int:
     stamp = now().strftime("%Y%m%dT%H%MZ")
     resume_of = None
@@ -1222,10 +1260,14 @@ def cmd_worker(a) -> int:
             wt, branch = make_worktree(issue, stamp)
             prompt = (f"Your working directory {wt} is your git worktree, on branch {branch} off origin/main "
                       f"(rename the branch if you like). Handoff notes go in {H}.\n\n{prompt}")
+        if not getattr(a, "repo", None) and not getattr(a, "check_of", None) and "[c:" not in prompt:
+            prompt += checklist_note(issue)
     if model not in WORKER_BUDGET:
         raise SystemExit(f"model must be one of {sorted(WORKER_BUDGET)}")
     with state_lock():
         state = load_state()
+        if not a.force and not getattr(a, "check_of", None) and (who := held_by_live(state, wt, task)):
+            raise SystemExit(f"{who} already works on this PR / worktree; --force to override")
         live = claude_slot_holders(state)
         plan = rate_plan(state)
         cap = worker_cap(state, plan, [r.get("model", "sonnet") for r in live] + [model])
@@ -1259,7 +1301,8 @@ def cmd_worker(a) -> int:
             "resume_of": resume_of["run_id"] if resume_of else None, "plan": plan,
             "resume_base_usd": round(session_cost_at(resume_of), 4) if resume_of else 0.0,
             "check_of": getattr(a, "check_of", None), "repo": getattr(a, "repo", None) or None,
-            "allow_workflows": bool(allow_wf), "precheck_of": getattr(a, "precheck_of", None)}
+            "allow_workflows": bool(allow_wf), "precheck_of": getattr(a, "precheck_of", None),
+            "head_start": run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip() or None}
     if credit:
         meta.update(lane="credit", queue_item=getattr(a, "queue_item", None))
     if getattr(a, "budget_usd", None):  # the credit lane's balance, the retro's cap
@@ -1975,6 +2018,8 @@ def reap(state: dict) -> list[dict]:
             # the branch the worker really used (it may rename it) and its open PR: a requeue or relaunch must name them
             branch, pr = worktree_pr(meta["worktree"], r["issue"])
             meta["branch"] = branch or meta["branch"]
+            if (changed := own_commits(meta["worktree"], meta.get("head_start"))) is not None:
+                meta["code_changed"] = changed
         meta.update(session_id=out.get("session_id"), status=status, cost_usd=round(cost, 2), finished=iso(now()), pr=pr,
                     session_cost_usd=round(session_cost, 4))
         if pr and not meta.get("repo") and all(pr_num(p) != pr for p in state.get("prs", [])):
@@ -2056,8 +2101,15 @@ def pr_snapshot(prs: list[int], old: dict) -> dict:
         snap[str(n)] = {"state": p["state"], "merged": p.get("merged", False), "head": p["head"]["sha"][:12],
                         "mergeable_state": ms, "labels": sorted(lbl["name"] for lbl in p.get("labels", [])),
                         "branch": p["head"].get("ref", ""), "closes": bool(CLOSES_RE.search(p.get("body") or "")),
-                        **({"check": [m.group(1).lower(), m.group(2)]} if (m := PR_CHECK_RE.search(p.get("body") or "")) else {})}
+                        **pr_checks(p.get("body") or "")}
     return snap
+
+
+def pr_checks(body: str) -> dict:
+    """{"checks": [[status, key, what is left], ...], "check": the first [status, key]} for the PR body's `Checklist:`
+    lines, or {} (#20: one PR may report several lines, and #5587's marker sat mid-line after "Part of #n.")."""
+    found = [[m.group(1).lower(), m.group(2), m.group(3).strip(" -:—")[:300]] for m in PR_CHECK_RE.finditer(body)]
+    return {"checks": found, "check": found[0][:2]} if found else {}
 
 
 CLOSES_RE = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#\d+", re.I)
@@ -2139,8 +2191,11 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
             keep.append(p)
             continue
         issue = p.get("issue") if isinstance(p, dict) else None
-        if v.get("merged") and issue and v.get("check") and not v.get("closes") and (
-                note := settle_check(state, int(issue), n, *v["check"])):
+        m = re.match(r"churn/(\d+)-", v.get("branch", ""))
+        owner = issue or (int(m.group(1)) if m else None)  # #20: an entry without its issue (mark_flake, ints) settles
+        checks = v.get("checks") or ([[*v["check"], ""]] if v.get("check") else [])
+        if v.get("merged") and owner and checks and not v.get("closes") and (
+                note := "; ".join(x for c in checks if (x := settle_check(state, int(owner), n, *c)))):
             notes.append(note)  # the box records it: no followup for the tick
         elif v.get("merged") and v.get("closes"):
             notes.append(f"merged #{n} (closes its issue itself)")
@@ -2152,8 +2207,9 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
     return notes
 
 
-def settle_check(state: dict, issue: int, pr: int, status: str, key: str) -> str | None:
-    """A merged PR that reported `Checklist: done|partial [c:key]`: tick the line (done), and for a core issue queue its
+def settle_check(state: dict, issue: int, pr: int, status: str, key: str, left_text: str = "") -> str | None:
+    """A merged PR that reported `Checklist: done|partial [c:key]`: tick the line (done) or say on the issue what the
+    slice delivered (partial; #20: epics showed 0 of 8 while their slices merged), and for a core issue queue its
     next unclaimed line (or the same one, partial) right away. None = not settled here: the old followup, e.g. every line
     is now ticked (the tick closes the issue), the line was edited away, or the issue cannot be read."""
     try:
@@ -2171,6 +2227,12 @@ def settle_check(state: dict, issue: int, pr: int, status: str, key: str) -> str
             return None
         body = new
         note += ", ticked"
+    elif status == "partial":
+        line = next(c["text"] for c in checklist(body) if c["key"] == key)
+        msg = (f"#{pr} merged: a partial slice of [c:{key}] \"{line[:200]}\""
+               + (f"; left: {left_text}" if left_text else "") + " (promoter-bot)")
+        if not run(["gh", "api", "-X", "POST", f"repos/{REPO}/issues/{issue}/comments", "-f", f"body={msg}"]).returncode:
+            note += ", commented"
     left = [c for c in checklist(body) if not c["done"]]
     if not left:
         return None
@@ -3302,13 +3364,14 @@ FIX_LOOP_CAP, FIX_LOOP_WINDOW_H = 3, 24
 
 
 def recent_fix_runs(pr: int, issue: int) -> int:
-    """Fix-loop runs (PR fixes naming #pr, send-backs and precheck retries of the issue's runs) started in the window."""
+    """Fix-loop runs (PR fixes naming #pr, send-backs and precheck retries of the issue's runs) started in the window.
+    A run known to have committed nothing of its own (merge-only or no-op, #20) is not a fix round."""
     cut = now() - dt.timedelta(hours=FIX_LOOP_WINDOW_H)
     n = 0
     for d in RUNS.glob(f"{issue}-*"):
         m = _run_meta(d.name)
         t = parse_iso(m.get("started"))
-        if not t or t < cut or m.get("check_of"):
+        if not t or t < cut or m.get("check_of") or m.get("code_changed") is False:
             continue
         kind = run_kind(m)
         if (kind == "pr_fix" and re.search(rf"#{pr}\b", m.get("task") or "")) or kind in ("send_back", "precheck_retry"):
@@ -3342,7 +3405,52 @@ def rescue_task(n, branch: str | None, issue: int, loops: int, why: list[str]) -
             f"There is no second rescue: if this fails again the PR goes to the owner.")
 
 
-def queue_pr_fixes(state: dict, snap: dict, triage=None) -> list[str]:
+FIX_SETTLE_MIN = 15  # a run on the PR finished this recently: CI on its push has not reported yet (#20)
+
+
+def update_branch(n: int) -> bool:
+    """Merge origin/main into PR n's branch on GitHub (the update-branch API): True when GitHub took it, False on a real
+    conflict (422) or any other failure. #20: ~8 Claude fix runs a night only merged main and pushed."""
+    return not run(["gh", "api", "-X", "PUT", f"repos/{REPO}/pulls/{n}/update-branch"]).returncode
+
+
+def recently_settling(state: dict, n: str, v: dict, issue: int) -> bool:
+    """A run on PR n is not judged yet (its report waits for review) or finished under FIX_SETTLE_MIN ago (#20: four
+    resume/fix runs found their work already done, one fix overlapped an Opus rescue)."""
+    if any(e.get("issue") == issue for e in state.get("reports_pending", [])):
+        return True
+    cut = now() - dt.timedelta(minutes=FIX_SETTLE_MIN)
+    return any(m.get("branch") == v.get("branch") and (t := parse_iso(m.get("finished"))) and t > cut
+               for d in RUNS.glob(f"{issue}-*") if (m := _run_meta(d.name)))
+
+
+def carry_reviews(state: dict, snap: dict, compare=None) -> list[str]:
+    """A PR the gate updated with main (update_branch) keeps its review: when its head moved from `updated_from` by
+    exactly GitHub's one merge commit, the verdict given at the old head is re-stamped at the new one, so the update
+    costs no re-review model tick."""
+    out = []
+    for p in state.get("prs", []):
+        if not isinstance(p, dict) or not (old := str(p.get("updated_from") or "")):
+            continue
+        v = snap.get(str(pr_num(p)), {})
+        if v.get("state") != "open" or not v.get("head") or old.startswith(v["head"]) or v["head"].startswith(old[:12]):
+            continue
+        p.pop("updated_from")
+        rh = str(p.get("reviewed_head") or "")
+        if not (rh and p.get("verdict") and (rh.startswith(old) or old.startswith(rh[:12]))):
+            continue
+        try:
+            c = (compare or gh_json)(f"repos/{REPO}/compare/{old}...{v['head']}")
+            commits = c.get("commits") or []
+        except (RuntimeError, ValueError, AttributeError):
+            continue
+        if len(commits) == 1 and len(commits[0].get("parents") or []) == 2:
+            p["reviewed_head"] = v["head"]
+            out.append(f"#{pr_num(p)} {p['verdict']} -> {v['head']}")
+    return out
+
+
+def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None) -> list[str]:
     """Owner 2026-10-13: #5038/#5041 sat conflicting for hours because a tick with no free slot only logged them and
     stuck_seen then hid them. Any watched open PR that is conflicting (dirty) or shepherd:needs-fix, with no live worker
     on it and no queue item for it, gets a fix item at the FRONT of the queue (key "pr").
@@ -3362,9 +3470,27 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None) -> list[str]:
                                 ("review sent it back", sent_back)) if hit]
         if not why:
             continue
+        m = re.match(r"churn/(\d+)-", v.get("branch", ""))
+        issue = issue_of.get(int(n)) or (int(m.group(1)) if m else int(n))
+        if recently_settling(state, n, v, issue):
+            continue
+        entry = next((p for p in state.get("prs", []) if isinstance(p, dict) and pr_num(p) == int(n)), None)
+        if why == ["conflicts with main"] and entry is not None and entry.get("update_tried") != v.get("head"):
+            # #20: a branch that only needs main merged is GitHub's job, not a model's; a real conflict fails (422)
+            entry["update_tried"] = v.get("head")
+            if (update or update_branch)(int(n)):
+                entry["updated_from"] = v.get("head")
+                added.append(f"updated:#{n}")
+                continue
         if why == ["shepherd:needs-fix"]:  # a red, not a conflict: only a REAL failure is a worker's job
             kinds = (triage or ci_triage)(int(n))
             if kinds is not None and not [k for k in kinds if k not in NOISE]:
+                if "main" in kinds and entry is not None and entry.get("update_tried") != v.get("head"):
+                    entry["update_tried"] = v.get("head")  # main's own red: take main's fix, no worker
+                    if (update or update_branch)(int(n)):
+                        entry["updated_from"] = v.get("head")
+                        added.append(f"updated:#{n}")
+                        continue
                 if kinds:  # infra / flake / main only: the shepherd reruns it; look again in FLAKE_HOURS or on a new head
                     mark_flake(state, n, v.get("head", ""), "gate: CI noise only (" + ", ".join(sorted(set(kinds))) + ")")
                     added.append(f"noise:#{n} ({', '.join(sorted(set(kinds)))})")
@@ -3373,8 +3499,6 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None) -> list[str]:
                         if isinstance(p, dict) and pr_num(p) == int(n):
                             p["clean_head"] = v.get("head")
                 continue
-        m = re.match(r"churn/(\d+)-", v.get("branch", ""))
-        issue = issue_of.get(int(n)) or (int(m.group(1)) if m else int(n))
         loops = recent_fix_runs(int(n), issue)
         # Owner 2026-10-17: two Sonnet fix runs, then ONE Opus rescue that judges the PR (save / slice / restart /
         # owner); a PR that fails again after its rescue goes to the owner. Before: the owner at 3 runs, no rescue.
@@ -3613,6 +3737,8 @@ def direct_launches(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
         spec = direct_spec(state, snap, x)
         if spec is None:
             break
+        if spec.get("worktree") and held_by_live(state, Path(spec["worktree"]), x.get("task") or ""):
+            continue  # a live run already has this PR (#20): the next pick may still go
         if x.get("lane") != "backfill" and not worker_slots(b, len(live) + len(did), slot_ceiling(state, plan)):
             break
         if not x.get("pr") and x.get("lane") != "backfill" and len(prs_needing_work(snap, live, state)) >= 3:
@@ -3812,7 +3938,7 @@ def recently_worked(issue: int, hours: float) -> bool:
 # what is left (scorecard), and a core issue's next line is queued at once instead of after the 12 h cooldown.
 CHECK_RE = re.compile(r"^(\s*[-*]\s+)\[([ xX])\]\s+(.*?)\s*$", re.M)
 CHECK_KEY_RE = re.compile(r"\[c:([0-9a-f]{8})\]")
-PR_CHECK_RE = re.compile(r"^\W*Checklist:?\W*(done|partial)\b[^\n]*?\[c:([0-9a-f]{8})\]", re.I | re.M)
+PR_CHECK_RE = re.compile(r"\bChecklist:?\W*(done|partial)\b[^\n]*?\[c:([0-9a-f]{8})\]([^\n]*)", re.I)
 
 
 def check_key(text: str) -> str:
@@ -4291,6 +4417,9 @@ def cmd_tick(a) -> int:
             with edit_state() as st:
                 for note in settle_closed(st, snap):
                     log(note)
+                with contextlib.suppress(Exception):
+                    if carried := carry_reviews(st, snap):
+                        log("review kept across the gate's update-branch: " + ", ".join(carried))
                 pruned = prune_pr_fixes(st, snap)
                 fixes = queue_pr_fixes(st, snap)
                 with contextlib.suppress(Exception):
@@ -4305,7 +4434,10 @@ def cmd_tick(a) -> int:
             if pruned:
                 log("dropped PR-fix items whose PR moved on (new head or closed): " + ", ".join(pruned))
             noise = [x[6:] for x in fixes if x.startswith("noise:")]
-            fixes = [x for x in fixes if not x.startswith("noise:")]
+            updated = [x[8:] for x in fixes if x.startswith("updated:")]
+            fixes = [x for x in fixes if not x.startswith(("noise:", "updated:"))]
+            if updated:
+                log("updated with main by the gate (update-branch, no worker): " + ", ".join(updated))
             if noise:
                 log("not queued, CI noise only (the shepherd reruns it; no worker): " + ", ".join(noise))
             if fixes:
@@ -4650,6 +4782,8 @@ def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, q
     trial = [r for r in state.get("agy", {}).get("trial", {}).get("results", []) if within(r.get("t"))]
     total = spend["workers"] + spend["ticks"]
     churn_merged = [p for p in merged if is_churn(p)]
+    # #20: epics advance by slices long before an issue closes; count the merged PRs that reported checklist lines
+    slices = [pr_checks(p.get("body") or "").get("checks", []) for p in churn_merged]
     quiet = quiet_text if quiet_text is not None else (QUIET_LOG.read_text() if QUIET_LOG.exists() else "")
     return {
         "factory": factory(day, state, text, quiet, churn_merged),
@@ -4660,6 +4794,7 @@ def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, q
         "credit": {"usd": round(sum(float(e.get("cost_usd") or 0) for e in credit_runs), 2), "runs": len(credit_runs),
                    "balance": credit_balance(state)["balance"]},
         "issues_created": created, "issues_closed": closed, "issues_net": created - closed, "core": core,
+        "slices_merged": sum(1 for s in slices if s), "items_done": sum(c[0] == "done" for s in slices for c in s),
         "red_main_hours": round(sum(r[0] for r in red), 1), "red_main": red[:3], "statuses": statuses,
         "agy_trial": {v: sum(1 for r in trial if r.get("verdict") == v) for v in ("PASS", "FIXED", "REJECT")},
         "queue": len(state.get("queue", [])), "queue_owner": sum(1 for q in state.get("queue", []) if q.get("needs_owner")),
@@ -4681,7 +4816,9 @@ def scorecard_md(c: dict) -> str:
               if c['core'].get('core_per_hour') else "") + "."] if (c.get("core") or {}).get("parts") is not None else []),
         f"- Merged: {len(c['merged'])} PRs, {len(c['churn_merged'])} from churn"
         + (f" ({', '.join('#' + str(n) for n in c['churn_merged'][:15])})" if c["churn_merged"] else "")
-        + f"; opened {c['opened']} ({c['churn_opened']} churn).",
+        + f"; opened {c['opened']} ({c['churn_opened']} churn)"
+        + (f"; {c['slices_merged']} reported checklist slices, {c.get('items_done', 0)} lines done"
+           if c.get("slices_merged") else "") + ".",
         f"- Spend: ${c['total_usd']:.2f} = workers ${c['spend']['workers']:.2f} ({c['runs']['workers']} runs) + ticks "
         f"${c['spend']['ticks']:.2f} ({c['runs']['ticks']}); agy {c['runs']['agy']} runs (Google quota)"
         + (f"; ${c['usd_per_merged_churn_pr']:.2f} per merged churn PR" if c["usd_per_merged_churn_pr"] is not None else "")
@@ -4732,7 +4869,8 @@ def record_factory(c: dict, push: bool = True) -> bool:
         data = {}
     days = data.get("days", {})
     days[c["day"]] = {**c["factory"], "churn_merged": len(c["churn_merged"]), "usd": c["total_usd"],
-                      "usd_per_merged_churn_pr": c["usd_per_merged_churn_pr"]}
+                      "usd_per_merged_churn_pr": c["usd_per_merged_churn_pr"],
+                      "slices_merged": c.get("slices_merged", 0), "items_done": c.get("items_done", 0)}
     keep = sorted(days)[-FACTORY_DAYS:]
     data = {"repo": REPO, "updated": iso(now()), "days": {d: days[d] for d in keep}}
     FACTORY.write_text(json.dumps(data, indent=1, sort_keys=True))
@@ -4741,7 +4879,7 @@ def record_factory(c: dict, push: bool = True) -> bool:
 
 # Fields of a factory day that add up across hosts (counts, hours, dollars, worker slots); the ratios are recomputed
 # from these sums, so a combined day is exact. ci_busy_hours is each host's view of the same CI queue: the max.
-FACTORY_SUM = ("churn_merged", "usd", "loop_runs", "idle_ticks", "idle_hours", "paused_hours", "max_workers",
+FACTORY_SUM = ("churn_merged", "slices_merged", "items_done", "usd", "loop_runs", "idle_ticks", "idle_hours", "paused_hours", "max_workers",
                "worker_hours", "precheck", "holds", "idle_causes", "idle_blockers")
 
 
