@@ -33,6 +33,8 @@ def churn(tmp_path, monkeypatch):
     mod.real_worktree_pr = mod.worktree_pr
     monkeypatch.setattr(mod, "worktree_pr", lambda wt, issue=None: ("", None))
     monkeypatch.setattr(mod, "run_sync_pulse", lambda force=False: None)  # never fetch or update this checkout
+    mod.real_sync_units = mod.sync_units
+    monkeypatch.setattr(mod, "sync_units", lambda src: "")  # never touch ~/.config/systemd from a test
     monkeypatch.setattr(mod, "ci_triage", lambda n: None)  # unreadable triage: queue as before
     mod.real_checklist_note = mod.checklist_note
     monkeypatch.setattr(mod, "checklist_note", lambda n: "")
@@ -2971,6 +2973,17 @@ def test_sync_waits_for_workers_but_not_forever(churn, tmp_path):
     assert git(install, "rev-parse", "HEAD") == head
     sync["behind_since"] = churn.iso(churn.now() - dt.timedelta(hours=churn.SYNC_MAX_DEFER_H + 1))
     assert churn.self_sync(sync, 2, src=install, force=True, test_cmd=["true"], units=False).startswith("sync: promoter-bot")
+
+
+def test_an_install_already_on_main_still_gets_its_units(churn, tmp_path, monkeypatch):  # a host pulled by hand
+    _, seed, install, git = _sync_repos(tmp_path)
+    calls = []
+    monkeypatch.setattr(churn, "sync_units", lambda src: calls.append(src) or "churn-poll.timer (enabled churn-poll.timer)")
+    assert churn.self_sync({}, 0, src=install, force=True) == "sync: units churn-poll.timer (enabled churn-poll.timer)"
+    (install / "systemd" / "churn-tick.timer").write_text("hand edit\n")
+    assert churn.self_sync({}, 0, src=install, force=True) is None and len(calls) == 1  # dirty: units left alone
+    monkeypatch.setattr(churn, "use_systemd", lambda: False)
+    assert churn.real_sync_units(install) == ""
 
 
 def test_install_units_copies_new_and_changed_units_only(churn, tmp_path):

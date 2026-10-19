@@ -985,8 +985,10 @@ SYNC_EVERY_MIN, SYNC_MAX_DEFER_H, SYNC_TEST_TIMEOUT_S = 60, 3, 600
 UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 
 
-def install_units(src: Path, dest: Path = UNIT_DIR) -> tuple[list[str], list[str]]:
-    """Copy the repo's systemd/*.service|*.timer that are new or changed into dest: (copied, new timers)."""
+def install_units(src: Path, dest: Path | None = None) -> tuple[list[str], list[str]]:
+    """Copy the repo's systemd/*.service|*.timer that are new or changed into dest: (copied, new timers). The repo's
+    units must be host-neutral (%h, no host paths): the pulse overwrites an installed unit of the same name."""
+    dest = dest or UNIT_DIR
     copied, new_timers = [], []
     for f in sorted(src.glob("*.service")) + sorted(src.glob("*.timer")):
         d = dest / f.name
@@ -998,6 +1000,18 @@ def install_units(src: Path, dest: Path = UNIT_DIR) -> tuple[list[str], list[str
         shutil.copyfile(f, d)
         copied.append(f.name)
     return copied, new_timers
+
+
+def sync_units(src: Path) -> str:
+    """Install the checkout's new or changed units under systemd (enabling new timers): what changed, or ""."""
+    if not use_systemd() or not (src / "systemd").is_dir():
+        return ""
+    copied, timers = install_units(src / "systemd")
+    if copied:
+        run(["systemctl", "--user", "daemon-reload"])
+        for t in timers:
+            run(["systemctl", "--user", "enable", "--now", t])
+    return ", ".join(copied) + (f" (enabled {', '.join(timers)})" if timers else "")
 
 
 def self_sync(sync: dict, live: int, src: Path | None = None, force: bool = False,
@@ -1017,8 +1031,9 @@ def self_sync(sync: dict, live: int, src: Path | None = None, force: bool = Fals
     ahead = int(git("rev-list", "--count", "origin/main..HEAD").stdout.strip() or 0)
     sync.update(head=head[:12], behind=behind, ahead=ahead)
     if not behind:
-        sync.pop("behind_since", None)
-        return None
+        sync.pop("behind_since", None)  # on main: still make the installed units match it (a host pulled by hand)
+        clean = not git("status", "--porcelain", "--untracked-files=no").stdout.strip()
+        return (f"sync: units {installed}" if clean and units and (installed := sync_units(src)) else None)
     sync.setdefault("behind_since", iso(now()))
     dirty = git("status", "--porcelain", "--untracked-files=no").stdout.strip()
     if ahead or dirty:
@@ -1052,13 +1067,8 @@ def self_sync(sync: dict, live: int, src: Path | None = None, force: bool = Fals
     if git("merge", "-q", "--ff-only", target).returncode:
         return f"sync: fast-forward to {target[:8]} failed; staying on {head[:8]}"
     note = f"sync: promoter-bot {head[:8]} -> {target[:8]} ({behind} commit(s))"
-    if units and use_systemd() and (src / "systemd").is_dir():
-        copied, timers = install_units(src / "systemd")
-        if copied:
-            run(["systemctl", "--user", "daemon-reload"])
-            for t in timers:
-                run(["systemctl", "--user", "enable", "--now", t])
-            note += "; units " + ", ".join(copied) + (f" (enabled {', '.join(timers)})" if timers else "")
+    if units and (installed := sync_units(src)):
+        note += f"; units {installed}"
     sync.update(head=target[:12], behind=0, ahead=0, applied=iso(now()))
     sync.pop("behind_since", None)
     sync.pop("failed", None)
