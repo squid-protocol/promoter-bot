@@ -1,0 +1,9 @@
+[Unit]
+Description=churn poll: one gh call; start the gate when a watched PR changed (#19)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/.local/bin/churn poll
+TimeoutStartSec=120
+Nice=5

@@ -38,4 +38,8 @@ optional:
 
 `CHURN_HOME` still overrides the state directory.
 
+Between gate ticks, `churn poll` (every 2 min, `systemd/churn-poll.timer`) makes one gh call and starts the gate at
+once when a watched PR changed (a red check labelled needs-fix, a push, a merge), so a fix starts within minutes.
+Install: `cp systemd/churn-poll.* ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now churn-poll.timer`.
+
 Tests: `python3 -m pytest -q tests` (each test runs against a tmp `CHURN_HOME`, never the live state).

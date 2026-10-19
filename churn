@@ -2957,6 +2957,49 @@ def cmd_watchdog(a) -> int:
     return 0
 
 
+POLL_SEEN = H / "churn-poll.json"
+
+
+def poll_changes(watched: list[int], open_prs: list[dict], snap: dict) -> dict[str, list]:
+    """{pr: [head, labels]} of the watched PRs as GitHub shows them now ([None, []] once closed or merged), and only
+    when that differs from the gate's last snapshot of them. Empty = nothing for the gate."""
+    now_ = {str(p["number"]): [p["head"]["sha"][:12], sorted(lbl["name"] for lbl in p.get("labels", []))]
+            for p in open_prs if p.get("number") in watched}
+    seen = {str(n): [v.get("head"), sorted(v.get("labels", []))] if v.get("state") == "open" else [None, []]
+            for n, v in snap.items() if int(n) in watched}
+    return {n: now_.get(n, [None, []]) for n in map(str, watched)
+            if n in seen and now_.get(n, [None, []]) != seen[n]}
+
+
+def cmd_poll(a) -> int:
+    """#19: between the 10-min gate ticks, look at the watched PRs with ONE gh call (every 2 min, churn-poll.timer) and
+    start the gate at once when one changed: a red check the shepherd labelled needs-fix, a push, a merge. The gate
+    then queues and launches the fix with no model tick, so a red check waits ~2 min, not up to 10, for its fix."""
+    state = load_state()
+    if STOP.exists() or state.get("workers_paused") or (
+            (p := parse_iso(state.get("paused_until"))) and now() < p) or state.get("offline"):
+        return 0
+    watched = [pr_num(p) for p in state.get("prs", [])]
+    if not watched or not SNAP.exists():
+        return 0
+    try:
+        changed = poll_changes(watched, gh_json(f"repos/{REPO}/pulls?state=open&per_page=100"),
+                               json.loads(SNAP.read_text()))
+    except (RuntimeError, ValueError):
+        return 0
+    try:
+        last = json.loads(POLL_SEEN.read_text())
+    except (OSError, ValueError):
+        last = {}
+    if not changed or changed == last:  # nothing new, or the gate already knows (it skipped: no slot, a pause)
+        return 0
+    POLL_SEEN.write_text(json.dumps(changed))
+    log("poll: watched PRs changed (" + ", ".join(f"#{n}" for n in changed) + "): gate now", quiet=True)
+    DIRTY.touch()  # a running tick loops once more
+    nudge_tick()
+    return 0
+
+
 def cmd_notify(a) -> int:
     cfg = notify_cfg()
     if a.action == "boot":  # churn-boot.service, once per boot (linger on): the network may need a minute
@@ -5254,6 +5297,8 @@ def cmd_pr(a) -> int:
             entry.update(reviewed_head=a.head, verdict=a.verdict, reviewed_at=iso(now()))
             if a.note:
                 entry["note"] = a.note[:300]
+            if a.verdict == "send-back":  # #19: the gate loops once more after this tick and launches the fix now
+                DIRTY.touch()
         elif a.head:
             entry["reviewed_head"] = a.head
         if idx is None:
@@ -5614,6 +5659,7 @@ def main() -> int:
     cl.add_argument("issue", nargs="?", type=int)
     cl.add_argument("--dry-run", action="store_true")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
+    sub.add_parser("poll", help="every 2 min: one gh call; start the gate at once when a watched PR changed")
     r = sub.add_parser("_run")
     r.add_argument("run_id")
     pc = sub.add_parser("_precheck")
@@ -5676,6 +5722,8 @@ def main() -> int:
         return cmd_credit(a)
     if a.cmd == "retro":
         return cmd_retro(a)
+    if a.cmd == "poll":
+        return cmd_poll(a)
     if a.cmd == "watchdog":
         return cmd_watchdog(a)
     if a.cmd == "factory":

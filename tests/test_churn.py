@@ -2854,3 +2854,47 @@ def test_the_fix_brief_names_the_red_checks(churn):
     st = {"prs": [{"number": 7, "issue": 70}], "queue": [], "running": []}
     churn.queue_pr_fixes(st, {"7": SNAP_RED["7"]}, triage=lambda n: ["real"])
     assert "Red at this head (ci_digest): Full Suite (real): tests/test_x.py::t" in st["queue"][0]["task"]
+
+
+def _gh_pr(n, sha, *labels):
+    return {"number": n, "head": {"sha": sha + "0" * 28}, "labels": [{"name": x} for x in labels]}
+
+
+def test_poll_sees_only_what_the_gate_has_not(churn):
+    snap = {"7": pr(head="aaaa11112222", labels=["shepherd:merge"]), "8": pr(head="bbbb11112222")}
+    same = [_gh_pr(7, "aaaa11112222", "shepherd:merge"), _gh_pr(8, "bbbb11112222"), _gh_pr(9, "cccc11112222")]
+    assert churn.poll_changes([7, 8], same, snap) == {}  # #9 is not watched
+    red = [_gh_pr(7, "aaaa11112222", "shepherd:merge", "shepherd:needs-fix"), _gh_pr(8, "bbbb11112222")]
+    assert churn.poll_changes([7, 8], red, snap) == {"7": ["aaaa11112222", ["shepherd:merge", "shepherd:needs-fix"]]}
+    assert churn.poll_changes([7, 8], same[:1], snap) == {"8": [None, []]}  # #8 merged or closed
+    assert churn.poll_changes([7, 8, 10], same, snap) == {}  # #10 the gate has not seen yet: its own tick picks it up
+
+
+def test_poll_nudges_the_gate_once_per_change(churn, monkeypatch):
+    put(churn, prs=[{"number": 7, "issue": 70}])
+    churn.SNAP.write_text(json.dumps({"7": pr(head="aaaa11112222")}))
+    nudged = []
+    monkeypatch.setattr(churn, "nudge_tick", lambda: nudged.append(1))
+    gh = {"prs": [_gh_pr(7, "aaaa11112222")]}
+    monkeypatch.setattr(churn, "gh_json", lambda path: gh["prs"])
+    assert churn.cmd_poll(None) == 0 and nudged == [] and not churn.DIRTY.exists()
+    gh["prs"] = [_gh_pr(7, "aaaa11112222", "shepherd:needs-fix")]
+    churn.cmd_poll(None)
+    assert nudged == [1] and churn.DIRTY.exists()
+    churn.cmd_poll(None)
+    assert nudged == [1]  # the gate has not refreshed its snapshot yet (busy, paused): no second nudge
+    churn.STOP.touch()
+    gh["prs"] = [_gh_pr(7, "dddd11112222")]
+    churn.cmd_poll(None)
+    assert nudged == [1]  # stopped: the poll stays quiet
+
+
+def test_a_send_back_verdict_makes_the_running_tick_loop_once_more(churn, monkeypatch):
+    monkeypatch.setattr(churn, "gh_label", lambda n, add=None, remove=None: None)  # never label a real PR
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", ""))
+    ns =argparse.Namespace(number=7, action="reviewed", head="h1", verdict="send-back", note="fix x", issue=70)
+    churn.cmd_pr(ns)
+    assert churn.DIRTY.exists()
+    churn.DIRTY.unlink()
+    churn.cmd_pr(argparse.Namespace(number=8, action="reviewed", head="h1", verdict="merge", note=None, issue=80))
+    assert not churn.DIRTY.exists()
