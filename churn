@@ -3325,6 +3325,7 @@ def red_main_issues() -> list[dict]:
 
 
 NOISE = {"infra", "flake", "main"}  # ci_digest triage the shepherd handles by rerunning (or main's own fix)
+CI_RED: dict[int, str] = {}  # PR -> its failing checks at the last triage, for the fix brief (#19: no tick to read CI)
 
 
 def ci_triage(n: int) -> list[str] | None:
@@ -3332,7 +3333,11 @@ def ci_triage(n: int) -> list[str] | None:
     it cannot be read. [] = nothing failing right now (CI still running, or the label is stale)."""
     try:  # ci_digest exits 1 whenever something failed; its JSON is the answer either way
         r = run([sys.executable, str(TOOLS / "tests" / "tools" / "ci_digest.py"), str(n), "--json"], timeout=300)
-        return [f.get("triage") for f in json.loads(r.stdout)["failed"]]
+        failed = json.loads(r.stdout)["failed"]
+        CI_RED[n] = "; ".join(f"{f.get('check')} ({f.get('triage')})"
+                              + (f": {' '.join((f.get('tests') or [])[:3])}" if f.get("tests") else "")
+                              + (f", repro `{f['repro']}`" if f.get("repro") else "") for f in failed)[:600]
+        return [f.get("triage") for f in failed]
     except (ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired):
         return None
 
@@ -3509,6 +3514,8 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None) -> list[st
         note = next((str(p.get("note") or "") for p in state.get("prs", []) if isinstance(p, dict) and pr_num(p) == int(n)), "")
         review = (f" The review at this head asked for: {note[:400]} (This item comes back every tick until the head "
                   f"changes: to defer it use `churn queue wait`, never `churn queue rm`.)" if sent_back and note else "")
+        if "shepherd:needs-fix" in why and CI_RED.get(int(n)):
+            review += f" Red at this head (ci_digest): {CI_RED[int(n)]}."
         task = (rescue_task(n, v.get("branch"), issue, loops, why) + review if rescue else
                 f"Fix PR #{n} ({v.get('branch')}): {' + '.join(why)}. Work on the PR's own branch: merge origin/main "
                 f"(never rebase), resolve (regenerate generated docs, never hand-merge them), read any red check and fix "
@@ -3640,6 +3647,9 @@ def _run_meta(rid: str) -> dict:
     return {}
 
 
+WARM_RESUME_MIN = 55  # a run finished this recently resumes inside the 1 h prompt cache (send-back's limit is 60)
+
+
 def direct_spec(state: dict, snap: dict, x: dict) -> dict | None:
     """How the gate can launch item x itself, or None if a model tick must write its brief (owner 2026-10-16: ~330 of
     ~440 model ticks since 10-14 carried a launch; for these items the brief already exists):
@@ -3652,6 +3662,11 @@ def direct_spec(state: dict, snap: dict, x: dict) -> dict | None:
         branch = (snap.get(str(x["pr"])) or {}).get("branch")
         metas = sorted((m for d in RUNS.glob(f"{x['issue']}-*") if (m := _run_meta(d.name))), key=lambda m: m.get("started", ""))
         m = next((m for m in reversed(metas) if branch and m.get("branch") == branch and tree(m)), None)
+        if m and m.get("session_id") and m.get("status") == "done" and not m.get("repo") and not x.get("rescue") and (
+                m.get("model") == x.get("model", "sonnet")) and (
+                t := parse_iso(m.get("finished"))) and now() - t < dt.timedelta(minutes=WARM_RESUME_MIN):
+            # #19: the run that wrote this PR is still in the 1 h prompt cache: the fix goes back into its session
+            return {"worktree": m["worktree"], "branch": branch, "brief": x["task"], "plan": False, "resume_run": m["run_id"]}
         return m and {"worktree": m["worktree"], "branch": branch, "brief": x["task"], "plan": False, "repo": m.get("repo")}
     if x.get("lane") == "backfill" and (r := re.match(r"RESUME backfill run (\S+)", str(x.get("task", "")))):
         m = tree(_run_meta(r.group(1)))
@@ -3746,17 +3761,21 @@ def direct_launches(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
         ok, _ = (True, "") if plan else pace_allows(state, x.get("model", "sonnet"))
         if not ok:
             break
-        what = (f"PR fix #{x['pr']}" if x.get("pr") else "backfill resume" if spec.get("lane") else
+        what = (f"PR fix #{x['pr']}" + (" (warm resume)" if spec.get("resume_run") else "") if x.get("pr") else "backfill resume" if spec.get("lane") else
                 f"held plan {spec['held_plan']}" if spec.get("held_plan") else "new issue, gate brief")
         did.append(f"#{x['issue']} ({what})")
         if dry_run:
             continue
         try:
             with contextlib.redirect_stdout(open(os.devnull, "w")):
-                cmd_worker(argparse.Namespace(resume_run=None, issue=x["issue"], model=x.get("model", "sonnet"),
-                                              task=x.get("task"), brief=spec["brief"], brief_file=None, force=False,
-                                              plan=spec["plan"], worktree=spec["worktree"], branch=spec.get("branch"),
-                                              check_of=None, repo=spec.get("repo"), lane=spec.get("lane")))
+                if spec.get("resume_run"):
+                    cmd_worker(argparse.Namespace(resume_run=spec["resume_run"], message=spec["brief"], force=False,
+                                                  plan=False))
+                else:
+                    cmd_worker(argparse.Namespace(resume_run=None, issue=x["issue"], model=x.get("model", "sonnet"),
+                                                  task=x.get("task"), brief=spec["brief"], brief_file=None, force=False,
+                                                  plan=spec["plan"], worktree=spec["worktree"], branch=spec.get("branch"),
+                                                  check_of=None, repo=spec.get("repo"), lane=spec.get("lane")))
         except (SystemExit, OSError, RuntimeError) as e:  # a cap / missing tree: leave the item to the model tick
             did.pop()
             log(f"direct launch of #{x['issue']} refused, left queued for the tick: {str(e)[:200]}")
