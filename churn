@@ -2155,7 +2155,7 @@ def reap(state: dict) -> list[dict]:
             {"t": iso(now()), "model": r["model"], "tokens": tokens, "cost_usd": round(cost, 2), "issue": r["issue"], "run_id": rid,
              **({"started": r["started"]} if r.get("started") else {})})
         entry = {"run_id": rid, "issue": r["issue"], "model": r["model"], "status": status, "report": str(rd / "report.md"),
-                 **({"pr": pr} if pr else {})}
+                 **({"pr": pr} if pr else {}), **({"repo": meta["repo"]} if meta.get("repo") else {})}
         rh = next((str(p.get("reviewed_head") or "") for p in state.get("prs", [])
                    if isinstance(p, dict) and pr and pr_num(p) == pr), "")
         if status == "done" and pr and rh and (why := small_delta(meta["worktree"], rh)):
@@ -3965,7 +3965,7 @@ def note_box(state: dict, b: dict) -> None:
 
 TICK_CLI = """NEVER edit churn-state.json yourself (not with Edit/Write, python or jq): change state ONLY with these
 (each validates and logs; the gate quarantines anything malformed):
-- `churn review done <run_id> [--note ...]`             a reviewed report leaves reports_pending
+- `churn review done <run_id> [--note ...]`             a reviewed report leaves reports_pending (no PR: note goes on the issue)
 - `churn pr watch <n> --issue <i> [--head <sha>]`       watch a PR (a worker's new draft PR)
 - `churn pr reviewed <n> --head <sha> --verdict merge|send-back|hold [--note]`  records the review at that head;
                                                          `merge` also adds shepherd:merge and drops shepherd:reapprove
@@ -5438,13 +5438,27 @@ def cmd_followup(a) -> int:
     return 0
 
 
+def comment_run_outcome(e: dict, note: str) -> None:
+    """A run that ends without a PR leaves its outcome only in the local churn log, which the other host, the owner on
+    GitHub and a later worktree cleanup never see (owner 2026-10-19): post the review note on the issue."""
+    r = run(["gh", "issue", "comment", str(e["issue"]), "-R", REPO, "--body",
+             f"<!-- promoter-bot run-outcome run={e['run_id']} -->\n**Churn run `{e['run_id']}` (host {HOST_ID}) ended "
+             f"without a PR.** {note}"])
+    if r.returncode:
+        log(f"run-outcome comment on #{e['issue']} failed: {r.stderr.strip()[:160]}")
+
+
 def cmd_review(a) -> int:
     with edit_state() as st:
-        before = len(st.get("reports_pending", []))
-        st["reports_pending"] = [e for e in st.get("reports_pending", []) if e["run_id"] != a.run_id]
-        if len(st["reports_pending"]) == before:
+        pending = st.get("reports_pending", [])
+        hit = next((e for e in pending if e["run_id"] == a.run_id), None)
+        if hit is None:
             raise SystemExit(f"{a.run_id} is not in reports_pending")
+        st["reports_pending"] = [e for e in pending if e["run_id"] != a.run_id]
     log(f"review done {a.run_id}" + (f": {a.note[:160]}" if a.note else ""))
+    # another repo's run never records its PR (reap skips the lookup): no outcome comment there
+    if a.note and hit.get("issue") and not hit.get("pr") and not hit.get("repo") and not getattr(a, "no_comment", False):
+        comment_run_outcome(hit, a.note)
     return 0
 
 
@@ -5723,7 +5737,8 @@ def main() -> int:
     rv = sub.add_parser("review", help="a reviewed worker report leaves reports_pending")
     rv.add_argument("action", choices=["done"])
     rv.add_argument("run_id")
-    rv.add_argument("--note")
+    rv.add_argument("--note", help="for a run with no PR, also posted on the issue as the run's outcome")
+    rv.add_argument("--no-comment", action="store_true", help="do not post the note on the issue")
     ar = sub.add_parser("agy-result", help=argparse.SUPPRESS)
     for x in (ar,):
         x.add_argument("--issue", type=int, required=True)
