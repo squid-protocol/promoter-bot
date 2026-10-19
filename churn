@@ -2957,6 +2957,49 @@ def cmd_watchdog(a) -> int:
     return 0
 
 
+POLL_SEEN = H / "churn-poll.json"
+
+
+def poll_changes(watched: list[int], open_prs: list[dict], snap: dict) -> dict[str, list]:
+    """{pr: [head, labels]} of the watched PRs as GitHub shows them now ([None, []] once closed or merged), and only
+    when that differs from the gate's last snapshot of them. Empty = nothing for the gate."""
+    now_ = {str(p["number"]): [p["head"]["sha"][:12], sorted(lbl["name"] for lbl in p.get("labels", []))]
+            for p in open_prs if p.get("number") in watched}
+    seen = {str(n): [v.get("head"), sorted(v.get("labels", []))] if v.get("state") == "open" else [None, []]
+            for n, v in snap.items() if int(n) in watched}
+    return {n: now_.get(n, [None, []]) for n in map(str, watched)
+            if n in seen and now_.get(n, [None, []]) != seen[n]}
+
+
+def cmd_poll(a) -> int:
+    """#19: between the 10-min gate ticks, look at the watched PRs with ONE gh call (every 2 min, churn-poll.timer) and
+    start the gate at once when one changed: a red check the shepherd labelled needs-fix, a push, a merge. The gate
+    then queues and launches the fix with no model tick, so a red check waits ~2 min, not up to 10, for its fix."""
+    state = load_state()
+    if STOP.exists() or state.get("workers_paused") or (
+            (p := parse_iso(state.get("paused_until"))) and now() < p) or state.get("offline"):
+        return 0
+    watched = [pr_num(p) for p in state.get("prs", [])]
+    if not watched or not SNAP.exists():
+        return 0
+    try:
+        changed = poll_changes(watched, gh_json(f"repos/{REPO}/pulls?state=open&per_page=100"),
+                               json.loads(SNAP.read_text()))
+    except (RuntimeError, ValueError):
+        return 0
+    try:
+        last = json.loads(POLL_SEEN.read_text())
+    except (OSError, ValueError):
+        last = {}
+    if not changed or changed == last:  # nothing new, or the gate already knows (it skipped: no slot, a pause)
+        return 0
+    POLL_SEEN.write_text(json.dumps(changed))
+    log("poll: watched PRs changed (" + ", ".join(f"#{n}" for n in changed) + "): gate now", quiet=True)
+    DIRTY.touch()  # a running tick loops once more
+    nudge_tick()
+    return 0
+
+
 def cmd_notify(a) -> int:
     cfg = notify_cfg()
     if a.action == "boot":  # churn-boot.service, once per boot (linger on): the network may need a minute
@@ -3325,6 +3368,7 @@ def red_main_issues() -> list[dict]:
 
 
 NOISE = {"infra", "flake", "main"}  # ci_digest triage the shepherd handles by rerunning (or main's own fix)
+CI_RED: dict[int, str] = {}  # PR -> its failing checks at the last triage, for the fix brief (#19: no tick to read CI)
 
 
 def ci_triage(n: int) -> list[str] | None:
@@ -3332,7 +3376,11 @@ def ci_triage(n: int) -> list[str] | None:
     it cannot be read. [] = nothing failing right now (CI still running, or the label is stale)."""
     try:  # ci_digest exits 1 whenever something failed; its JSON is the answer either way
         r = run([sys.executable, str(TOOLS / "tests" / "tools" / "ci_digest.py"), str(n), "--json"], timeout=300)
-        return [f.get("triage") for f in json.loads(r.stdout)["failed"]]
+        failed = json.loads(r.stdout)["failed"]
+        CI_RED[n] = "; ".join(f"{f.get('check')} ({f.get('triage')})"
+                              + (f": {' '.join((f.get('tests') or [])[:3])}" if f.get("tests") else "")
+                              + (f", repro `{f['repro']}`" if f.get("repro") else "") for f in failed)[:600]
+        return [f.get("triage") for f in failed]
     except (ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired):
         return None
 
@@ -3509,6 +3557,8 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None) -> list[st
         note = next((str(p.get("note") or "") for p in state.get("prs", []) if isinstance(p, dict) and pr_num(p) == int(n)), "")
         review = (f" The review at this head asked for: {note[:400]} (This item comes back every tick until the head "
                   f"changes: to defer it use `churn queue wait`, never `churn queue rm`.)" if sent_back and note else "")
+        if "shepherd:needs-fix" in why and CI_RED.get(int(n)):
+            review += f" Red at this head (ci_digest): {CI_RED[int(n)]}."
         task = (rescue_task(n, v.get("branch"), issue, loops, why) + review if rescue else
                 f"Fix PR #{n} ({v.get('branch')}): {' + '.join(why)}. Work on the PR's own branch: merge origin/main "
                 f"(never rebase), resolve (regenerate generated docs, never hand-merge them), read any red check and fix "
@@ -3640,6 +3690,9 @@ def _run_meta(rid: str) -> dict:
     return {}
 
 
+WARM_RESUME_MIN = 55  # a run finished this recently resumes inside the 1 h prompt cache (send-back's limit is 60)
+
+
 def direct_spec(state: dict, snap: dict, x: dict) -> dict | None:
     """How the gate can launch item x itself, or None if a model tick must write its brief (owner 2026-10-16: ~330 of
     ~440 model ticks since 10-14 carried a launch; for these items the brief already exists):
@@ -3652,6 +3705,11 @@ def direct_spec(state: dict, snap: dict, x: dict) -> dict | None:
         branch = (snap.get(str(x["pr"])) or {}).get("branch")
         metas = sorted((m for d in RUNS.glob(f"{x['issue']}-*") if (m := _run_meta(d.name))), key=lambda m: m.get("started", ""))
         m = next((m for m in reversed(metas) if branch and m.get("branch") == branch and tree(m)), None)
+        if m and m.get("session_id") and m.get("status") == "done" and not m.get("repo") and not x.get("rescue") and (
+                m.get("model") == x.get("model", "sonnet")) and (
+                t := parse_iso(m.get("finished"))) and now() - t < dt.timedelta(minutes=WARM_RESUME_MIN):
+            # #19: the run that wrote this PR is still in the 1 h prompt cache: the fix goes back into its session
+            return {"worktree": m["worktree"], "branch": branch, "brief": x["task"], "plan": False, "resume_run": m["run_id"]}
         return m and {"worktree": m["worktree"], "branch": branch, "brief": x["task"], "plan": False, "repo": m.get("repo")}
     if x.get("lane") == "backfill" and (r := re.match(r"RESUME backfill run (\S+)", str(x.get("task", "")))):
         m = tree(_run_meta(r.group(1)))
@@ -3746,17 +3804,21 @@ def direct_launches(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
         ok, _ = (True, "") if plan else pace_allows(state, x.get("model", "sonnet"))
         if not ok:
             break
-        what = (f"PR fix #{x['pr']}" if x.get("pr") else "backfill resume" if spec.get("lane") else
+        what = (f"PR fix #{x['pr']}" + (" (warm resume)" if spec.get("resume_run") else "") if x.get("pr") else "backfill resume" if spec.get("lane") else
                 f"held plan {spec['held_plan']}" if spec.get("held_plan") else "new issue, gate brief")
         did.append(f"#{x['issue']} ({what})")
         if dry_run:
             continue
         try:
             with contextlib.redirect_stdout(open(os.devnull, "w")):
-                cmd_worker(argparse.Namespace(resume_run=None, issue=x["issue"], model=x.get("model", "sonnet"),
-                                              task=x.get("task"), brief=spec["brief"], brief_file=None, force=False,
-                                              plan=spec["plan"], worktree=spec["worktree"], branch=spec.get("branch"),
-                                              check_of=None, repo=spec.get("repo"), lane=spec.get("lane")))
+                if spec.get("resume_run"):
+                    cmd_worker(argparse.Namespace(resume_run=spec["resume_run"], message=spec["brief"], force=False,
+                                                  plan=False))
+                else:
+                    cmd_worker(argparse.Namespace(resume_run=None, issue=x["issue"], model=x.get("model", "sonnet"),
+                                                  task=x.get("task"), brief=spec["brief"], brief_file=None, force=False,
+                                                  plan=spec["plan"], worktree=spec["worktree"], branch=spec.get("branch"),
+                                                  check_of=None, repo=spec.get("repo"), lane=spec.get("lane")))
         except (SystemExit, OSError, RuntimeError) as e:  # a cap / missing tree: leave the item to the model tick
             did.pop()
             log(f"direct launch of #{x['issue']} refused, left queued for the tick: {str(e)[:200]}")
@@ -5235,6 +5297,8 @@ def cmd_pr(a) -> int:
             entry.update(reviewed_head=a.head, verdict=a.verdict, reviewed_at=iso(now()))
             if a.note:
                 entry["note"] = a.note[:300]
+            if a.verdict == "send-back":  # #19: the gate loops once more after this tick and launches the fix now
+                DIRTY.touch()
         elif a.head:
             entry["reviewed_head"] = a.head
         if idx is None:
@@ -5595,6 +5659,7 @@ def main() -> int:
     cl.add_argument("issue", nargs="?", type=int)
     cl.add_argument("--dry-run", action="store_true")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
+    sub.add_parser("poll", help="every 2 min: one gh call; start the gate at once when a watched PR changed")
     r = sub.add_parser("_run")
     r.add_argument("run_id")
     pc = sub.add_parser("_precheck")
@@ -5657,6 +5722,8 @@ def main() -> int:
         return cmd_credit(a)
     if a.cmd == "retro":
         return cmd_retro(a)
+    if a.cmd == "poll":
+        return cmd_poll(a)
     if a.cmd == "watchdog":
         return cmd_watchdog(a)
     if a.cmd == "factory":

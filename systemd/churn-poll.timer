@@ -1,0 +1,10 @@
+[Unit]
+Description=churn poll every 2 minutes (between the 10-min gate ticks)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
