@@ -2822,3 +2822,35 @@ def test_own_commits_ignores_merges_of_main(churn, tmp_path):
     git("commit", "-q", "--allow-empty", "-m", "real fix")
     assert churn.own_commits(str(tmp_path), start) is True
     assert churn.own_commits(str(tmp_path), None) is None and churn.own_commits(str(tmp_path), "0" * 40) is None
+
+
+# --- #19 (reduced): a PR fix resumes its writer's warm session; the fix brief names what is red ----------------------
+def test_a_pr_fix_resumes_the_warm_session_that_wrote_the_pr(churn, tmp_path, monkeypatch):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    snap = {"5204": {"state": "open", "head": "h", "branch": "churn/5092-x", "labels": [], "mergeable_state": "dirty"}}
+    _run(churn, "5092-a", issue=5092, branch="churn/5092-x", worktree=str(wt), session_id="s", status="done",
+         model="sonnet", finished=churn.iso(churn.now()))
+    s = churn.direct_spec({}, snap, item(5092, pr=5204))
+    assert s["resume_run"] == "5092-a" and s["worktree"] == str(wt)
+    assert "resume_run" not in churn.direct_spec({}, snap, item(5092, pr=5204, model="opus", rescue=True))
+    _run(churn, "5092-a", issue=5092, branch="churn/5092-x", worktree=str(wt), session_id="s", status="done",
+         model="sonnet", finished=churn.iso(churn.now() - dt.timedelta(minutes=churn.WARM_RESUME_MIN + 1)))
+    assert "resume_run" not in churn.direct_spec({}, snap, item(5092, pr=5204))  # cache cold: a fresh session
+    _run(churn, "5092-a", issue=5092, branch="churn/5092-x", worktree=str(wt), session_id="s", status="done",
+         model="sonnet", finished=churn.iso(churn.now()))
+    put(churn, max_workers=2, queue=[item(5092, pr=5204, task="Fix PR #5204 (churn/5092-x): conflicts with main")],
+        usage={"log": [], "pace": "off"})
+    launched = []
+    monkeypatch.setattr(churn, "cmd_worker", lambda a: launched.append(a))
+    monkeypatch.setattr(churn, "rate_plan", lambda state: None)
+    monkeypatch.setattr(churn, "pace_allows", lambda state, m: (True, ""))
+    assert churn.direct_launches({"verdict": "GREEN", "free_slots": 3}, snap) == ["#5092 (PR fix #5204 (warm resume))"]
+    assert launched[0].resume_run == "5092-a" and launched[0].message.startswith("Fix PR #5204")
+
+
+def test_the_fix_brief_names_the_red_checks(churn):
+    churn.CI_RED[7] = "Full Suite (real): tests/test_x.py::t, repro `pytest tests/test_x.py`"
+    st = {"prs": [{"number": 7, "issue": 70}], "queue": [], "running": []}
+    churn.queue_pr_fixes(st, {"7": SNAP_RED["7"]}, triage=lambda n: ["real"])
+    assert "Red at this head (ci_digest): Full Suite (real): tests/test_x.py::t" in st["queue"][0]["task"]
