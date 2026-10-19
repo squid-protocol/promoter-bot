@@ -35,6 +35,8 @@ def churn(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "run_sync_pulse", lambda force=False: None)  # never fetch or update this checkout
     mod.real_sync_units = mod.sync_units
     monkeypatch.setattr(mod, "sync_units", lambda src: "")  # never touch ~/.config/systemd from a test
+    monkeypatch.setattr(mod, "PRIVATE_DIR", tmp_path / "private")  # nor the private checkout or ~/.claude/skills
+    monkeypatch.setattr(mod, "SKILLS_DIR", tmp_path / "claude-skills")
     monkeypatch.setattr(mod, "ci_triage", lambda n: None)  # unreadable triage: queue as before
     mod.real_checklist_note = mod.checklist_note
     monkeypatch.setattr(mod, "checklist_note", lambda n: "")
@@ -2995,3 +2997,46 @@ def test_install_units_copies_new_and_changed_units_only(churn, tmp_path):
     assert churn.install_units(src, dest) == ([], [])  # unchanged: nothing to do
     (src / "churn-poll.timer").write_text("c\n")
     assert churn.install_units(src, dest) == (["churn-poll.timer"], [])  # changed, but not new: no enable
+
+
+# --- skills follow the private repo (pulse 3) -----------------------------------------------------------------------
+def test_skills_are_linked_only_when_missing_or_identical(churn):
+    src = churn.PRIVATE_DIR / "skills"
+    (src / "night-shift").mkdir(parents=True)
+    (src / "night-shift" / "SKILL.md").write_text("v1\n")
+    (src / "box" / "SKILL.md").parent.mkdir()
+    (src / "box" / "SKILL.md").write_text("box\n")
+    (src / "README.md").write_text("not a skill\n")
+    dest = churn.SKILLS_DIR
+    (dest / "night-shift").mkdir(parents=True)
+    (dest / "night-shift" / "SKILL.md").write_text("v1\n")  # the hand copy, identical
+    assert churn.link_skills() == (["box/SKILL.md", "night-shift/SKILL.md"], [])
+    assert (dest / "night-shift" / "SKILL.md").is_symlink() and (dest / "night-shift" / "SKILL.md").read_text() == "v1\n"
+    assert not (dest / "README.md").exists() and churn.link_skills() == ([], [])  # linked: nothing more to do
+    (src / "night-shift" / "SKILL.md").write_text("v2\n")
+    assert (dest / "night-shift" / "SKILL.md").read_text() == "v2\n"  # a pull updates the installed skill
+    (dest / "box" / "SKILL.md").unlink()
+    (dest / "box" / "SKILL.md").write_text("a host's own edit\n")
+    assert churn.link_skills() == ([], ["box/SKILL.md"])  # differs: left alone, reported
+    assert (dest / "box" / "SKILL.md").read_text() == "a host's own edit\n"
+
+
+def test_the_private_checkout_fast_forwards_but_never_over_local_edits(churn, tmp_path):
+    _, seed, _, git = _sync_repos(tmp_path)
+    subprocess.run(["git", "clone", "-q", str(tmp_path / "origin.git"), str(churn.PRIVATE_DIR)], check=True,
+                   capture_output=True)
+    assert churn.pull_private() is None  # up to date
+    _land_on_main(seed, git, "skill.txt")
+    assert churn.pull_private() == "private checkout updated (1 commit(s))"
+    _land_on_main(seed, git, "skill2.txt")
+    (churn.PRIVATE_DIR / "systemd" / "churn-tick.timer").write_text("edited here\n")
+    assert "not updated" in churn.pull_private()
+    assert churn.pull_private(tmp_path / "nowhere") is None  # no checkout: nothing to do
+
+
+def test_skills_note_reports_what_it_did(churn, monkeypatch):
+    monkeypatch.setattr(churn, "pull_private", lambda src=None: "private checkout updated (2 commit(s))")
+    monkeypatch.setattr(churn, "link_skills", lambda src=None, dest=None: (["night-shift/SKILL.md"], ["box/SKILL.md"]))
+    note = churn.skills_note()
+    assert note.startswith("private checkout updated") and "linked to the repo: night-shift/SKILL.md" in note
+    assert "differ from the repo (left alone): box/SKILL.md" in note

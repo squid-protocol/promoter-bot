@@ -48,4 +48,10 @@ tests (config `python`, which needs pytest) in a temp worktree, fast-forwards, a
 checkout (it alerts instead), and alerts once when a main fails its tests here. `churn sync` runs it now; `churn
 status` shows the install's version and how far behind it is.
 
+Skills: host-private files live in the private repo `promoter-bot-private`, checked out at
+`~/.local/src/promoter-bot-private` (config `private_dir`). The same pulse fast-forwards it to its upstream and links
+each `skills/<name>/<file>` into `~/.claude/skills/<name>/<file>` when that file is missing or identical; a copy that
+differs is left alone and alerts once a day. `churn skills` runs it now. One-time setup per host:
+`gh repo clone squid-protocol/promoter-bot-private ~/.local/src/promoter-bot-private`.
+
 Tests: `python3 -m pytest -q tests` (each test runs against a tmp `CHURN_HOME`, never the live state).
