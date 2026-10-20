@@ -242,6 +242,23 @@ class TestGateRules:
         with pytest.raises(SystemExit):
             churn.cmd_review(argparse.Namespace(run_id="r1", note=None))
 
+    def test_review_done_without_pr_comments_the_outcome(self, churn, monkeypatch):
+        calls = []
+        monkeypatch.setattr(churn, "run", lambda cmd, **kw: calls.append(cmd) or argparse.Namespace(returncode=0, stderr=""))
+        put(churn, reports_pending=[{"run_id": "r1", "issue": 5521, "status": "done", "report": "x"},
+                                    {"run_id": "r2", "issue": 9, "status": "done", "report": "x", "pr": 77},
+                                    {"run_id": "r3", "issue": 9, "status": "done", "report": "x", "repo": "o/other"},
+                                    {"run_id": "r4", "issue": 9, "status": "done", "report": "x"},
+                                    {"run_id": "r5", "issue": 9, "status": "done", "report": "x"}])
+        churn.cmd_review(argparse.Namespace(run_id="r1", note="no-op: slice 1 already merged (#5532)"))
+        churn.cmd_review(argparse.Namespace(run_id="r2", note="merge"))
+        churn.cmd_review(argparse.Namespace(run_id="r3", note="no PR"))
+        churn.cmd_review(argparse.Namespace(run_id="r4", note="no PR", no_comment=True))
+        churn.cmd_review(argparse.Namespace(run_id="r5", note=None))
+        assert len(calls) == 1
+        assert calls[0][:4] == ["gh", "issue", "comment", "5521"]
+        assert "run=r1" in calls[0][-1] and "slice 1 already merged" in calls[0][-1]
+
 
 # ---------------------------------------------------------------- item 6: scorecard
 def test_scorecard_counts_the_day(churn):
