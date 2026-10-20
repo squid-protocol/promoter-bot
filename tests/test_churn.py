@@ -1967,6 +1967,34 @@ def test_claude_login_failure_pages(churn, monkeypatch):
     assert pages == [("claude-auth", "urgent")]
 
 
+def test_work_stop_pages_once_per_idle_spell_with_reasons_then_says_resumed(churn, monkeypatch):
+    _topic(churn)
+    pages = []
+    monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: pages.append((key, title, msg)) or True)
+    last = churn.iso(churn.now() - churn.dt.timedelta(hours=2))
+    st = {"queue": [item(7)], "running": [], "usage": {"log": [{"t": last, "model": "sonnet", "issue": 7},
+                                                               {"t": churn.iso(churn.now()), "model": "orchestrator-sonnet", "issue": 0}]}}
+    yellow = {"verdict": "YELLOW", "free_slots": 0, "reasons": ["disk filling, /: 49 GB free of 491 GB (10%)"]}
+    assert churn.work_stop_check(st, yellow, {}).startswith("no workers for 2.0 h")
+    assert len(pages) == 1 and pages[0][0] == f"work-stopped-{last}" and "disk filling" in pages[0][2]
+    assert churn.work_stop_check(st, yellow, {}) is None  # same spell: once
+    st["running"] = [{"run_id": "r1", "issue": 7, "pid": 123}]
+    assert churn.work_stop_check(st, {"verdict": "GREEN", "free_slots": 1}, {}) == "work resumed"
+    assert pages[-1][1] == "churn: working again" and "work_stopped" not in churn.notify_cfg()
+    st["running"] = []
+    churn.STOP.touch()  # stopped on purpose: no page
+    assert churn.work_stop_check(st, yellow, {}) is None and len(pages) == 2
+
+
+def test_work_stop_waits_out_short_gaps_and_starts_a_clock_without_history(churn, monkeypatch):
+    _topic(churn)
+    monkeypatch.setattr(churn, "notify", lambda *a, **kw: pytest.fail("paged"))
+    recent = {"queue": [], "running": [], "usage": {"log": [{"t": churn.iso(churn.now()), "model": "opus", "issue": 3}]}}
+    assert churn.work_stop_check(recent, None, {}) is None
+    assert churn.work_stop_check({"queue": [], "running": []}, None, {}) is None
+    assert churn.notify_cfg()["idle_seen"]
+
+
 def test_gate_alerts_disk_red_and_owner_waits_past_twelve_hours(churn, monkeypatch):
     _topic(churn)
     pages = []
