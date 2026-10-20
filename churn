@@ -3123,10 +3123,86 @@ def watchdog_checks(gh_ok=None, timer_active=None, state=None) -> list[tuple[str
     return out
 
 
+# Owner 2026-10-19: nyx's disk hit 10% free, box_status said YELLOW, and the gate launched nothing for hours with no
+# alert (disk-red pages only at RED). Every cause of a stop has its own rule; this one watches the outcome instead: no
+# Claude worker live for WORK_STOP_ALERT_MIN pages once per idle spell with every reason it can see.
+WORK_STOP_ALERT_MIN = 60
+
+
+def last_worker_activity(state: dict) -> dt.datetime | None:
+    """When a Claude worker last finished (the usage ledger; orchestrator ticks are not workers)."""
+    ts = [parse_iso(e.get("t")) for e in (state.get("usage") or {}).get("log", [])
+          if e.get("issue") and not str(e.get("model", "")).startswith("orchestrator")]
+    return max((t for t in ts if t), default=None)
+
+
+def work_stop_reasons(state: dict, b: dict | None, snap: dict | None) -> list[str]:
+    out = []
+    if state.get("offline"):
+        out.append(f"offline since {state['offline'].get('since')}")
+    if (p := parse_iso(state.get("paused_until"))) and now() < p:
+        out.append(f"usage-limit pause until {iso(p)}")
+    if state.get("workers_paused"):
+        out.append(f"workers_paused: {state['workers_paused']}")
+    if (fs := state.get("fail_streak")) and fs.get("n"):
+        out.append(f"{fs['n']} workers failed in a row")
+    if int(state.get("max_workers", 2)) < 1:
+        out.append("max_workers is 0")
+    if b and b.get("verdict") != "GREEN":
+        out.append(f"box {b.get('verdict')}: " + "; ".join(b.get("reasons", []))[:300])
+    elif b and int(b.get("free_slots", 0)) < 1:
+        out.append("box GREEN but no free heavy slot")
+    out.append(idle_causes(state, snap, state.get("ci_mode", "calm")))
+    return out
+
+
+def work_stop_check(state: dict, b: dict | None, snap: dict | None) -> str | None:
+    """Page once when no Claude worker has run for WORK_STOP_ALERT_MIN (unless churn was stopped on purpose); say so
+    when one runs again. Returns what it sent, for the log."""
+    if STOP.exists():
+        return None
+    cfg = notify_cfg()
+    if claude_slot_holders(state):
+        if not (stopped := cfg.pop("work_stopped", None)):
+            return None
+        with contextlib.suppress(OSError):
+            NOTIFY.write_text(json.dumps(cfg, indent=1))
+        notify(f"work-resumed-{stopped}", "churn: working again", f"A worker is running again (idle since {stopped}).",
+               cooldown_h=0, tags="white_check_mark", queue=False)
+        return "work resumed"
+    since = last_worker_activity(state) or parse_iso(cfg.get("idle_seen"))
+    if since is None:  # no worker on record: start the clock now
+        cfg["idle_seen"] = iso(now())
+        with contextlib.suppress(OSError):
+            NOTIFY.write_text(json.dumps(cfg, indent=1))
+        return None
+    idle_min = (now() - since).total_seconds() / 60
+    if idle_min < WORK_STOP_ALERT_MIN or cfg.get("work_stopped") == iso(since):
+        return None
+    why = work_stop_reasons(state, b, snap)
+    if not notify(f"work-stopped-{iso(since)}", f"churn: no workers for {idle_min / 60:.1f} h",
+                  "Nothing has run since " + iso(since) + ".\n- " + "\n- ".join(why)
+                  + "\n`churn status` for detail.", priority="high", cooldown_h=24 * 365, tags="warning"):
+        return None
+    cfg = notify_cfg()
+    cfg["work_stopped"] = iso(since)
+    with contextlib.suppress(OSError):
+        NOTIFY.write_text(json.dumps(cfg, indent=1))
+    return f"no workers for {idle_min / 60:.1f} h: " + " | ".join(why)
+
+
 def cmd_watchdog(a) -> int:
     for key, title, msg in watchdog_checks():
         notify(key, title, msg, priority="urgent" if key == "gh-auth" else "high", tags="warning")
         log(f"watchdog: {title}" + (f": {msg}" if key.startswith("stuck-") else ""), quiet=not key.startswith("stuck-"))
+    with contextlib.suppress(Exception):  # an alert bug must never fail the watchdog
+        state = load_state()
+        b = None
+        with contextlib.suppress(Exception):
+            b = box(state)
+        snap = json.loads(SNAP.read_text()) if SNAP.exists() else {}
+        if sent := work_stop_check(state, b, snap):
+            log(f"watchdog: {sent[:400]}")
     return 0
 
 
