@@ -398,7 +398,7 @@ def normalize_state(state: dict) -> list[str]:
     except ValueError as e:
         quarantine("max_workers", state.get("max_workers"), str(e))
         state["max_workers"] = 2
-    for key in ("agy", "features", "usage", "credit", "retro"):
+    for key in ("agy", "features", "usage", "credit", "retro", "goal"):
         if not isinstance(state.get(key, {}), dict):
             quarantine(key, state[key], "not an object")
             state[key] = {}
@@ -2401,6 +2401,10 @@ def settle_check(state: dict, issue: int, pr: int, status: str, key: str, left_t
         body = new
         note += ", ticked"
     elif status == "partial":
+        parts = state.setdefault("line_partials", {})
+        parts[key] = int(parts.pop(key, 0)) + 1  # re-inserted last: the 300 most recent lines are kept
+        for k in list(parts)[:-300]:
+            del parts[k]
         line = next(c["text"] for c in checklist(body) if c["key"] == key)
         msg = (f"#{pr} merged: a partial slice of [c:{key}] \"{line[:200]}\""
                + (f"; left: {left_text}" if left_text else "") + " (promoter-bot)")
@@ -2415,7 +2419,13 @@ def settle_check(state: dict, issue: int, pr: int, status: str, key: str, left_t
             and not foreign_claim(i) and not host_skips(i)
             and not any(x.get("issue") == issue for s in ("queue", "running") for x in state.get(s, []))
             and (c := next_check(i, state))):
-        state.setdefault("queue", []).append(refill_item(i, check=c))
+        item = refill_item(i, check=c)
+        if (n := int((state.get("line_partials") or {}).get(c["key"], 0))) >= int(goal_cfg(state)["line_partials_max"]):
+            item["task"] = (f"SPLIT FIRST: [c:{c['key']}] has had {n} partial slices. Before more code, propose splitting "
+                            "it into concrete PR-sized checklist lines in your report (the tick edits the issue), then "
+                            "do the first of them. " + item["task"])
+            note += f" (split first: {n} partials)"
+        state.setdefault("queue", []).append(item)
         note += f"; queued next line [c:{c['key']}]"
     return note
 
@@ -3409,6 +3419,31 @@ def core_short(state: dict) -> bool:
     return held < int(state.get("core_reserve", CORE_RESERVE))
 
 
+# Owner 2026-10-21: the factory had throughput but no goal. Work entered from labels, checklist lines and refills, so the
+# queue drifted to wherever reviews had last filed siblings: 6 of 10 burned programs that did not translate whole had
+# no issue at all, and the core slot took core items by position alone. The goal is an ordered list of stages, each an
+# issue set (`churn goal add STAGE N`); the active stage's issues launch first in every pick (PR fixes, the core slot,
+# normal work) and in the rule refill, later stages next, everything else after. With `goal_reports` in the host
+# config, `churn goal measure` (the gate every measure_every_h) reads the repo's evidence reports, counts programs per
+# level and names the programs with holes that no open issue mentions; the tick is asked to file and add those.
+GOAL_DEFAULT = {"order": ["translate", "l5", "breadth"], "stage": "translate", "measure_every_h": 6,
+                "line_partials_max": 3}
+GOAL_REPORTS = _CFG.get("goal_reports") or {}  # {"fetch": "branch", "ref": "origin/branch", "path": "dir/of/reports"}
+
+
+def goal_cfg(state: dict) -> dict:
+    return {**GOAL_DEFAULT, **(state.get("goal") or {})}
+
+
+def goal_rank(state: dict, x: dict) -> int:
+    """0 = the active stage's issue, 1.. = later stages, len(order) = not goal work (earlier, finished stages too)."""
+    g = goal_cfg(state)
+    order = list(g["order"])
+    stages = order[order.index(g["stage"]):] if g["stage"] in order else order
+    issues = g.get("issues") or {}
+    return next((k for k, s in enumerate(stages) if x.get("issue") in set(issues.get(s) or [])), len(order))
+
+
 def stamp_scopes(state: dict, limit: int = 6) -> list[str]:
     """Give queue items without a scope their issue's scope (and tier) label, at most `limit` gh reads a tick; an
     item is read once (`scope_checked`). Before this, PR-fix and hand-queued items ranked level with sweep."""
@@ -3439,14 +3474,17 @@ def pick_item(state: dict, snap: dict | None, mode: str) -> tuple[int, dict] | t
     backfill_idle_ticks ticks in a row; the streak keeps a just-unblocked normal item from losing its box to it."""
     q = [(i, x) for i, x in enumerate(state.get("queue", [])) if not x.get("needs_owner") and x.get("backend") != "agy"
          and not blocked_by(x, snap, state) and not waiting(x) and not plan_overlap(state, x) and not scope_held(x)]
-    fix = min(((i, x) for i, x in q if x.get("pr")), key=lambda ix: (scope_rank(ix[1]), ix[0]), default=None)
+    fix = min(((i, x) for i, x in q if x.get("pr")), key=lambda ix: (scope_rank(ix[1]), goal_rank(state, ix[1]), ix[0]),
+              default=None)
     if fix:
         return fix
     for i, x in q:
         if x.get("auto") == "main-red":
             return i, x  # a red main blocks every PR, core ones too
-    if core_short(state) and (core := next(((i, x) for i, x in q if x.get("scope") == "core"
-                                            and x.get("lane") in (None, "normal", "ci")), None)):
+    if core_short(state) and (core := min(((i, x) for i, x in q if x.get("scope") == "core"
+                                           and x.get("lane") in (None, "normal", "ci")),
+                                          key=lambda ix: (goal_rank(state, ix[1]), TIER_RANK[item_tier(ix[1])], ix[0]),
+                                          default=None)):
         return core  # the core slot: at least core_reserve workers on scope:core, in busy mode too
     for i, x in q:
         if x.get("lane") == "ci":
@@ -3462,7 +3500,8 @@ def pick_item(state: dict, snap: dict | None, mode: str) -> tuple[int, dict] | t
                        key=lambda ix: (scope_rank(ix[1]), backfill_rank(ix[1]), ix[0]), default=(None, None))
         return None, None
     normal = min(((i, x) for i, x in q if x.get("lane") in (None, "normal")),
-                 key=lambda ix: (scope_rank(ix[1]), TIER_RANK[item_tier(ix[1])], ix[0]), default=(None, None))
+                 key=lambda ix: (scope_rank(ix[1]), goal_rank(state, ix[1]), TIER_RANK[item_tier(ix[1])], ix[0]),
+                 default=(None, None))
     if normal[1] is not None or len(live) >= int(cfg["backfill_max"]) \
             or int(state.get("idle_streak", 0)) < int(cfg["backfill_idle_ticks"]):
         return normal
@@ -4326,8 +4365,8 @@ def refill_candidates(state: dict, issues: list[dict], in_pr: set[int], callgrap
     def rank(i):
         names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
         sc = next((x[6:] for x in names if x.startswith("scope:")), None)
-        return (SCOPE_RANK.get(sc, 1), "bug" not in names, min((PRIO_RANK[n] for n in names if n in PRIO_RANK), default=2),
-                i["number"])
+        return (goal_rank(state, {"issue": i["number"]}), SCOPE_RANK.get(sc, 1), "bug" not in names,
+                min((PRIO_RANK[n] for n in names if n in PRIO_RANK), default=2), i["number"])
     return sorted(out, key=rank)[:int(cfg["batch"])]
 
 
@@ -4381,6 +4420,148 @@ def refill_need(state: dict) -> str:
             "issue; (4) queue what you labelled or filed with `churn queue add --issue <n> --model sonnet --task ...`. "
             "Never queue frontier work. If nothing qualifies, say so: the gate falls back to call-graph work "
             f"(#{CALLGRAPH_EPIC}) in an hour.")
+
+
+def goal_reports() -> list[dict]:
+    """The evidence reports at goal_reports.ref (fetched first): one dict per `report.json` under goal_reports.path,
+    with `file` added. A report lists programs[] with `program`, `level` (L0..L5, `*` = carried while stale) and
+    `translation` {hole_count, gap_classes, refused}. No goal_reports in the host config: nothing to measure."""
+    ref, path = GOAL_REPORTS.get("ref"), GOAL_REPORTS.get("path")
+    if not ref or not path:
+        return []
+    if GOAL_REPORTS.get("fetch"):
+        run(["git", "-C", str(V6), "fetch", "-q", "origin", GOAL_REPORTS["fetch"]], timeout=120)
+    r = run(["git", "-C", str(V6), "ls-tree", "-r", "--name-only", ref, "--", path])
+    if r.returncode:
+        raise RuntimeError(f"goal reports at {ref}:{path}: {r.stderr.strip()[:160]}")
+    out = []
+    for f in r.stdout.split():
+        if f.endswith("report.json") and not (s := run(["git", "-C", str(V6), "show", f"{ref}:{f}"])).returncode:
+            with contextlib.suppress(ValueError):
+                out.append({**json.loads(s.stdout), "file": f})
+    return out
+
+
+def goal_measure(reports: list[dict], issues: list[dict]) -> dict:
+    """Programs per level, and every program that does not translate whole (L0) with the open issues that name it.
+    `untracked` = L0 programs no open issue mentions: nobody is working on them."""
+    levels: collections.Counter = collections.Counter()
+    texts = [(i["number"], f"{i.get('title', '')}\n{i.get('body') or ''}".lower()) for i in issues]
+    untranslated = []
+    for rep in reports:
+        for p in rep.get("programs") or []:
+            lv = str(p.get("level") or "?").rstrip("*")
+            levels[lv] += 1
+            if lv != "L0":
+                continue
+            t = p.get("translation") or {}
+            stem = Path(str(p.get("program", ""))).stem.lower()
+            hits = sorted(n for n, txt in texts if stem and re.search(rf"\b{re.escape(stem)}\b", txt))
+            untranslated.append({"estate": Path(rep["file"]).parent.name, "program": p.get("program"),
+                                 "holes": t.get("hole_count"), "refused": t.get("refused"),
+                                 "classes": [str(c)[:120] for c in (t.get("gap_classes") or [])[:4]], "issues": hits})
+    return {"t": iso(now()), "programs": sum(levels.values()), "levels": dict(sorted(levels.items())),
+            "untranslated": untranslated, "untracked": [u["program"] for u in untranslated if not u["issues"]]}
+
+
+def goal_summary(m: dict) -> str:
+    lv = " ".join(f"{k} {v}" for k, v in (m.get("levels") or {}).items())
+    holes = sum(int(u.get("holes") or 0) for u in m.get("untranslated", []))
+    return (f"{m.get('programs', 0)} programs: {lv}; {len(m.get('untranslated', []))} not translated whole "
+            f"({holes} holes), {len(m.get('untracked', []))} with no open issue")
+
+
+def goal_tick(state: dict, force: bool = False) -> list[str]:
+    """Measure when due (goal.measure_every_h), keep the result and a dated snapshot, and set goal.ask to the untracked
+    programs not asked about in the last day. Returns log notes."""
+    g = goal_cfg(state)
+    last = parse_iso((g.get("measure") or {}).get("t"))
+    if not GOAL_REPORTS or (not force and last and now() - last < dt.timedelta(hours=float(g["measure_every_h"]))):
+        return []
+    m = goal_measure(goal_reports(), open_issues())
+    snaps = H / "progress-snapshots"
+    snaps.mkdir(exist_ok=True)
+    (snaps / f"goal-{now().strftime('%Y-%m-%dT%H%MZ')}.json").write_text(json.dumps(m, indent=1))
+    with edit_state() as st:
+        gs = st.setdefault("goal", {})
+        gs["measure"] = m
+        asked = {k: t for k, t in (gs.get("asked") or {}).items()
+                 if (ts := parse_iso(t)) and now() - ts < dt.timedelta(days=1)}
+        gs["asked"] = asked
+        gs["ask"] = [p for p in m["untracked"] if p not in asked]
+    return [f"goal measured: {goal_summary(m)}"]
+
+
+def goal_need(state: dict) -> str:
+    g = goal_cfg(state)
+    rows = {u["program"]: u for u in (g.get("measure") or {}).get("untranslated", [])}
+    lines = "; ".join(f"{p} ({rows.get(p, {}).get('estate', '?')}: {rows.get(p, {}).get('holes')} holes"
+                      + (f", refused: {rows[p]['refused']}" if rows.get(p, {}).get("refused") else "")
+                      + f", classes: {' | '.join(rows.get(p, {}).get('classes') or [])[:240]})" for p in g.get("ask", []))
+    return (f"goal ({g['stage']}): these programs do not translate whole and no open issue names them: {lines}. "
+            "For each hole class (one issue per class, several programs may share it): check closed issues for an owner "
+            "decision first; if the program cannot be done here (source the vendor compiler rejects, needs a real "
+            "mainframe, a language we do not translate) file it scope:frontier and say why; otherwise file a scope:core "
+            "issue with the holes and source lines, a checklist, and the labels the repo uses, then "
+            f"`churn goal add {g['stage']} <n>` and `churn queue add --issue <n> --tier era-core --front`.")
+
+
+def cmd_goal(a) -> int:
+    """`churn goal` (status), `stage NAME`, `add STAGE N..`, `rm N..`, `order A,B,..`, `measure`."""
+    args = list(a.args or [])
+    if a.action == "measure":
+        state = load_state()
+        if not GOAL_REPORTS:
+            raise SystemExit("no goal_reports in the host config: nothing to measure")
+        for note in goal_tick(state, force=True):
+            log(note)
+            print(note)
+    elif a.action in ("stage", "add", "rm", "order"):
+        with edit_state() as st:
+            gs = st.setdefault("goal", {})
+            g = goal_cfg(st)
+            if a.action == "order":
+                if len(args) != 1 or not all(args[0].split(",")):
+                    raise SystemExit("goal order A,B,C")
+                gs["order"] = args[0].split(",")
+                msg = f"goal order {gs['order']}"
+            elif a.action == "stage":
+                if len(args) != 1 or args[0] not in g["order"]:
+                    raise SystemExit(f"goal stage NAME, one of {g['order']}")
+                gs["stage"] = args[0]
+                msg = f"goal stage -> {args[0]}"
+            elif a.action == "add":
+                if len(args) < 2 or args[0] not in g["order"]:
+                    raise SystemExit(f"goal add STAGE N.., STAGE one of {g['order']}")
+                nums = [_int(x) for x in args[1:]]
+                iss = gs.setdefault("issues", {})
+                for s in iss:
+                    iss[s] = [n for n in iss[s] if n not in nums]  # an issue belongs to one stage
+                iss[args[0]] = sorted(set(iss.get(args[0], [])) | set(nums))
+                msg = f"goal: {args[0]} += {', '.join(f'#{n}' for n in nums)}"
+            else:
+                nums = {_int(x) for x in args}
+                gs["issues"] = {s: [n for n in v if n not in nums] for s, v in (gs.get("issues") or {}).items()}
+                msg = f"goal: removed {', '.join(f'#{n}' for n in sorted(nums))}"
+        log(f"{msg} (owner)")
+        print(msg)
+    else:
+        state = load_state()
+        g = goal_cfg(state)
+        print(f"goal stage: {g['stage']} (order {' > '.join(g['order'])})")
+        for s in g["order"]:
+            print(f"  {s}: " + (", ".join(f"#{n}" for n in (g.get("issues") or {}).get(s, [])) or "-"))
+        if m := g.get("measure"):
+            print(f"measured {m['t']}: {goal_summary(m)}")
+            for u in m.get("untranslated", []):
+                print(f"  {u['estate']} {u['program']}: {u.get('holes')} holes"
+                      + (f" ({u['refused']})" if u.get("refused") else "") + " -> "
+                      + (", ".join(f"#{n}" for n in u["issues"]) or "NO ISSUE"))
+        elif not GOAL_REPORTS:
+            print("not measured: no goal_reports in the host config")
+        queued = [x for x in state.get("queue", []) if goal_rank(state, x) == 0]
+        print(f"queued for the active stage: {', '.join(f'#{x['issue']}' for x in queued) or 'none'}")
+    return 0
 
 
 def cmd_refill(a) -> int:
@@ -4780,6 +4961,11 @@ def cmd_tick(a) -> int:
             except (RuntimeError, OSError, ValueError) as e:  # GitHub unreadable: try again next tick
                 log(f"refill skipped: {str(e)[:160]}", quiet=True)
             try:
+                for note in goal_tick(state):
+                    log(note)
+            except (RuntimeError, OSError, ValueError) as e:
+                log(f"goal measure skipped: {str(e)[:160]}", quiet=True)
+            try:
                 for note in sync_claims():
                     log(note, quiet=not note.startswith(("CLAIM", "dropped")))
             except (RuntimeError, OSError, ValueError, SystemExit) as e:
@@ -4817,6 +5003,13 @@ def cmd_tick(a) -> int:
             with edit_state() as st:
                 st.setdefault("refill", {})["agent_t"] = iso(now())
             log("refill: no rule-based candidates; asking the tick to label, split epics and file sibling gaps")
+        if goal_cfg(state).get("ask"):
+            wants["goal"] = goal_need(state)
+            if not a.dry_run:
+                with edit_state() as st:
+                    gs = st.setdefault("goal", {})
+                    gs["asked"] = {**(gs.get("asked") or {}), **{p: iso(now()) for p in gs.pop("ask", [])}}
+                log(f"goal: asking the tick to file issues for {len(goal_cfg(state)['ask'])} untracked programs")
         if a.dry_run:
             active, stalled = list(wants), []
         else:
@@ -5354,6 +5547,9 @@ def cmd_status(a) -> int:
     if state.get("quarantine"):
         print(f"quarantined state entries: {len(state['quarantine'])} (last: {state['quarantine'][-1]['where']}: "
               f"{state['quarantine'][-1]['why']})")
+    g = goal_cfg(state)
+    print(f"goal: {g['stage']} ({len((g.get('issues') or {}).get(g['stage'], []))} issues)"
+          + (f"; {goal_summary(g['measure'])} at {g['measure']['t']}" if g.get("measure") else ""))
     print("queue head: " + ", ".join(f"#{q['issue']}" + ("*" if q.get("needs_owner") else "") + ("(agy)" if q.get("backend") == "agy" else "")
                                      for q in state.get("queue", [])[:6]))
     cfg = agy_cfg(state)
@@ -5938,6 +6134,10 @@ def main() -> int:
     cl.add_argument("action", nargs="?", default="status", choices=["status", "sync", "on", "off", "release"])
     cl.add_argument("issue", nargs="?", type=int)
     cl.add_argument("--dry-run", action="store_true")
+    gl = sub.add_parser("goal", help="the factory's goal: status (default) / stage NAME / add STAGE N.. / rm N.. / "
+                                     "order A,B,.. / measure")
+    gl.add_argument("action", nargs="?", default="status", choices=["status", "stage", "add", "rm", "order", "measure"])
+    gl.add_argument("args", nargs="*")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
     sub.add_parser("poll", help="every 2 min: one gh call; start the gate at once when a watched PR changed")
     sub.add_parser("sync", help="sync pulse now: test origin/main and fast-forward this install (the gate does it hourly)")
@@ -5974,6 +6174,8 @@ def main() -> int:
         return cmd_worker(ns)
     if a.cmd == "status":
         return cmd_status(a)
+    if a.cmd == "goal":
+        return cmd_goal(a)
     if a.cmd == "queue":
         return cmd_queue(a)
     if a.cmd == "_run":

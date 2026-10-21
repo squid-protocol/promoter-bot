@@ -3085,3 +3085,89 @@ def test_skills_note_reports_what_it_did(churn, monkeypatch):
     note = churn.skills_note()
     assert note.startswith("private checkout updated") and "linked to the repo: night-shift/SKILL.md" in note
     assert "differ from the repo (left alone): box/SKILL.md" in note
+
+
+# ---------------------------------------------------------------- goal (owner 2026-10-21)
+def test_the_goal_stage_launches_first_in_the_core_slot_and_in_normal_work(churn):
+    st = {"running": [], "goal": {"stage": "translate", "issues": {"translate": [3], "l5": [2]}},
+          "queue": [item(1, scope="core", tier="era-core"), item(2, scope="core"), item(3, scope="core", tier="followup")]}
+    assert churn.pick_item(st, {}, "calm")[1]["issue"] == 3  # core slot: the active stage beats position and tier
+    assert churn.pick_item(st, {}, "busy")[1]["issue"] == 3
+    st["running"] = [{"run_id": "r", "pid": 5, "issue": 9, "scope": "core"}]
+    assert [x["issue"] for _, x in _picks(churn, st, 3)] == [3, 2, 1]  # normal: active stage, later stage, the rest
+    st["goal"]["stage"] = "l5"  # a finished stage is no longer goal work
+    assert [x["issue"] for _, x in _picks(churn, st, 3)] == [2, 1, 3]
+    st["queue"] += [item(4, pr=40, scope="core"), item(5, pr=50, scope="core")]
+    st["goal"]["issues"]["l5"] = [5]
+    assert churn.pick_item(st, {}, "calm")[1]["issue"] == 5  # PR fixes: goal work first within a scope
+
+
+def test_no_goal_keeps_the_old_order(churn):
+    st = {"running": [], "queue": [item(1, scope="core"), item(2, scope="core", tier="era-core")]}
+    assert churn.pick_item(st, {}, "calm")[1]["issue"] == 2  # the core slot now honours tier, then position
+    assert churn.goal_rank(st, item(1)) == len(churn.GOAL_DEFAULT["order"])
+
+
+def test_refill_ranks_goal_issues_first(churn, monkeypatch):
+    issues = [_iss(4, "scope:core", "bug"), _iss(5, "scope:core"), _iss(6, "scope:sweep")]
+    put(churn, queue=[], running=[], goal={"issues": {"translate": [6], "l5": [5]}})
+    assert [i["number"] for i in churn.refill_candidates(churn.load_state(), issues, set())] == [6, 5, 4]
+
+
+def test_a_line_partial_too_often_is_split_first(churn, monkeypatch):
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
+    k = churn.check_key("first part")
+    _Gh(churn, monkeypatch, BODY)
+    st = {"prs": [], "queue": [], "running": []}
+    for n in range(3):
+        st["queue"] = []
+        note = churn.settle_check(st, 4, 90 + n, "partial", k, "more")
+    assert st["line_partials"][k] == 3 and "split first: 3 partials" in note
+    assert st["queue"][0]["task"].startswith(f"SPLIT FIRST: [c:{k}] has had 3 partial slices")
+
+
+def test_goal_measure_finds_untracked_programs(churn):
+    reports = [{"file": "r/est-a/report.json", "programs": [
+        {"program": "src/AAA01.cbl", "level": "L0", "translation": {"hole_count": 5, "gap_classes": ["SET ADDRESS OF"]}},
+        {"program": "src/BBB02.cbl", "level": "L0", "translation": {"hole_count": 2, "gap_classes": ["X"]}},
+        {"program": "src/CCC.asm", "level": "L0", "translation": {"refused": "refused: Assembler"}},
+        {"program": "src/DDD.cbl", "level": "L4*"}, {"program": "src/EEE.cbl", "level": "L5"}]}]
+    issues = [{"number": 7, "title": "det: aaa01 pointers", "body": ""},
+              {"number": 8, "title": "x", "body": "covers CCC and BBB021"}]
+    m = churn.goal_measure(reports, issues)
+    assert m["levels"] == {"L0": 3, "L4": 1, "L5": 1} and m["programs"] == 5
+    assert [(u["program"], u["issues"]) for u in m["untranslated"]] == [
+        ("src/AAA01.cbl", [7]), ("src/BBB02.cbl", []), ("src/CCC.asm", [8])]
+    assert m["untracked"] == ["src/BBB02.cbl"]  # a whole-word match only: BBB021 is another program
+    assert "3 not translated whole (7 holes), 1 with no open issue" in churn.goal_summary(m)
+
+
+def test_goal_tick_asks_once_a_day_about_untracked_programs(churn, monkeypatch):
+    monkeypatch.setattr(churn, "GOAL_REPORTS", {"ref": "origin/g", "path": "r"})
+    monkeypatch.setattr(churn, "goal_reports", lambda: [{"file": "r/e/report.json", "programs": [
+        {"program": "Z1.cbl", "level": "L0", "translation": {"hole_count": 1}}]}])
+    put(churn, queue=[], running=[])
+    assert "1 with no open issue" in churn.goal_tick(churn.load_state())[0]
+    g = churn.load_state()["goal"]
+    assert g["ask"] == ["Z1.cbl"] and list((churn.H / "progress-snapshots").glob("goal-*.json"))
+    assert churn.goal_tick(churn.load_state()) == []  # not due again for measure_every_h
+    assert "Z1.cbl (e: 1 holes" in churn.goal_need(churn.load_state())
+    with churn.edit_state() as st:
+        st["goal"]["asked"] = {"Z1.cbl": churn.iso(churn.now())}
+    assert churn.goal_tick(churn.load_state(), force=True) and churn.load_state()["goal"]["ask"] == []
+
+
+def test_goal_command_sets_stage_and_issues(churn, capsys):
+    ns = lambda action, *args: argparse.Namespace(action=action, args=list(args))
+    put(churn, queue=[item(5)], running=[])
+    churn.cmd_goal(ns("add", "translate", "5", "#6"))
+    churn.cmd_goal(ns("add", "l5", "6"))  # an issue belongs to one stage
+    assert churn.load_state()["goal"]["issues"] == {"translate": [5], "l5": [6]}
+    churn.cmd_goal(ns("stage", "l5"))
+    churn.cmd_goal(ns("rm", "6"))
+    g = churn.load_state()["goal"]
+    assert g["stage"] == "l5" and g["issues"] == {"translate": [5], "l5": []}
+    with pytest.raises(SystemExit):
+        churn.cmd_goal(ns("stage", "nope"))
+    churn.cmd_goal(ns("status"))
+    assert "goal stage: l5" in capsys.readouterr().out
