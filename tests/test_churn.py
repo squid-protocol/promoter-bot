@@ -1467,6 +1467,33 @@ def test_a_run_queued_for_hours_does_not_hold_ci_busy(churn):
     assert churn.ci_mode({"ci_mode": "busy"}, q)[0] == "calm"
 
 
+def test_every_tick_logs_a_ci_snapshot_and_status_summarizes_them(churn, monkeypatch):
+    # #36: only mode switches were logged, so busy time had to be rebuilt from switch lines
+    monkeypatch.setattr(churn, "pid_alive", lambda pid: pid == 7)
+    st = {"ci_mode": "busy", "ci_mode_since": "2026-10-21T13:31Z", "queue": [item(1), item(2)],
+          "running": [{"run_id": "a", "pid": 7, "lane": "backfill"}, {"run_id": "b", "pid": 8}]}
+    churn.log_ci_snapshot(st, {"queued": 21, "median_wait_min": 4.0, "ignored": 19, "t": "x"})
+    st.update(ci_mode="calm", running=[])
+    churn.log_ci_snapshot(st, {"queued": 5, "median_wait_min": 1.0})
+    churn.log_ci_snapshot(st, {"error": "rate limited"})
+    rows = [json.loads(ln) for ln in churn.CI_SNAPSHOTS.read_text().splitlines()]
+    assert len(rows) == 3 and rows[0]["host"] == churn.HOST_ID and rows[0]["t"] != "x"
+    assert (rows[0]["queued"], rows[0]["ignored"], rows[0]["mode"], rows[0]["running"], rows[0]["running_backfill"],
+            rows[0]["queue_len"]) == (21, 19, "busy", 1, 1, 2)
+    s = churn.ci_snapshot_summary()
+    assert "busy 50% of 2 ticks (0 with 0 running)" in s and "median queued 21" in s  # the error row is left out
+
+
+def test_the_ci_snapshot_log_trims_to_its_keep_window(churn, monkeypatch):
+    old = json.dumps({"t": churn.iso(churn.now() - churn.dt.timedelta(days=40)), "queued": 1})
+    churn.CI_SNAPSHOTS.write_text(old + "\nnot json\n")
+    monkeypatch.setattr(churn, "CI_SNAPSHOTS_MAX_BYTES", 10)
+    churn.log_ci_snapshot({"queue": [], "running": []}, {"queued": 3, "median_wait_min": 0.5})
+    rows = churn.CI_SNAPSHOTS.read_text().splitlines()
+    assert len(rows) == 1 and json.loads(rows[0])["queued"] == 3
+    assert churn.ci_snapshot_summary(path=churn.H / "missing.jsonl") == "no CI snapshots yet"
+
+
 def test_a_refused_precheck_send_back_keeps_the_report(churn, monkeypatch):
     monkeypatch.setattr(churn, "gh_json", lambda path: {"body": GOOD_BODY})
     monkeypatch.setattr(churn, "precheck_problems", lambda meta, body: ["PR body lacks Sibling gaps"])

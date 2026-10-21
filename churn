@@ -70,6 +70,7 @@ H = Path(os.environ.get("CHURN_HOME", _CFG.get("state_dir", str(ROOT / "handoffs
 STATE = H / "churn-state.json"
 LOG = H / "churn-log.md"
 QUIET_LOG = H / "churn-quiet.log"
+CI_SNAPSHOTS = H / "ci-snapshots.jsonl"  # #36: one CI reading per tick, for tuning and checking CI backpressure
 STOP = H / "churn.stop"
 DIRTY = H / "churn.dirty"
 SNAP = H / "churn-snapshot.json"
@@ -3332,6 +3333,57 @@ def ci_mode(state: dict, q: dict) -> tuple[str, str]:
     return mode, f"CI {mode}: {n} runs queued, median wait {w} min"
 
 
+def _json_or_empty(line: str) -> dict:
+    try:
+        r = json.loads(line)
+    except ValueError:
+        return {}
+    return r if isinstance(r, dict) else {}
+
+
+CI_SNAPSHOTS_KEEP_D = 30
+CI_SNAPSHOTS_MAX_BYTES = 4_000_000  # ~300 B a tick, 144 ticks a day: trimming runs about once a month
+
+
+def log_ci_snapshot(state: dict, q: dict, path: Path | None = None) -> None:
+    """#36: append this tick's CI reading and the decision it fed. Only mode switches were logged before, so busy time
+    and the queued/wait distribution had to be rebuilt from switch lines (the #34 analysis)."""
+    path = path or CI_SNAPSHOTS
+    live = [r for r in state.get("running", []) if pid_alive(r.get("pid"))]
+    row = {"t": iso(now()), "host": HOST_ID, **{k: v for k, v in q.items() if k != "t"},
+           "mode": state.get("ci_mode", "calm"), "mode_since": state.get("ci_mode_since"),
+           "running": len(live), "running_backfill": sum(r.get("lane") == "backfill" for r in live),
+           "queue_len": len(state.get("queue", []))}
+    try:
+        with open(path, "a") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+        if path.stat().st_size > CI_SNAPSHOTS_MAX_BYTES:
+            cut = now() - dt.timedelta(days=CI_SNAPSHOTS_KEEP_D)
+            path.write_text("".join(ln + "\n" for ln in path.read_text().splitlines()
+                                    if (t := parse_iso(_json_or_empty(ln).get("t"))) and t >= cut))
+    except OSError as e:
+        log(f"ci snapshot not written: {e}", quiet=True)
+
+
+def ci_snapshot_summary(hours: float = 24, path: Path | None = None) -> str:
+    """Busy share and the queued / median-wait spread over the last `hours` of snapshots, for `churn status`."""
+    path = path or CI_SNAPSHOTS
+    if not path.exists():
+        return "no CI snapshots yet"
+    cut = now() - dt.timedelta(hours=hours)
+    rows = [r for ln in path.read_text().splitlines()
+            if (t := parse_iso((r := _json_or_empty(ln)).get("t"))) and t >= cut and "error" not in r]
+    if not rows:
+        return f"no CI snapshots in the last {hours:g} h"
+    def mid(k):
+        vs = sorted(r.get(k, 0) for r in rows)
+        return vs[len(vs) // 2]
+    busy = sum(r.get("mode") == "busy" for r in rows)
+    idle_busy = sum(r.get("mode") == "busy" and not r.get("running") for r in rows)
+    return (f"CI last {hours:g} h: busy {100 * busy // len(rows)}% of {len(rows)} ticks ({idle_busy} with 0 running); "
+            f"median queued {mid('queued')}, median wait {mid('median_wait_min')} min")
+
+
 HELD_PLAN_MAX_H = 48
 OVERLAP_IGNORE = re.compile(r"(^docs/|\.md$|baseline|ledger|_report\b|CHANGELOG)")  # shared ledgers: the tick calls these harmless
 _INFLIGHT: dict[str, set[str]] | None = None  # inflight_files() once per tick (git + one gh call per watched PR)
@@ -4966,6 +5018,7 @@ def cmd_tick(a) -> int:
                     st["ci_mode_since"] = iso(now())
                 st["ci_mode"], st["ci_queue"] = mode, {**cq, "t": iso(now())}
                 throttled = yield_backfill(st, snap, b, mode=mode)  # backfill stops only for waiting work, not on calm
+                log_ci_snapshot(st, cq)
             for note in throttled:
                 log(note)
             state = load_state()
@@ -5578,6 +5631,7 @@ def cmd_status(a) -> int:
     cq = state.get("ci_queue", {})
     print(f"CI mode: {state.get('ci_mode', 'calm')} ({cq.get('queued', '?')} runs queued, median wait "
           f"{cq.get('median_wait_min', '?')} min at {cq.get('t', '?')}); backfill: busy, or calm with idle slots")
+    print(ci_snapshot_summary())
     print(f"window ${window_usd(state):.2f} / {WINDOW_H}h; learned budget ${usage.get('learned_budget_usd')}; last model tick {state.get('last_model_tick')}")
     print(f"pace: {usage.get('pace') or 'ledger'}; max_workers {state.get('max_workers', 2)}, max_opus {state.get('max_opus', 1)}")
     sy = state.get("sync") or {}
