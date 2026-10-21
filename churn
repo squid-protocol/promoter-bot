@@ -4237,7 +4237,9 @@ TICK_CLI = """NEVER edit churn-state.json yourself (not with Edit/Write, python 
 - `churn pr watch <n> --issue <i> [--head <sha>]`       watch a PR (a worker's new draft PR)
 - `churn pr reviewed <n> --head <sha> --verdict merge|send-back|hold [--note]`  records the review at that head;
                                                          `merge` also adds shepherd:merge and drops shepherd:reapprove
-- `churn pr unwatch <n>`;  `churn followup done <n> [--note]`  (after the issue-closure decision)
+- `churn pr unwatch <n>`;  `churn followup done <n> [--note] [--closed | --next "<next slice>"]`  (after the
+   issue-closure decision: --closed when it closed; when it stays open, --next queues that slice at the front, and
+   without it an open core issue gets a generic next slice)
 - `churn pr flake <n> --head <sha> --note ...`  after you rerun a red that is a CI flake: the gate queues no fix for
    that PR until its head changes or 2 h pass (then drop the PR-fix item with `churn queue rm`)
 - `churn queue wait --index <k> --run <actions run id> | --minutes <m> --note ...`  when the gate names a launch you
@@ -5087,8 +5089,9 @@ def cmd_tick(a) -> int:
         for f in state.get("followups", []):
             wants[f"followup #{f['pr']}"] = (
                 f"followup: PR #{f['pr']} {f['kind']}" + (f" (issue #{f['issue']})" if f.get("issue") else "")
-                + ": decide whether the issue's acceptance is now met (close it with a comment if so), then "
-                f"`churn followup done {f['pr']}`")
+                + ": decide whether the issue's acceptance is now met (close it with a comment if so, then "
+                f"`churn followup done {f['pr']} --closed`); if it stays open, `churn followup done {f['pr']} "
+                "--next \"<the next PR-sized slice>\"` queues that slice")
         if refill_stage == "ask":
             wants["refill"] = refill_need(state)
             with edit_state() as st:
@@ -5865,13 +5868,41 @@ def cmd_pr(a) -> int:
     return 0
 
 
+def requeue_next_slice(state: dict, f: dict, nxt: str | None) -> str | None:
+    """#37 (2026-10-21): followups for #5878/#5893 (#5648) and #5850 (#5649) left their issues open and nothing queued
+    the next slice, so nyx's core work stopped until the owner requeued it. A merged "Part of" followup whose issue is
+    still open queues the next slice at the front: `--next` text when the tick gives it, else (core issues only, like
+    settle_check's checklist lines) a generic continue-after-#pr task. None = nothing queued."""
+    issue = f.get("issue")
+    if not issue or f.get("kind") != "merged" or (not nxt and (state.get("workers_paused")
+                                                               or not refill_cfg(state)["enabled"])):
+        return None
+    if any(x.get("issue") == issue for s in ("queue", "running") for x in state.get(s, [])):
+        return None
+    try:
+        i = gh_json(f"repos/{REPO}/issues/{issue}")
+    except (RuntimeError, ValueError):
+        return None
+    if i.get("state") != "open" or foreign_claim(i) or host_skips(i):
+        return None
+    if not nxt and issue_scope(issue, i) != "core":
+        return None
+    item = refill_item(i, task=(f"Next slice of #{issue} after PR #{f['pr']}: {nxt}" if nxt else
+                                f"#{issue} {i.get('title', '')[:120]} -- continue after PR #{f['pr']} (a merged slice): "
+                                "take the next PR-sized part of what the issue still asks; one draft PR"))
+    item["auto"] = "followup-next"
+    state.setdefault("queue", []).insert(0, item)
+    return f"queued the next slice of #{issue}" + ("" if nxt else " (generic: no --next)")
+
+
 def cmd_followup(a) -> int:
     with edit_state() as st:
-        before = len(st.get("followups", []))
-        st["followups"] = [f for f in st.get("followups", []) if f["pr"] != a.number]
-        if len(st["followups"]) == before:
+        f = next((f for f in st.get("followups", []) if f["pr"] == a.number), None)
+        if f is None:
             raise SystemExit(f"no followup for #{a.number}")
-    log(f"followup #{a.number} done" + (f": {a.note[:160]}" if a.note else ""))
+        st["followups"] = [g for g in st["followups"] if g is not f]
+        queued = None if getattr(a, "closed", False) else requeue_next_slice(st, f, getattr(a, "next", None))
+    log(f"followup #{a.number} done" + (f": {a.note[:160]}" if a.note else "") + (f"; {queued}" if queued else ""))
     return 0
 
 
@@ -6171,6 +6202,8 @@ def main() -> int:
     fp.add_argument("action", choices=["done"])
     fp.add_argument("number", type=int)
     fp.add_argument("--note")
+    fp.add_argument("--next", help="the issue stays open: what the next slice should do (queued at the front)")
+    fp.add_argument("--closed", action="store_true", help="the issue was closed (or needs nothing more): queue nothing")
     rv = sub.add_parser("review", help="a reviewed worker report leaves reports_pending")
     rv.add_argument("action", choices=["done"])
     rv.add_argument("run_id")
