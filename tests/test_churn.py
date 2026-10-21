@@ -243,6 +243,36 @@ class TestGateRules:
         with pytest.raises(SystemExit):
             churn.cmd_review(argparse.Namespace(run_id="r1", note=None))
 
+    def test_a_followup_that_leaves_the_issue_open_queues_the_next_slice(self, churn, monkeypatch):
+        # #37: #5648 / #5649 slices merged, the followups left the issues open, and nothing queued the next slice
+        issues = {5648: {"number": 5648, "state": "open", "title": "Shared COBOL preprocessor",
+                         "labels": [{"name": "scope:core"}, {"name": "lane:nyx"}]},
+                  5700: {"number": 5700, "state": "open", "title": "a sweep", "labels": [{"name": "scope:sweep"}]},
+                  5701: {"number": 5701, "state": "closed", "title": "done", "labels": [{"name": "scope:core"}]}}
+        monkeypatch.setattr(churn, "gh_json", lambda path: issues[int(path.rsplit("/", 1)[1])])
+        monkeypatch.setattr(churn, "host_skips", lambda i: None)
+        monkeypatch.setattr(churn, "foreign_claim", lambda i: None)
+        def done(pr, **kw):
+            churn.cmd_followup(argparse.Namespace(number=pr, note=None, **kw))
+            return churn.load_state()["queue"]
+        put(churn, queue=[item(1)], followups=[{"pr": 5893, "kind": "merged", "issue": 5648},
+                                               {"pr": 5894, "kind": "merged", "issue": 5648}])
+        q = done(5893, next="move the translator's COPY/REPLACING onto the core expander", closed=False)
+        assert [x["issue"] for x in q] == [5648, 1] and q[0]["auto"] == "followup-next" and q[0]["scope"] == "core"
+        assert q[0]["task"].startswith("Next slice of #5648 after PR #5893: move the translator's")
+        assert len(done(5894)) == 2  # already queued: no second item
+        put(churn, queue=[], followups=[{"pr": 1, "kind": "merged", "issue": 5648}, {"pr": 2, "kind": "merged", "issue": 5700},
+                                        {"pr": 3, "kind": "merged", "issue": 5701}, {"pr": 4, "kind": "closed", "issue": 5648},
+                                        {"pr": 5, "kind": "merged", "issue": 5648}])
+        assert done(2) == [] and done(3) == [] and done(4) == []  # not core without --next; closed issue; unmerged PR
+        assert done(5, closed=True) == []
+        q = done(1)  # no --next: an open core issue still gets a generic next slice
+        assert q == []  # ... but only with refill on (the fixture turns it off)
+        put(churn, queue=[], refill={"enabled": True}, followups=[{"pr": 1, "kind": "merged", "issue": 5648}])
+        q = done(1)
+        assert len(q) == 1 and "continue after PR #1" in q[0]["task"]
+        assert any("queued the next slice of #5648 (generic: no --next)" in ln for ln in churn.LOG.read_text().splitlines())
+
     def test_review_done_without_pr_comments_the_outcome(self, churn, monkeypatch):
         calls = []
         monkeypatch.setattr(churn, "run", lambda cmd, **kw: calls.append(cmd) or argparse.Namespace(returncode=0, stderr=""))
