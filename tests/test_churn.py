@@ -38,6 +38,7 @@ def churn(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "PRIVATE_DIR", tmp_path / "private")  # nor the private checkout or ~/.claude/skills
     monkeypatch.setattr(mod, "SKILLS_DIR", tmp_path / "claude-skills")
     monkeypatch.setattr(mod, "ci_triage", lambda n: None)  # unreadable triage: queue as before
+    monkeypatch.setattr(mod, "ci_in_flight", lambda head: False)  # no check runs in flight, without asking GitHub
     mod.real_checklist_note = mod.checklist_note
     monkeypatch.setattr(mod, "checklist_note", lambda n: "")
     monkeypatch.setattr(mod, "update_branch", lambda n: False)  # a real conflict: queue the Claude fix as before
@@ -1559,6 +1560,9 @@ def test_orphans_name_what_has_no_next_step(churn, monkeypatch):
           "queue": [item(5, after_prs=[99])], "running": [], "reports_pending": [], "followups": []}
     out = churn.orphans(st, snap, [])
     assert set(out) == {"orphan PR #11", "orphan blocker #99"}
+    monkeypatch.setattr(churn, "ci_in_flight", lambda head: head == "h11")  # 2026-10-21: CI still running at this head
+    assert "orphan PR #11" not in churn.orphans(st, snap, [])
+    monkeypatch.setattr(churn, "ci_in_flight", lambda head: False)
     st["queue"].append(item(5, pr=11))
     assert "orphan PR #11" not in churn.orphans(st, snap, [])
     st["queue"].append(item(6, pr=11, needs_owner=True))
