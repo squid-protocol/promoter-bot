@@ -2453,6 +2453,20 @@ def reviews_needed(state: dict, snap: dict, live: list[dict]) -> dict[str, str]:
 
 
 REPORT_STALE_H, FOLLOWUP_STALE_H = 6, 24
+_CI_IN_FLIGHT: dict[str, bool] = {}
+
+
+def ci_in_flight(head: str) -> bool:
+    """A check run at this head is still queued or running (one gh call per head per tick). 2026-10-21: 13 of 15 PRs
+    the liveness rule flagged carried a stale shepherd:needs-fix from an older head while CI ran on the new one; each
+    Sonnet tick said "waiting on CI, no action" and the PR merged on its own (~50 ticks in a day)."""
+    if head not in _CI_IN_FLIGHT:
+        try:
+            runs = gh_json(f"repos/{REPO}/commits/{head}/check-runs?per_page=100").get("check_runs", [])
+            _CI_IN_FLIGHT[head] = any(r.get("status") != "completed" for r in runs)
+        except RuntimeError:
+            _CI_IN_FLIGHT[head] = False  # unreadable: flag it as before
+    return _CI_IN_FLIGHT[head]
 
 
 def orphans(state: dict, snap: dict, live: list[dict]) -> dict[str, str]:
@@ -2470,8 +2484,8 @@ def orphans(state: dict, snap: dict, live: list[dict]) -> dict[str, str]:
         labels = set(v.get("labels", []))
         mergeable = "shepherd:needs-fix" not in labels and v.get("mergeable_state") != "dirty"
         if (pr_in_hand(n, v, live) or verdict == "hold" or (verdict == "merge" and mergeable)
-                or flaked(state, n, v) or clean_at_head(state, n, v)):
-            continue  # a worker has it / the owner / CI + the shepherd / a rerun / nothing failing
+                or flaked(state, n, v) or clean_at_head(state, n, v) or ci_in_flight(v["head"])):
+            continue  # a worker has it / the owner / CI + the shepherd / a rerun / nothing failing / CI still running
         out[f"orphan PR #{n}"] = (f"PR #{n} at {v['head']} has no next step (verdict {verdict or 'none'} at this head, "
                                   f"labels {sorted(labels) or 'none'}, {v.get('mergeable_state')})")
     watched = {pr_num(p) for p in state.get("prs", [])}
@@ -4898,6 +4912,7 @@ def cmd_tick(a) -> int:
         global _INFLIGHT
         _INFLIGHT = None
         _RUN_DONE.clear()
+        _CI_IN_FLIGHT.clear()
         snap = pr_snapshot(state.get("prs", []), old)
         if not a.dry_run:
             with contextlib.suppress(Exception):  # an alert bug must never stop the gate
