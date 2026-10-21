@@ -3331,9 +3331,11 @@ def ci_queue(gh=None, ignore=()) -> dict:
     # Runs beyond the pages read are unseen: count them at the share of counted runs among those seen.
     unseen = total - len(runs)
     queued = len(counted) - stale + (round(unseen * len(counted) / len(runs)) if runs else unseen)
+    by_wf = collections.Counter(os.path.basename(str(r.get("path", ""))) for r in counted
+                                if (t := parse_iso(r.get("created_at"))) and now() - t < dt.timedelta(hours=STALE_QUEUED_H))
     return {"queued": max(0, queued), "median_wait_min": round(waits[len(waits) // 2], 1) if waits else 0.0,
             **({"stale": stale} if stale else {}), **({"ignored": light} if light else {}),
-            **({"unseen": unseen} if unseen > 0 else {})}
+            **({"unseen": unseen} if unseen > 0 else {}), "by_workflow": dict(by_wf)}
 
 
 def ci_mode(state: dict, q: dict) -> tuple[str, str]:
@@ -3356,6 +3358,138 @@ def ci_mode(state: dict, q: dict) -> tuple[str, str]:
     return mode, f"CI {mode}: {n} runs queued{f' ({extra})' if extra else ''}, median wait {w} min"
 
 
+# #38 step 1 (shadow): measure CI load in runner-minutes against the pool instead of counting runs. The busy/calm counts
+# were set 2026-10-14; by 10-20 jobs ran 4.9 -> 3.1 min on the same 20-job pool, so "20 queued" meant half the wait, and
+# busy hours tripled while runner-hours stayed flat (#34). A learned per-workflow cost tracks such changes by itself.
+# Logged next to busy/calm, deciding nothing yet; the admission controller (#38 step 2) reads these numbers.
+CI_PROFILE_DEFAULT = {"every_h": 1, "sample_runs": 12, "alpha": 0.3, "pool": 20, "wait_window_h": 2,
+                      "default_runner_min": 5.0}
+
+
+def ci_profile_cfg(state: dict) -> dict:
+    return {**CI_PROFILE_DEFAULT, **(state.get("ci_profile_cfg") or {})}
+
+
+def ci_run_cost(jobs: list[dict]) -> dict | None:
+    """Runner-minutes, wall minutes, job count and per-job queue waits of one completed run; None if no job ran."""
+    ran = [(c, s, e) for j in jobs if j.get("conclusion") != "skipped"
+           and (c := parse_iso(j.get("created_at"))) and (s := parse_iso(j.get("started_at")))
+           and (e := parse_iso(j.get("completed_at")))]
+    if not ran:
+        return None
+    return {"runner_min": sum((e - s).total_seconds() for _, s, e in ran) / 60,
+            "wall_min": (max(e for *_, e in ran) - min(c for c, *_ in ran)).total_seconds() / 60,
+            "jobs": len(ran), "waits": [max(0.0, (s - c).total_seconds() / 60) for c, s, _ in ran]}
+
+
+def ci_profile_sample(state: dict, gh=None, ignore=(), want=()) -> list[str]:
+    """Every every_h: read the jobs of up to sample_runs completed runs (about 1 + 1.5 x sample_runs API calls) and
+    fold each workflow file's runner-minutes, wall minutes and job count into an EWMA; keep pull_request job queue
+    waits (the outcome the admission controller holds to a target). `want`: workflow files queued now -- the
+    least-profiled of them get their latest completed run first. Returns log notes; mutates state."""
+    cfg = ci_profile_cfg(state)
+    prof = state.setdefault("ci_profile", {"workflows": {}, "waits": []})
+    last = parse_iso(prof.get("sampled_at"))
+    if last and now() - last < dt.timedelta(hours=float(cfg["every_h"])):
+        return []
+    gh = gh or gh_json
+    prof["sampled_at"] = iso(now())
+    seen = set(prof.get("seen_runs", []))
+    try:
+        runs = gh(f"repos/{REPO}/actions/runs?status=completed&per_page=100").get("workflow_runs", [])
+    except RuntimeError as e:
+        return [f"ci profile: runs unreadable ({str(e)[:80]})"]
+    fresh = [r for r in runs if r.get("id") not in seen and r.get("conclusion") not in ("cancelled", "skipped")
+             and os.path.basename(str(r.get("path", ""))) not in set(ignore)]
+    # Short runs finish most often (and shepherd runs fill the newest 100), so the newest runs are mostly docs, audits
+    # and post-merge. The least-profiled workflows queued now come first, then one run per workflow, least-sampled first,
+    # so the heavy PR workflows (smoke, det sweep) don't go unmeasured.
+    def n_of(wf):
+        return int((prof["workflows"].get(wf) or {}).get("n", 0))
+    picked: list[dict] = []
+    wanted = collections.Counter(w for w in want if w.endswith((".yml", ".yaml")) and w not in set(ignore))
+    for wf in sorted(wanted, key=lambda w: (n_of(w), -wanted[w], w)):  # least profiled, then most queued
+        if len(picked) >= int(cfg["sample_runs"]) // 2 or n_of(wf) >= 3:
+            break
+        try:  # 20: superseded PR runs are cancelled (cancel-in-progress), so the last few can all be cancelled
+            got = gh(f"repos/{REPO}/actions/workflows/{wf}/runs?status=completed&per_page=20").get("workflow_runs", [])
+        except RuntimeError:
+            continue
+        picked += [r for r in got if r.get("id") not in seen
+                   and r.get("conclusion") not in ("cancelled", "skipped")][:1]
+    first: dict[str, dict] = {}
+    for r in fresh:
+        first.setdefault(os.path.basename(str(r.get("path", ""))), r)
+    have = {r.get("id") for r in picked}
+    picked += sorted((r for r in first.values() if r.get("id") not in have),
+                     key=lambda r: n_of(os.path.basename(str(r.get("path", "")))))
+    picked = picked[:int(cfg["sample_runs"])]
+    a, n = float(cfg["alpha"]), 0
+    for r in picked:
+        try:
+            jobs = gh(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100").get("jobs", [])
+        except RuntimeError:
+            continue
+        seen.add(r["id"])
+        if not (c := ci_run_cost(jobs)):
+            continue
+        n += 1
+        w = prof["workflows"].setdefault(os.path.basename(str(r.get("path", ""))), {"n": 0})
+        for k in ("runner_min", "wall_min", "jobs"):
+            w[k] = round(c[k] if not w["n"] else (1 - a) * float(w.get(k, c[k])) + a * c[k], 2)
+        w["n"], w["t"] = w["n"] + 1, iso(now())
+        if r.get("event") == "pull_request":
+            prof["waits"] += [[iso(t), round(x, 2)] for x in c["waits"] if (t := parse_iso(r.get("updated_at")))]
+    keep = now() - dt.timedelta(hours=max(6.0, float(cfg["wait_window_h"])))
+    prof["waits"] = [x for x in prof["waits"] if (t := parse_iso(x[0])) and t >= keep][-500:]
+    prof["seen_runs"] = sorted(seen)[-300:]
+    return [f"ci profile: sampled {n} of {len(picked)} runs, {len(prof['workflows'])} workflows known"] if picked else []
+
+
+def workflow_cost(prof: dict, wf: str, cfg: dict) -> dict:
+    """The learned cost of workflow file `wf`, else the median of known workflows, else default_runner_min."""
+    known = prof.get("workflows") or {}
+    if wf in known:
+        return known[wf]
+    rms = sorted(float(w.get("runner_min", 0)) for w in known.values()) or [float(cfg["default_runner_min"])]
+    return {"runner_min": rms[len(rms) // 2], "wall_min": None, "jobs": None}
+
+
+def ci_backlog(state: dict, q: dict, in_progress: list[dict] | None) -> dict:
+    """Minutes the pool needs to drain the work in hand: queued runs at their learned runner-minutes plus what is left
+    of runs in progress (shards queue AFTER a run's plan job starts, so queued runs alone miss most of the backlog),
+    over `pool` runners. Plus the outcome: median pull_request job queue wait over wait_window_h."""
+    cfg = ci_profile_cfg(state)
+    prof = state.get("ci_profile") or {}
+    pool = max(1, int(cfg["pool"]))
+    by_wf = q.get("by_workflow") or {}
+    queued_rm = sum(n * float(workflow_cost(prof, wf, cfg)["runner_min"]) for wf, n in by_wf.items())
+    if q.get("unseen") and by_wf:
+        queued_rm *= (sum(by_wf.values()) + q["unseen"]) / sum(by_wf.values())
+    active_rm = 0.0
+    for r in in_progress or []:
+        c = workflow_cost(prof, os.path.basename(str(r.get("path", ""))), cfg)
+        if (t := parse_iso(r.get("run_started_at") or r.get("created_at"))) and c.get("wall_min"):
+            done = min(1.0, (now() - t).total_seconds() / 60 / max(1.0, float(c["wall_min"])))
+            active_rm += float(c["runner_min"]) * (1 - done)
+        else:
+            active_rm += float(c["runner_min"]) / 2  # no wall time learned yet: assume half done
+    cut = now() - dt.timedelta(hours=float(cfg["wait_window_h"]))
+    waits = sorted(x[1] for x in prof.get("waits", []) if (t := parse_iso(x[0])) and t >= cut)
+    return {"backlog_min": round((queued_rm + active_rm) / pool, 1), "queued_rm": round(queued_rm),
+            "active_rm": round(active_rm), "in_progress": None if in_progress is None else len(in_progress),
+            "pool": pool, "job_wait_p50": waits[len(waits) // 2] if waits else None, "job_wait_n": len(waits)}
+
+
+def ci_in_progress(gh=None, ignore=()) -> list[dict] | None:
+    """Runs in progress (one API call, newest 100), minus the `ignore` workflows; None when unreadable."""
+    try:
+        runs = (gh or gh_json)(f"repos/{REPO}/actions/runs?status=in_progress&per_page=100").get("workflow_runs", [])
+    except RuntimeError:
+        return None
+    return [r for r in runs if os.path.basename(str(r.get("path", ""))) not in set(ignore)]
+
+
 def _json_or_empty(line: str) -> dict:
     try:
         r = json.loads(line)
@@ -3373,7 +3507,8 @@ def log_ci_snapshot(state: dict, q: dict, path: Path | None = None) -> None:
     and the queued/wait distribution had to be rebuilt from switch lines (the #34 analysis)."""
     path = path or CI_SNAPSHOTS
     live = [r for r in state.get("running", []) if pid_alive(r.get("pid"))]
-    row = {"t": iso(now()), "host": HOST_ID, **{k: v for k, v in q.items() if k != "t"},
+    row = {"t": iso(now()), "host": HOST_ID, **{k: v for k, v in q.items() if k not in ("t", "by_workflow")},
+           **{k: v for k, v in (state.get("ci_backlog") or {}).items() if k != "t"},
            "mode": state.get("ci_mode", "calm"), "mode_since": state.get("ci_mode_since"),
            "running": len(live), "running_backfill": sum(r.get("lane") == "backfill" for r in live),
            "queue_len": len(state.get("queue", []))}
@@ -5034,8 +5169,15 @@ def cmd_tick(a) -> int:
                 log(note)
             for note in gc_worktrees_if_due(b):
                 log(note)
-            cq = ci_queue(ignore=ci_cfg(state)["ignore_workflows"])
+            ign = ci_cfg(state)["ignore_workflows"]
+            cq, inprog = ci_queue(ignore=ign), ci_in_progress(ignore=ign)
+            want = [*collections.Counter(cq.get("by_workflow") or {}).elements(),
+                    *(os.path.basename(str(r.get("path", ""))) for r in inprog or [])]
+            for note in ci_profile_sample(state, ignore=ign, want=want):  # GitHub calls outside the state lock
+                log(note, quiet=True)
             with edit_state() as st:
+                st["ci_profile"] = state.get("ci_profile") or st.get("ci_profile")
+                st["ci_backlog"] = {**ci_backlog(st, cq, inprog), "t": iso(now())}  # #38 shadow: logged, decides nothing
                 mode, why = ci_mode(st, cq)
                 if mode != st.get("ci_mode", "calm"):
                     log(f"CI mode {st.get('ci_mode', 'calm')} -> {mode} ({why}); "
@@ -5658,6 +5800,11 @@ def cmd_status(a) -> int:
     print(f"CI mode: {state.get('ci_mode', 'calm')} ({cq.get('queued', '?')} runs queued, median wait "
           f"{cq.get('median_wait_min', '?')} min at {cq.get('t', '?')}); backfill: busy, or calm with idle slots")
     print(ci_snapshot_summary())
+    if bl := state.get("ci_backlog"):
+        wfs = (state.get("ci_profile") or {}).get("workflows") or {}
+        print(f"CI backlog (#38 shadow): {bl.get('backlog_min')} min to drain on {bl.get('pool')} runners "
+              f"({bl.get('queued_rm')} queued + {bl.get('active_rm')} in-progress runner-min); PR job wait p50 "
+              f"{bl.get('job_wait_p50')} min (n={bl.get('job_wait_n')}); {len(wfs)} workflows profiled")
     print(f"window ${window_usd(state):.2f} / {WINDOW_H}h; learned budget ${usage.get('learned_budget_usd')}; last model tick {state.get('last_model_tick')}")
     print(f"pace: {usage.get('pace') or 'ledger'}; max_workers {state.get('max_workers', 2)}, max_opus {state.get('max_opus', 1)}")
     sy = state.get("sync") or {}

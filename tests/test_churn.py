@@ -1558,6 +1558,76 @@ def test_the_ci_snapshot_log_trims_to_its_keep_window(churn, monkeypatch):
     assert churn.ci_snapshot_summary(path=churn.H / "missing.jsonl") == "no CI snapshots yet"
 
 
+def _job(churn, created_ago, wait, took, conclusion="success"):
+    t = churn.now() - churn.dt.timedelta(minutes=created_ago)
+    return {"created_at": churn.iso(t), "started_at": churn.iso(t + churn.dt.timedelta(minutes=wait)),
+            "completed_at": churn.iso(t + churn.dt.timedelta(minutes=wait + took)), "conclusion": conclusion}
+
+
+def test_ci_run_cost_counts_runner_minutes_of_jobs_that_ran(churn):
+    c = churn.ci_run_cost([_job(churn, 30, 2, 10), _job(churn, 30, 4, 6), _job(churn, 30, 0, 0, "skipped")])
+    assert (c["runner_min"], c["jobs"], sorted(c["waits"])) == (16, 2, [2, 4]) and c["wall_min"] == 12
+    assert churn.ci_run_cost([_job(churn, 5, 0, 0, "skipped")]) is None
+
+
+def test_the_ci_profile_learns_workflow_costs_and_pr_job_waits(churn):
+    # #38 step 1: a learned cost per workflow file, so a faster or bigger CI changes the numbers with no retuning
+    wf = ".github/workflows/"
+    runs = [{"id": 1, "path": wf + "docs.yml", "event": "push", "conclusion": "success"},
+            {"id": 2, "path": wf + "docs.yml", "event": "push", "conclusion": "success"},
+            {"id": 3, "path": wf + "shepherd-event.yml", "event": "pull_request_target", "conclusion": "success"},
+            {"id": 4, "path": wf + "audit.yml", "event": "pull_request", "conclusion": "cancelled"}]
+    smoke = [{"id": 9, "path": wf + "smoke-test.yml", "event": "pull_request", "conclusion": "cancelled"},
+             {"id": 10, "path": wf + "smoke-test.yml", "event": "pull_request", "conclusion": "success",
+              "updated_at": churn.iso(churn.now())}]
+    jobs = {1: [_job(churn, 20, 1, 2)], 2: [_job(churn, 20, 1, 4)],
+            10: [_job(churn, 30, 3, 10), _job(churn, 30, 5, 10), _job(churn, 30, 0, 0, "skipped")]}
+    calls = []
+    def gh(path):
+        calls.append(path)
+        if "/workflows/smoke-test.yml/runs" in path:
+            return {"workflow_runs": smoke}
+        if path.endswith("/jobs?per_page=100"):
+            return {"jobs": jobs[int(path.split("/runs/")[1].split("/")[0])]}
+        return {"workflow_runs": runs}
+    st = {}
+    notes = churn.ci_profile_sample(st, gh=gh, ignore=["shepherd-event.yml"],
+                                    want=["smoke-test.yml", "smoke-test.yml", "pages-build-deployment"])
+    w = st["ci_profile"]["workflows"]
+    assert set(w) == {"smoke-test.yml", "docs.yml"} and notes == ["ci profile: sampled 2 of 2 runs, 2 workflows known"]
+    assert (w["smoke-test.yml"]["runner_min"], w["smoke-test.yml"]["jobs"]) == (20, 2)  # skipped job left out
+    assert sorted(x[1] for x in st["ci_profile"]["waits"]) == [3, 5]  # pull_request runs only
+    assert not any("/runs/3/" in p or "/runs/4/" in p for p in calls)  # ignored workflow, cancelled run
+    assert churn.ci_profile_sample(st, gh=gh) == []  # not due again for every_h
+    st["ci_profile"]["sampled_at"] = churn.iso(churn.now() - churn.dt.timedelta(hours=2))
+    churn.ci_profile_sample(st, gh=gh, ignore=["shepherd-event.yml"])  # docs run 1 seen; run 2 new: 0.7 * 2 + 0.3 * 4
+    assert w["docs.yml"] == {**w["docs.yml"], "n": 2, "runner_min": 2.6}
+
+
+def test_ci_backlog_is_minutes_of_work_over_the_pool(churn):
+    t = churn.now()
+    st = {"ci_profile": {"workflows": {"smoke-test.yml": {"n": 3, "runner_min": 12, "wall_min": 20, "jobs": 7},
+                                       "det-sweep.yml": {"n": 2, "runner_min": 40, "wall_min": 30, "jobs": 12},
+                                       "audit.yml": {"n": 1, "runner_min": 2, "wall_min": 2, "jobs": 1}},
+                         "waits": [[churn.iso(t), 1.0], [churn.iso(t), 3.0], [churn.iso(t), 9.0],
+                                   [churn.iso(t - churn.dt.timedelta(hours=5)), 60.0]]}}
+    q = {"queued": 7, "by_workflow": {"smoke-test.yml": 4, "det-sweep.yml": 2, "new.yml": 1}}
+    started = churn.iso(t - churn.dt.timedelta(minutes=15))
+    ip = [{"path": ".github/workflows/det-sweep.yml", "run_started_at": started}]  # half of its 30 min wall time
+    b = churn.ci_backlog(st, q, ip)
+    # queued 4*12 + 2*40 + 12 (unknown: the median known cost) = 140; in progress 40 * 0.5 = 20; over 20 runners
+    assert (b["queued_rm"], b["pool"], b["in_progress"]) == (140, 20, 1)
+    assert 19 <= b["active_rm"] <= 20 and 7.9 <= b["backlog_min"] <= 8.0  # iso() keeps minutes: a few seconds more done
+    assert (b["job_wait_p50"], b["job_wait_n"]) == (3.0, 3)  # the 5 h old wait is outside wait_window_h
+    st["ci_profile_cfg"] = {"pool": 40}
+    assert churn.ci_backlog(st, {**q, "unseen": 7}, None)["backlog_min"] == 7.0  # unseen doubles queued; no in-progress
+    assert churn.ci_backlog({}, {"by_workflow": {"x.yml": 2}}, [])["backlog_min"] == 0.5  # default 5 runner-min
+    st["ci_backlog"] = b
+    churn.log_ci_snapshot(st, {**q, "median_wait_min": 1.0})
+    row = json.loads(churn.CI_SNAPSHOTS.read_text().splitlines()[-1])
+    assert row["backlog_min"] == b["backlog_min"] and row["job_wait_p50"] == 3.0 and "by_workflow" not in row
+
+
 def test_a_refused_precheck_send_back_keeps_the_report(churn, monkeypatch):
     monkeypatch.setattr(churn, "gh_json", lambda path: {"body": GOOD_BODY})
     monkeypatch.setattr(churn, "precheck_problems", lambda meta, body: ["PR body lacks Sibling gaps"])
