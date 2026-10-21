@@ -1628,6 +1628,56 @@ def test_ci_backlog_is_minutes_of_work_over_the_pool(churn):
     assert row["backlog_min"] == b["backlog_min"] and row["job_wait_p50"] == 3.0 and "by_workflow" not in row
 
 
+def test_per_push_cost_counts_finished_runs_per_pushed_sha(churn):
+    # #38 step 2: the newest completed runs read 9 runner-min a push (heavy runs still going); a closed window doesn't
+    prof = {"workflows": {"smoke-test.yml": {"runner_min": 12}, "det-sweep.yml": {"runner_min": 30},
+                          "ruff-audit.yml": {"runner_min": 1}}}
+    def run(wf, sha, conclusion="success", status="completed"):
+        return {"event": "pull_request", "path": f".github/workflows/{wf}", "head_sha": sha,
+                "conclusion": conclusion, "status": status}
+    runs = [run("ruff-audit.yml", s) for s in "abcd"] + [run("smoke-test.yml", s) for s in "abcd"] + \
+           [run("det-sweep.yml", "a"), run("det-sweep.yml", "b"), run("det-sweep.yml", "c", "cancelled"),
+            run("det-sweep.yml", "d", None, "in_progress"), run("other.yml", "e", "skipped"),
+            {**run("ruff-audit.yml", "f"), "event": "push"}]
+    cfg = churn.ci_profile_cfg({})
+    assert churn.per_push_cost(runs, prof, cfg) == 1 + 12 + 2 / 4 * 30  # 4 pushes; 2 finished det sweeps among them
+    assert churn.per_push_cost(runs[:2], prof, cfg) is None  # under 3 pushes in view
+
+
+def test_target_util_follows_pr_job_wait_by_aimd(churn):
+    t = churn.iso(churn.now())
+    def util(waits, start=None):
+        st = {"ci_profile": {"waits": [[t, w] for w in waits], **({"target_util": start} if start else {})}}
+        note = churn.adjust_target_util(st)
+        return st["ci_profile"]["target_util"], note
+    assert util([9] * 5, 0.8)[0] == 0.64 and "0.80 -> 0.64" in util([9] * 5, 0.8)[1]  # over 5 min: cut x0.8
+    assert util([1] * 5, 0.8)[0] == 0.85  # under 3 min (60% of target): +0.05
+    assert util([4] * 5, 0.8) == (0.8, None)  # between: hold
+    assert util([9] * 4, 0.6) == (0.6, None)  # too few waits to judge
+    assert util([1] * 5, 0.98)[0] == 1.0 and util([9] * 5, 0.32)[0] == 0.3  # util_max / util_min
+    assert util([1] * 5)[0] == 0.85  # starts from util_init 0.8
+
+
+def test_ci_admission_prices_launches_against_room_in_the_pool(churn, monkeypatch):
+    monkeypatch.setattr(churn, "pid_alive", lambda pid: True)
+    st = {"ci_profile": {"per_push_rm": 40, "target_util": 0.5},
+          "running": [{"run_id": "a", "pid": 1}, {"run_id": "b", "pid": 2, "repo": "cics-crucible"},
+                      {"run_id": "c", "pid": 3, "lane": "backfill"}]}
+    ad = churn.ci_admission(st, {"queued_rm": 100, "active_rm": 20, "pool": 20})
+    # 0.5 x 20 x 60 = 600; minus 120 in hand, minus 80 for the one live gitgalaxy-CI worker = 400; 80 a launch
+    assert ad == {"target_util": 0.5, "per_launch_rm": 80, "committed_rm": 80, "room_rm": 400, "admit": 5}
+    assert churn.ci_admission(st, {"queued_rm": 900, "active_rm": 0, "pool": 20})["admit"] == 0  # no room: holds
+    assert churn.ci_admission({}, {"pool": 20})["per_launch_rm"] == 20  # nothing learned: 2 x default 5 a push, 2 pushes
+
+
+def test_the_ci_summary_counts_where_shadow_admission_disagrees(churn):
+    for mode, admit in (("busy", 3), ("busy", 0), ("calm", 0), ("calm", 2)):
+        churn.log_ci_snapshot({"ci_mode": mode, "ci_admission": {"admit": admit}, "queue": [], "running": []},
+                              {"queued": 1, "median_wait_min": 1.0})
+    s = churn.ci_snapshot_summary()
+    assert "admission (shadow) over 4 ticks: busy held while it would admit 1, calm while it would hold 1" in s
+
+
 def test_a_refused_precheck_send_back_keeps_the_report(churn, monkeypatch):
     monkeypatch.setattr(churn, "gh_json", lambda path: {"body": GOOD_BODY})
     monkeypatch.setattr(churn, "precheck_problems", lambda meta, body: ["PR body lacks Sibling gaps"])
