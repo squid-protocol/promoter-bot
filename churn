@@ -3443,7 +3443,89 @@ def ci_profile_sample(state: dict, gh=None, ignore=(), want=()) -> list[str]:
     keep = now() - dt.timedelta(hours=max(6.0, float(cfg["wait_window_h"])))
     prof["waits"] = [x for x in prof["waits"] if (t := parse_iso(x[0])) and t >= keep][-500:]
     prof["seen_runs"] = sorted(seen)[-300:]
-    return [f"ci profile: sampled {n} of {len(picked)} runs, {len(prof['workflows'])} workflows known"] if picked else []
+    notes = [f"ci profile: sampled {n} of {len(picked)} runs, {len(prof['workflows'])} workflows known"] if picked else []
+    # Per-push cost from pushes whose runs have all finished: the newest completed runs hold a recent push's quick
+    # workflows but not its heavy ones (still running), which read 9 runner-min a push against ~65 measured (#34).
+    lo, hi = now() - dt.timedelta(minutes=90), now() - dt.timedelta(minutes=60)
+    try:
+        window = gh(f"repos/{REPO}/actions/runs?event=pull_request&per_page=100&created="
+                    f"{lo.strftime('%Y-%m-%dT%H:%M:%SZ')}..{hi.strftime('%Y-%m-%dT%H:%M:%SZ')}").get("workflow_runs", [])
+    except RuntimeError:
+        window = []
+    if (pp := per_push_cost(window, prof, cfg)) is not None:
+        prof["per_push_rm"] = round(pp if prof.get("per_push_rm") is None else (1 - a) * float(prof["per_push_rm"]) + a * pp, 1)
+    if note := adjust_target_util(state):
+        notes.append(note)
+    return notes
+
+
+def per_push_cost(runs: list[dict], prof: dict, cfg: dict) -> float | None:
+    """Runner-minutes one PR push costs: for the pull_request runs in `runs` (all runs created in a closed window),
+    each workflow's runs per pushed head SHA times its learned cost. Cancelled (superseded) and skipped (draft) runs
+    don't count, nor runs still going. None with fewer than 3 pushes in view."""
+    pr = [r for r in runs if r.get("event") == "pull_request" and r.get("status") in (None, "completed")
+          and r.get("conclusion") not in ("cancelled", "skipped")]
+    shas = {r.get("head_sha") for r in pr if r.get("head_sha")}
+    if len(shas) < 3:
+        return None
+    per_wf = collections.Counter(os.path.basename(str(r.get("path", ""))) for r in pr)
+    return sum(k / len(shas) * float(workflow_cost(prof, wf, cfg)["runner_min"]) for wf, k in per_wf.items())
+
+
+# #38 step 2 (shadow): admission instead of a busy/calm switch. Each launch is priced at its expected CI cost and
+# admitted while the pool has room under target_util; target_util follows the outcome (PR job queue wait) by AIMD, so
+# nothing here is a hand-set congestion threshold. pushes_per_pr is a setting until PR history is measured (step 3).
+CI_ADMISSION_DEFAULT = {"target_wait_min": 5.0, "util_init": 0.8, "util_min": 0.3, "util_max": 1.0, "util_step": 0.05,
+                        "util_cut": 0.8, "pushes_per_pr": 2.0, "horizon_min": 60, "min_waits": 5}
+
+
+def ci_admission_cfg(state: dict) -> dict:
+    return {**CI_ADMISSION_DEFAULT, **(state.get("ci_admission_cfg") or {})}
+
+
+def recent_job_waits(state: dict) -> list[float]:
+    cfg = ci_profile_cfg(state)
+    cut = now() - dt.timedelta(hours=float(cfg["wait_window_h"]))
+    return sorted(x[1] for x in (state.get("ci_profile") or {}).get("waits", []) if (t := parse_iso(x[0])) and t >= cut)
+
+
+def adjust_target_util(state: dict) -> str | None:
+    """AIMD on the pool share admission may fill, once per profile sample: PR job wait p50 over target_wait_min cuts it
+    (x util_cut), under 60% of the target raises it (+ util_step); in between, or with too few waits, it holds."""
+    cfg = ci_admission_cfg(state)
+    prof = state.setdefault("ci_profile", {"workflows": {}, "waits": []})
+    u = float(prof.get("target_util", cfg["util_init"]))
+    waits = recent_job_waits(state)
+    if len(waits) < int(cfg["min_waits"]):
+        prof["target_util"] = u
+        return None
+    p50, target = waits[len(waits) // 2], float(cfg["target_wait_min"])
+    if p50 > target:
+        new = max(float(cfg["util_min"]), u * float(cfg["util_cut"]))
+    elif p50 < 0.6 * target:
+        new = min(float(cfg["util_max"]), u + float(cfg["util_step"]))
+    else:
+        new = u
+    prof["target_util"] = round(new, 3)
+    return f"ci admission: PR job wait p50 {p50} min vs target {target}: target_util {u:.2f} -> {new:.2f}" \
+        if round(new, 3) != round(u, 3) else None
+
+
+def ci_admission(state: dict, backlog: dict) -> dict:
+    """What admission would allow now: room = target_util x pool x horizon minus the work in hand (backlog) minus what
+    live Claude workers will push (one PR's cost each), in runner-minutes; admit = launches that fit at one PR each.
+    Crucible-repo work runs on its own repo's CI and is not priced here."""
+    cfg, pcfg = ci_admission_cfg(state), ci_profile_cfg(state)
+    prof = state.get("ci_profile") or {}
+    u = float(prof.get("target_util", cfg["util_init"]))
+    per_push = float(prof.get("per_push_rm") or 2 * float(pcfg["default_runner_min"]))
+    per_launch = per_push * float(cfg["pushes_per_pr"])
+    live = [r for r in claude_slot_holders(state) if not r.get("repo")]
+    committed = len(live) * per_launch
+    in_hand = float(backlog.get("queued_rm") or 0) + float(backlog.get("active_rm") or 0)
+    room = u * int(backlog.get("pool") or pcfg["pool"]) * float(cfg["horizon_min"]) - in_hand - committed
+    return {"target_util": round(u, 3), "per_launch_rm": round(per_launch), "committed_rm": round(committed),
+            "room_rm": round(room), "admit": max(0, int(room // per_launch)) if per_launch > 0 else 0}
 
 
 def workflow_cost(prof: dict, wf: str, cfg: dict) -> dict:
@@ -3474,8 +3556,7 @@ def ci_backlog(state: dict, q: dict, in_progress: list[dict] | None) -> dict:
             active_rm += float(c["runner_min"]) * (1 - done)
         else:
             active_rm += float(c["runner_min"]) / 2  # no wall time learned yet: assume half done
-    cut = now() - dt.timedelta(hours=float(cfg["wait_window_h"]))
-    waits = sorted(x[1] for x in prof.get("waits", []) if (t := parse_iso(x[0])) and t >= cut)
+    waits = recent_job_waits(state)
     return {"backlog_min": round((queued_rm + active_rm) / pool, 1), "queued_rm": round(queued_rm),
             "active_rm": round(active_rm), "in_progress": None if in_progress is None else len(in_progress),
             "pool": pool, "job_wait_p50": waits[len(waits) // 2] if waits else None, "job_wait_n": len(waits)}
@@ -3509,6 +3590,7 @@ def log_ci_snapshot(state: dict, q: dict, path: Path | None = None) -> None:
     live = [r for r in state.get("running", []) if pid_alive(r.get("pid"))]
     row = {"t": iso(now()), "host": HOST_ID, **{k: v for k, v in q.items() if k not in ("t", "by_workflow")},
            **{k: v for k, v in (state.get("ci_backlog") or {}).items() if k != "t"},
+           **{k: v for k, v in (state.get("ci_admission") or {}).items() if k != "t"},
            "mode": state.get("ci_mode", "calm"), "mode_since": state.get("ci_mode_since"),
            "running": len(live), "running_backfill": sum(r.get("lane") == "backfill" for r in live),
            "queue_len": len(state.get("queue", []))}
@@ -3538,8 +3620,15 @@ def ci_snapshot_summary(hours: float = 24, path: Path | None = None) -> str:
         return vs[len(vs) // 2]
     busy = sum(r.get("mode") == "busy" for r in rows)
     idle_busy = sum(r.get("mode") == "busy" and not r.get("running") for r in rows)
-    return (f"CI last {hours:g} h: busy {100 * busy // len(rows)}% of {len(rows)} ticks ({idle_busy} with 0 running); "
-            f"median queued {mid('queued')}, median wait {mid('median_wait_min')} min")
+    out = (f"CI last {hours:g} h: busy {100 * busy // len(rows)}% of {len(rows)} ticks ({idle_busy} with 0 running); "
+           f"median queued {mid('queued')}, median wait {mid('median_wait_min')} min")
+    # #38 step 2: where the shadow admission disagrees with busy/calm -- the evidence for switching over (step 3)
+    if adm := [r for r in rows if "admit" in r]:
+        held = sum(r.get("mode") == "busy" and r["admit"] >= 1 for r in adm)
+        over = sum(r.get("mode") != "busy" and r["admit"] < 1 for r in adm)
+        out += (f"; admission (shadow) over {len(adm)} ticks: busy held while it would admit {held}, calm while it "
+                f"would hold {over}")
+    return out
 
 
 HELD_PLAN_MAX_H = 48
@@ -5178,6 +5267,7 @@ def cmd_tick(a) -> int:
             with edit_state() as st:
                 st["ci_profile"] = state.get("ci_profile") or st.get("ci_profile")
                 st["ci_backlog"] = {**ci_backlog(st, cq, inprog), "t": iso(now())}  # #38 shadow: logged, decides nothing
+                st["ci_admission"] = {**ci_admission(st, st["ci_backlog"]), "t": iso(now())}
                 mode, why = ci_mode(st, cq)
                 if mode != st.get("ci_mode", "calm"):
                     log(f"CI mode {st.get('ci_mode', 'calm')} -> {mode} ({why}); "
@@ -5805,6 +5895,10 @@ def cmd_status(a) -> int:
         print(f"CI backlog (#38 shadow): {bl.get('backlog_min')} min to drain on {bl.get('pool')} runners "
               f"({bl.get('queued_rm')} queued + {bl.get('active_rm')} in-progress runner-min); PR job wait p50 "
               f"{bl.get('job_wait_p50')} min (n={bl.get('job_wait_n')}); {len(wfs)} workflows profiled")
+    if ad := state.get("ci_admission"):
+        print(f"CI admission (#38 shadow): would admit {ad.get('admit')} launch(es) now: room {ad.get('room_rm')} "
+              f"runner-min at target_util {ad.get('target_util')}, {ad.get('per_launch_rm')} per launch, "
+              f"{ad.get('committed_rm')} committed by live workers; busy/calm still decides ({state.get('ci_mode', 'calm')})")
     print(f"window ${window_usd(state):.2f} / {WINDOW_H}h; learned budget ${usage.get('learned_budget_usd')}; last model tick {state.get('last_model_tick')}")
     print(f"pace: {usage.get('pace') or 'ledger'}; max_workers {state.get('max_workers', 2)}, max_opus {state.get('max_opus', 1)}")
     sy = state.get("sync") or {}
