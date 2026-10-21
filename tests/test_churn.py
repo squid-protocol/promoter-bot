@@ -440,6 +440,40 @@ class TestCiLoadBalancer:
             raise RuntimeError("rate limited")
         assert "error" in churn.ci_queue(gh=boom)
 
+    def test_ci_queue_leaves_out_lightweight_workflows(self, churn):
+        # #35: the 2026-10-21 19:00Z mix -- 35 one-job shepherd label-event runs held both hosts busy at "53 queued"
+        t0 = churn.now()
+        def run(path, m):
+            return {"path": f".github/workflows/{path}", "created_at": churn.iso(t0 - churn.dt.timedelta(minutes=m))}
+        runs = [run("shepherd-event.yml", 40)] * 35 + [run("det-sweep.yml", 6)] * 18
+        q = churn.ci_queue(gh=lambda path: {"total_count": 53, "workflow_runs": runs},
+                           ignore=churn.CI_PRESSURE_DEFAULT["ignore_workflows"])
+        assert q["queued"] == 18 and q["ignored"] == 35 and 5 <= q["median_wait_min"] <= 7
+        mode, why = churn.ci_mode({"ci_mode": "calm"}, q)
+        assert mode == "calm" and "18 runs queued (35 lightweight ignored)" in why
+        assert churn.ci_queue(gh=lambda path: {"total_count": 53, "workflow_runs": runs})["queued"] == 53
+
+    def test_ci_queue_medians_every_page_read_and_scales_the_unseen_rest(self, churn):
+        # #35: the median came from the newest 100 only; older pages hold the long waits
+        t0 = churn.now()
+        def page(m, n):
+            return [{"path": ".github/workflows/smoke-test.yml",
+                     "created_at": churn.iso(t0 - churn.dt.timedelta(minutes=m))}] * n
+        pages = {1: page(2, 100), 2: page(30, 100), 3: page(50, 100)}
+        seen = []
+        def gh(path):
+            n = int(path.split("&page=")[1]) if "&page=" in path else 1
+            seen.append(n)
+            return {"total_count": 450, "workflow_runs": pages[n]}
+        q = churn.ci_queue(gh=gh)
+        assert seen == [1, 2, 3] and q["queued"] == 450 and q["unseen"] == 150 and 29 <= q["median_wait_min"] <= 31
+        def flaky(path):
+            if "&page=" in path:
+                raise RuntimeError("rate limited")
+            return {"total_count": 450, "workflow_runs": pages[1]}
+        q = churn.ci_queue(gh=flaky)  # a later page failing keeps the first page's reading
+        assert q["queued"] == 450 and q["unseen"] == 350 and q["median_wait_min"] < 3
+
     def test_lane_is_validated_and_copied_to_the_running_entry(self, churn):
         st = {"queue": [item(1, lane="fast")]}
         churn.normalize_state(st)

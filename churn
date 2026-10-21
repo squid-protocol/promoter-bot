@@ -2545,9 +2545,12 @@ def bump_attempts(state: dict, keys: list[str]) -> None:
 # ci items held) and was preempted/resumed 5 times in 5 h (an Opus context reload each). Now it always runs under a hard
 # CPUQuota of backfill_cores; when CI calms a backfill run DRAINS (finishes its ~20-30 min step) and is stopped only once it
 # has run backfill_drain_max_min; a (re)launch waits until CI has been busy for backfill_min_busy_min.
+# #35 (2026-10-21): 35 of 53 queued runs were one-job, ~1-min shepherd label-event runs (35% of all runs, 1.6-2.2k/day,
+# mostly our own PRs' labels) while 6 ran: they held both hosts busy. ignore_workflows (workflow file names) don't count.
 CI_PRESSURE_DEFAULT = {"busy_queued": 20, "busy_wait_min": 20, "calm_queued": 8, "calm_wait_min": 10, "backfill_max": 1,
                        "backfill_calm_cores": 3, "busy_count_min_wait": 5, "backfill_cores": 4, "backfill_drain_max_min": 45,
-                       "backfill_min_busy_min": 20, "backfill_idle_ticks": 2}
+                       "backfill_min_busy_min": 20, "backfill_idle_ticks": 2,
+                       "ignore_workflows": ["shepherd-event.yml", "shepherd-reconcile.yml", "main-watch.yml"]}
 
 
 def ci_cfg(state: dict) -> dict:
@@ -3296,22 +3299,40 @@ def cmd_notify(a) -> int:
 
 
 STALE_QUEUED_H = 3
+CI_QUEUE_PAGES = 3  # #35: the median came from the newest 100 only (biased low in a long queue); read up to 300
 
 
-def ci_queue(gh=None) -> dict:
-    """GitHub Actions runs waiting for a runner: count and median wait (minutes). One API call."""
+def ci_queue(gh=None, ignore=()) -> dict:
+    """GitHub Actions runs waiting for a runner: count and median wait (minutes), leaving out runs of the `ignore`
+    workflow files. One API call, up to CI_QUEUE_PAGES when more than 100 runs are queued."""
     gh = gh or gh_json
+    runs: list = []
+    total = 0
     try:
-        d = gh(f"repos/{REPO}/actions/runs?status=queued&per_page=100")
+        for page in range(1, CI_QUEUE_PAGES + 1):
+            d = gh(f"repos/{REPO}/actions/runs?status=queued&per_page=100" + (f"&page={page}" if page > 1 else ""))
+            got = d.get("workflow_runs", [])
+            total, runs = max(total, int(d.get("total_count", 0))), runs + got
+            if len(got) < 100 or len(runs) >= total:
+                break
     except RuntimeError as e:
-        return {"error": str(e)[:120]}
-    every = sorted((now() - t).total_seconds() / 60 for r in d.get("workflow_runs", []) if (t := parse_iso(r.get("created_at"))))
+        if not runs:
+            return {"error": str(e)[:120]}  # a later page failing keeps what the earlier pages saw
+    total = max(total, len(runs))
+    is_light = [os.path.basename(str(r.get("path", ""))) in set(ignore) for r in runs]
+    counted = [r for r, lt in zip(runs, is_light) if not lt]
+    light = len(runs) - len(counted)
+    every = sorted((now() - t).total_seconds() / 60 for r in counted if (t := parse_iso(r.get("created_at"))))
     # 2026-10-16 audit: one run queued for hours (no runner will ever take it) kept the median >= busy_wait_min, so busy
     # mode -- and the hold on normal work -- could never end. Runs queued longer than STALE_QUEUED_H don't count.
     waits = [w for w in every if w < STALE_QUEUED_H * 60]
     stale = len(every) - len(waits)
-    return {"queued": max(0, int(d.get("total_count", len(every))) - stale),
-            "median_wait_min": round(waits[len(waits) // 2], 1) if waits else 0.0, **({"stale": stale} if stale else {})}
+    # Runs beyond the pages read are unseen: count them at the share of counted runs among those seen.
+    unseen = total - len(runs)
+    queued = len(counted) - stale + (round(unseen * len(counted) / len(runs)) if runs else unseen)
+    return {"queued": max(0, queued), "median_wait_min": round(waits[len(waits) // 2], 1) if waits else 0.0,
+            **({"stale": stale} if stale else {}), **({"ignored": light} if light else {}),
+            **({"unseen": unseen} if unseen > 0 else {})}
 
 
 def ci_mode(state: dict, q: dict) -> tuple[str, str]:
@@ -3329,7 +3350,9 @@ def ci_mode(state: dict, q: dict) -> tuple[str, str]:
         mode = "calm"
     else:
         mode = prev
-    return mode, f"CI {mode}: {n} runs queued, median wait {w} min"
+    extra = ", ".join(f"{q[k]} {label}" for k, label in (("ignored", "lightweight ignored"), ("unseen", "past the pages read"))
+                      if q.get(k))
+    return mode, f"CI {mode}: {n} runs queued{f' ({extra})' if extra else ''}, median wait {w} min"
 
 
 HELD_PLAN_MAX_H = 48
@@ -4957,7 +4980,7 @@ def cmd_tick(a) -> int:
                 log(note)
             for note in gc_worktrees_if_due(b):
                 log(note)
-            cq = ci_queue()
+            cq = ci_queue(ignore=ci_cfg(state)["ignore_workflows"])
             with edit_state() as st:
                 mode, why = ci_mode(st, cq)
                 if mode != st.get("ci_mode", "calm"):
