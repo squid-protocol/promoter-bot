@@ -1908,6 +1908,26 @@ def test_queue_add_and_retier_read_the_scope_label(churn, monkeypatch):
     assert churn.load_state()["queue"][0]["scope"] == "sweep"
 
 
+def test_a_promotion_sticks_to_the_issue_across_launches(churn, monkeypatch):
+    monkeypatch.setattr(churn, "issue_meta", lambda n: {"title": "t", "labels": [{"name": "scope:frontier"}]})
+    base = dict(action="add", task="slice", model="sonnet", front=False, needs_owner=False, backend=None, pr=None,
+                after_pr=None, allow_workflows=False, agy_step=None, lane=None, repo=None, before_issue=None, tier=None,
+                after_merge=False, index=None, note=None, run=None, minutes=None, promote=False, issue=5620)
+    churn.cmd_queue(argparse.Namespace(**base))
+    assert churn.scope_held(churn.load_state()["queue"][0])
+    churn.cmd_queue(argparse.Namespace(**{**base, "action": "promote", "index": 0}))
+    churn.cmd_queue(argparse.Namespace(**{**base, "action": "rm", "index": 0}))  # launched: the item is gone
+    churn.cmd_queue(argparse.Namespace(**base))  # the followup's next slice, queued without --promote
+    st = churn.load_state()
+    assert st["queue"][0]["promoted"] and not churn.scope_held(st["queue"][0]) and "5620" in st["promoted_issues"]
+    churn.cmd_queue(argparse.Namespace(**{**base, "action": "unpromote"}))
+    st = churn.load_state()
+    assert churn.scope_held(st["queue"][0]) and "promoted_issues" not in st
+    st["promoted_issues"] = {"5620": churn.iso(churn.now() - churn.dt.timedelta(days=churn.PROMOTE_DAYS + 1))}
+    churn.normalize_state(st)  # an old promotion has lapsed
+    assert churn.scope_held(st["queue"][0]) and "promoted_issues" not in st
+
+
 def test_unknown_queue_keys_pass_through_and_quarantine_can_be_restored(churn):
     # 2026-10-16: a process on the previous code quarantined every item with the new `scope` key, emptying the queue
     st = {"queue": [item(1, colour="red")]}
