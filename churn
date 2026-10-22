@@ -553,6 +553,61 @@ def start_precheck(rid: str) -> None:
     spawn_detached(f"churn-precheck-{rid}", [sys.executable, SELF, "_precheck", rid], TICK_CWD, RUNS / rid / "precheck.log")
 
 
+# promoter-bot-private#2 (owner ruling 2026-10-19, GitGalaxy is an LLC): projects with an unclear license or provenance
+# are internal only, never named in committed files or public PRs. A hand-made grep list missed prose mentions and five
+# lines survived a cleanup PR (2026-10-20). The list lives in the private repo, since it names them; a hit is reported
+# by file:line only, and the matched name goes to the run's local precheck.log, never to GitHub-visible text.
+def internal_names(path: Path | None = None) -> list[str]:
+    p = path or Path(_CFG.get("internal_names", str(PRIVATE_DIR / "policy" / "internal-only-names.txt")))
+    try:
+        lines = p.read_text().splitlines()
+    except OSError:
+        return []
+    return [s for x in lines if (s := x.strip()) and not s.startswith("#")]
+
+
+def internal_name_re(names: list[str]) -> re.Pattern | None:
+    """Case-insensitive; `-`, `_` and word characters on either side make it another name: listing `foo-doom` leaves
+    a public `foo-doom-cc` alone."""
+    if not names:
+        return None
+    alt = "|".join(re.escape(n) for n in sorted(set(names), key=len, reverse=True))
+    return re.compile(rf"(?<![\w-])(?:{alt})(?![\w-])", re.IGNORECASE)
+
+
+def added_lines(diff: str) -> list[tuple[str, int, str]]:
+    """(file, new line number, text) of each added line in a `git diff -U0` output."""
+    out, f, n = [], None, 0
+    for ln in diff.splitlines():
+        if ln.startswith("+++ "):
+            f = ln[6:] if ln.startswith("+++ b/") else None
+        elif ln.startswith("@@") and (m := re.match(r"@@ -\S+ \+(\d+)", ln)):
+            n = int(m.group(1))
+        elif ln.startswith("+") and f:
+            out.append((f, n, ln[1:]))
+            n += 1
+    return out
+
+
+def internal_name_problems(diff: str, body: str, names: list[str]) -> tuple[list[str], list[str]]:
+    """(problems without the names, local-only detail lines with them) for a PR's added lines and its body."""
+    rx = internal_name_re(names)
+    if not rx:
+        return [], []
+    hits = [(f"{f}:{n}", m.group(0)) for f, n, t in added_lines(diff) for m in [rx.search(t)] if m]
+    in_body = [(f"PR body line {k}", m.group(0)) for k, t in enumerate(body.splitlines(), 1) for m in [rx.search(t)] if m]
+    out = []
+    if hits:
+        out.append(f"adds an internal-only project name (promoter-bot-private policy list) at "
+                   f"{', '.join(w for w, _ in hits[:10])}{f' and {len(hits) - 10} more' if len(hits) > 10 else ''}: "
+                   "describe the shape generically (own fixtures for engine bugs); never quote the name in the PR body, "
+                   "comments, commit messages or the report")
+    if in_body:
+        out.append(f"the PR body names an internal-only project ({', '.join(w for w, _ in in_body[:5])}): edit it to "
+                   "describe the shape generically")
+    return out, [f"{w}: {name}" for w, name in hits + in_body]
+
+
 def precheck_problems(meta: dict, body: str, gates=None) -> list[str]:
     """The mechanical problems a reviewer would otherwise send back (2026-10-16: about half of 22 send-backs were
     these): conflicts with main, a workflow edited without an allow_workflows item, a PR body without its class table,
@@ -571,6 +626,12 @@ def precheck_problems(meta: dict, body: str, gates=None) -> list[str]:
                        "(night-shift Never rule) or say in the report that it needs the owner")
     if len(body.strip()) < 150 or not re.search(r"(?i)\bclass\b|sibling", body):
         out.append("the PR body is missing or has no class table / Sibling gaps (gitgalaxy-pr-worker.md): write it")
+    if names := internal_names():
+        diff = run(["git", "-C", wt, "diff", "-U0", "--no-color", "--no-ext-diff", "origin/main...HEAD"], timeout=300).stdout
+        probs, detail = internal_name_problems(diff, body, names)
+        out += probs
+        for x in detail:  # precheck.log on this host only; the problems above stay name-free
+            print(f"internal-only name: {x}")
     g = (gates or (lambda: run([str(Path(wt) / "tests/tools/box/heavy-run.sh"), sys.executable, "tests/tools/pr_gates.py",
                                 "--fast"], cwd=wt, timeout=1800)))()
     if g.returncode:

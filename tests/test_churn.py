@@ -1216,6 +1216,34 @@ def test_precheck_finds_the_mechanical_send_back_reasons(churn, tmp_path):
     assert churn.precheck_problems({"worktree": str(clean)}, GOOD_BODY, gates=ok) == []  # launched before the flag: unknown
 
 
+def test_precheck_fails_an_internal_only_name_without_echoing_it(churn, tmp_path, monkeypatch, capsys):
+    # promoter-bot-private#2. Made-up names only: the real list lives in the private repo and never in this one.
+    lst = tmp_path / "names.txt"
+    lst.write_text("# internal only\nzorkport\nmy-fake-doom\n\n")
+    monkeypatch.setitem(churn._CFG, "internal_names", str(lst))
+    assert churn.internal_names() == ["zorkport", "my-fake-doom"]
+    assert churn.internal_names(tmp_path / "missing.txt") == []  # no private checkout: no check
+    ok = lambda: subprocess.CompletedProcess([], 0, "6/6 gates pass", "")  # noqa: E731
+    wt = _repo_with_conflict(tmp_path / "a", conflict=False)
+    (wt / "docs.md").write_text("intro\nPorts like ZorkPort show it.\nmy-fake-doom-cc is public\n")
+    (wt / "t.py").write_text('X = "zorkport/src"\n')
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-q", "-m", "names")
+    body = GOOD_BODY + "\nseen in my-fake-doom too"
+    probs = churn.precheck_problems({"worktree": str(wt)}, body, gates=ok)
+    assert len(probs) == 2 and "docs.md:2, t.py:1" in probs[0] and "PR body line 9" in probs[1]
+    assert not any(n in p.lower() for p in probs for n in ("zorkport", "my-fake-doom"))  # GitHub-visible: name-free
+    assert "docs.md:2: ZorkPort" in capsys.readouterr().out  # the local precheck.log has the detail
+    clean = _repo_with_conflict(tmp_path / "b", conflict=False)
+    assert churn.precheck_problems({"worktree": str(clean)}, GOOD_BODY, gates=ok) == []
+
+
+def test_added_lines_keeps_new_file_line_numbers(churn):
+    diff = ("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -3,0 +4,2 @@\n+one\n+two\n@@ -9 +11 @@\n-old\n+new\n"
+            "diff --git a/y b/y\n--- a/y\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n")
+    assert churn.added_lines(diff) == [("x", 4, "one"), ("x", 5, "two"), ("x", 11, "new")]
+
+
 def test_a_failed_precheck_sends_the_run_back_once_then_goes_to_review(churn, monkeypatch):
     sent, nudged = [], []
     monkeypatch.setattr(churn, "gh_json", lambda path: {"body": GOOD_BODY})
