@@ -1125,11 +1125,16 @@ def self_sync(sync: dict, live: int, src: Path | None = None, force: bool = Fals
     try:
         if git("worktree", "add", "-q", "--detach", str(tmp / "t"), target).returncode:
             return None
-        try:
-            r = run(test_cmd or [SELFSCAN_PY, "-m", "pytest", "-q", "-x", "tests"], cwd=str(tmp / "t"),
-                    timeout=SYNC_TEST_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            r = subprocess.CompletedProcess([], 1, "", "tests timed out")
+        # A second run before pinning main as failed (nyx 2026-10-22: one flaky test at 10:31Z held the host 4
+        # commits behind all day, since a failed target is never retested).
+        for _ in range(2):
+            try:
+                r = run(test_cmd or [SELFSCAN_PY, "-m", "pytest", "-q", "-x", "tests"], cwd=str(tmp / "t"),
+                        timeout=SYNC_TEST_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                r = subprocess.CompletedProcess([], 1, "", "tests timed out")
+            if not r.returncode:
+                break
     finally:
         git("worktree", "remove", "--force", str(tmp / "t"))
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1138,7 +1143,7 @@ def self_sync(sync: dict, live: int, src: Path | None = None, force: bool = Fals
         tail = " ".join((r.stdout + r.stderr).split())[-300:]
         notify(f"sync-tests-{target[:8]}", "promoter-bot: main fails its tests here",
                f"Not updating {head[:8]} -> {target[:8]}: {tail}", priority="high", cooldown_h=24)
-        return f"sync: origin/main {target[:8]} fails its tests here; staying on {head[:8]}"
+        return f"sync: origin/main {target[:8]} fails its tests here (twice); staying on {head[:8]}: {tail}"
     if git("merge", "-q", "--ff-only", target).returncode:
         return f"sync: fast-forward to {target[:8]} failed; staying on {head[:8]}"
     note = f"sync: promoter-bot {head[:8]} -> {target[:8]} ({behind} commit(s))"
@@ -3984,12 +3989,35 @@ def idle_causes(state: dict, snap: dict | None, mode: str) -> str:
                                 for k, v in c.most_common())
 
 
+def unapplied_owner_answers() -> list[dict]:
+    """Owner replies in owner-answers.jsonl the tick has not applied yet. One the tick looked at and could not map stays
+    `applied: false` with an `applied_note` saying why; that one waits for the owner, so it does not wake the model."""
+    try:
+        lines = (H / "owner-answers.jsonl").read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and not e.get("applied") and not e.get("applied_note"):
+            out.append(e)
+    return out
+
+
 def gate(state: dict, b: dict, force: list[str], needs: dict[str, str] | None = None,
          snap: dict | None = None) -> tuple[list[str], str]:
     """needs: {key: reason} from reconcile (review #n@head, followup #n), already filtered by the stall rule."""
     reasons = list(force)
     if needs:
         reasons += list(needs.values())
+    # 2026-10-22: the gate never looked at owner answers, so seven 10-21 rulings sat unapplied for a day while the
+    # ticks it did wake (refill, launch) stayed on their own reason. Step 0b applies them.
+    if answers := unapplied_owner_answers():
+        reasons.append("owner answers to apply (step 0b, owner-answers.jsonl): " + ", ".join(
+            f"{e.get('id', '?')} ({str(e.get('question') or e.get('item') or '')[:60]})" for e in answers))
     pending = [e for e in state.get("reports_pending", []) if not auto_checkable(e)  # agy `done`: the lane launches a checker
                and not precheck_holds(e)]
     if pending:
@@ -4811,7 +4839,7 @@ def refill_candidates(state: dict, issues: list[dict], in_pr: set[int], callgrap
     def rank(i):
         names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
         sc = next((x[6:] for x in names if x.startswith("scope:")), None)
-        return (goal_rank(state, {"issue": i["number"]}), SCOPE_RANK.get(sc, 1), "bug" not in names,
+        return (goal_rank(state, {"issue": i["number"]}), not host_prefers(i), SCOPE_RANK.get(sc, 1), "bug" not in names,
                 min((PRIO_RANK[n] for n in names if n in PRIO_RANK), default=2), i["number"])
     return sorted(out, key=rank)[:int(cfg["batch"])]
 
@@ -5122,7 +5150,8 @@ def host_skips(i: dict) -> str | None:
     """Why issue `i` (a gh issue dict with labels + milestone) is not this host's work; None if it is.
     A `lane:<host_id>` label routes an issue to that host whatever its milestone. Otherwise an issue must be in one of
     host.milestones or carry one of host.labels (both empty: anything), must not be in host.exclude_milestones, and
-    every `needs:<x>` label it carries must be in host.capabilities (unset: this host can do anything)."""
+    every `needs:<x>` label it carries must be in host.capabilities (unset: this host can do anything).
+    host.prefer_milestones only orders refill (host_prefers), it skips nothing."""
     names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
     ms = str((i.get("milestone") or {}).get("title", ""))
     lanes = {n[5:] for n in names if n.startswith("lane:")}
@@ -5139,6 +5168,14 @@ def host_skips(i: dict) -> str | None:
     if (want_ms or want_labels) and ms not in want_ms and not names & set(want_labels):
         return "outside this host's lanes"
     return None
+
+
+def host_prefers(i: dict) -> bool:
+    """Issue `i` is in one of host.prefer_milestones or routed here by `lane:<host_id>`: refill takes it first. Unlike
+    host.milestones this never skips anything (owner 2026-10-22: nyx sat idle half the day with its two milestones
+    all frontier, claimed or needing docker, while 55 other open issues were fair game)."""
+    names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
+    return f"lane:{HOST_ID}" in names or str((i.get("milestone") or {}).get("title", "")) in (HOST.get("prefer_milestones") or [])
 
 
 def claim(state: dict, n: int, dry_run: bool = False) -> tuple[bool, str, dict | None]:

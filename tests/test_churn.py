@@ -209,6 +209,17 @@ class TestGateRules:
         assert churn.worker_slots({"verdict": "GREEN", "free_slots": 0}, 2, 3) == 0  # the box says no
         assert churn.worker_slots({"verdict": "GREEN", "free_slots": 1}, 0, 3) == 1
 
+    def test_unapplied_owner_answers_wake_the_model(self, churn):
+        st = {"queue": [], "running": []}
+        rows = [{"id": "o1", "question": "Close #1?", "applied": True},
+                {"id": "o2", "question": "Close #2?", "applied": False},
+                {"id": "o3", "question": "Close #3?", "applied": False, "applied_note": "no such queue item"}]
+        (churn.H / "owner-answers.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
+        reasons, _ = churn.gate(st, self.GREEN, [], {}, {})
+        assert len(reasons) == 1 and "o2 (Close #2?)" in reasons[0] and "o1" not in reasons[0] and "o3" not in reasons[0]
+        (churn.H / "owner-answers.jsonl").unlink()
+        assert churn.gate(st, self.GREEN, [], {}, {})[0] == []
+
     def test_needs_wake_the_model_and_daily_summary_does_not(self, churn):
         st = {"queue": [], "running": [], "last_daily_summary": "2000-01-01"}
         assert churn.gate(st, self.GREEN, [], {}, {})[0] == []
@@ -540,7 +551,7 @@ class TestCiLoadBalancer:
                 raise RuntimeError("rate limited")
             return {"total_count": 450, "workflow_runs": pages[1]}
         q = churn.ci_queue(gh=flaky)  # a later page failing keeps the first page's reading
-        assert q["queued"] == 450 and q["unseen"] == 350 and q["median_wait_min"] <= 3  # iso() keeps minutes: 2.95 -> 3.0
+        assert q["queued"] == 450 and q["unseen"] == 350 and q["median_wait_min"] <= 3  # iso() drops seconds: 2-3 min
 
     def test_lane_is_validated_and_copied_to_the_running_entry(self, churn):
         st = {"queue": [item(1, lane="fast")]}
@@ -3034,6 +3045,18 @@ def test_host_capabilities_and_excluded_milestones(churn, monkeypatch):
     assert churn.host_skips(gh_issue(4, [f"lane:{churn.HOST_ID}", "needs:db2"])) == "needs db2"  # routing can't add a box
 
 
+def test_preferred_milestones_and_lane_go_first_in_refill_but_skip_nothing(churn, monkeypatch):
+    monkeypatch.setattr(churn, "HOST", {"prefer_milestones": ["DOOM"]})
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "batch", 9)
+    issues = [gh_issue(1, ms="Side Quests"), gh_issue(2, ["scope:infra"], ms="DOOM"), gh_issue(3),
+              gh_issue(4, [f"lane:{churn.HOST_ID}"]), gh_issue(5, ms="DOOM")]
+    for i in issues:
+        i["labels"] = [x for x in i["labels"] if x["name"] != "scope:core" or i["number"] != 2]
+    assert all(churn.host_skips(i) is None for i in issues)
+    st = {"queue": [], "running": []}
+    assert [i["number"] for i in churn.refill_candidates(st, issues, set())] == [4, 5, 2, 1, 3]
+
+
 def test_host_roles_limit_the_one_host_jobs(churn, monkeypatch):
     monkeypatch.setattr(churn, "HOST", {"roles": ["retro"]})
     assert churn.host_role("retro") and not churn.host_role("bot_prs") and not churn.host_role("main_red")
@@ -3281,6 +3304,16 @@ def test_sync_stays_put_when_main_fails_its_tests(churn, tmp_path):
     note = churn.self_sync(sync, 0, src=install, force=True, test_cmd=["false"], units=False)
     assert "fails its tests" in note and sync["failed"] == target and git(install, "rev-parse", "HEAD") == head
     assert churn.self_sync(sync, 0, src=install, force=True, test_cmd=["true"], units=False) is None  # not retested
+
+
+def test_sync_runs_the_tests_twice_before_pinning_main_as_failed(churn, tmp_path):
+    _, seed, install, git = _sync_repos(tmp_path)
+    target = _land_on_main(seed, git)
+    flag = tmp_path / "ran-once"
+    sync = {}
+    note = churn.self_sync(sync, 0, src=install, force=True, units=False,
+                           test_cmd=["sh", "-c", f"test -f {flag} || {{ touch {flag}; exit 1; }}"])
+    assert note.startswith("sync: promoter-bot") and "failed" not in sync and git(install, "rev-parse", "HEAD") == target
 
 
 def test_sync_never_touches_a_dirty_or_diverged_install(churn, tmp_path):
