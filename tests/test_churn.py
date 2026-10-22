@@ -209,6 +209,17 @@ class TestGateRules:
         assert churn.worker_slots({"verdict": "GREEN", "free_slots": 0}, 2, 3) == 0  # the box says no
         assert churn.worker_slots({"verdict": "GREEN", "free_slots": 1}, 0, 3) == 1
 
+    def test_unapplied_owner_answers_wake_the_model(self, churn):
+        st = {"queue": [], "running": []}
+        rows = [{"id": "o1", "question": "Close #1?", "applied": True},
+                {"id": "o2", "question": "Close #2?", "applied": False},
+                {"id": "o3", "question": "Close #3?", "applied": False, "applied_note": "no such queue item"}]
+        (churn.H / "owner-answers.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
+        reasons, _ = churn.gate(st, self.GREEN, [], {}, {})
+        assert len(reasons) == 1 and "o2 (Close #2?)" in reasons[0] and "o1" not in reasons[0] and "o3" not in reasons[0]
+        (churn.H / "owner-answers.jsonl").unlink()
+        assert churn.gate(st, self.GREEN, [], {}, {})[0] == []
+
     def test_needs_wake_the_model_and_daily_summary_does_not(self, churn):
         st = {"queue": [], "running": [], "last_daily_summary": "2000-01-01"}
         assert churn.gate(st, self.GREEN, [], {}, {})[0] == []
