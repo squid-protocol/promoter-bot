@@ -3002,8 +3002,37 @@ def auth_alert(text: str, source: str) -> None:
                + " ".join(text.split())[:300], priority="urgent", tags="rotating_light")
 
 
+OWNER_REF_RE = re.compile(r"^\s*(PR|queue) #(\d+)|^\s*(stalled): (\S+)")
+
+
+def owner_ref(text: str) -> tuple[str, str] | None:
+    """("PR", "123") / ("queue", "45") / ("stalled", key) from the head of an owner item or an answer's `item`."""
+    m = OWNER_REF_RE.match(str(text or ""))
+    return None if not m else (m[1], m[2]) if m[1] else (m[3], m[4])
+
+
+def answered_refs() -> set[tuple[str, str]]:
+    """Owner items the owner has answered but the tick has not applied yet (#28): no alert, `ANSWERED` in status."""
+    return {r for e in unapplied_owner_answers() if (r := owner_ref(e.get("item")))}
+
+
+def owner_question(ref: tuple[str, str] | None) -> str | None:
+    """The phone text of $H/owner-questions/*.md for this item: its question and the yes/no/hold labels."""
+    if not ref:
+        return None
+    for f in sorted((H / "owner-questions").glob("*.md")):
+        with contextlib.suppress(OSError):
+            lines = f.read_text().splitlines()
+            fields = {k.strip().lower(): v.strip() for k, _, v in (x.partition(":") for x in lines) if v}
+            if owner_ref(fields.get("item")) == ref:
+                opts = [f"{k}: {fields[k].split(' -- ')[0]}" for k in ("yes", "no", "hold") if fields.get(k)]
+                return "\n".join([fields.get("question", ""), *opts]).strip() or None
+    return None
+
+
 def gate_alerts(state: dict, b: dict, snap: dict) -> None:
-    """Disk RED from box_status, and anything waiting on the owner for OWNER_WAIT_H (one alert per item)."""
+    """Disk RED from box_status, and the owner's items: one ping when an item first appears (#29: a hold sat 12 h
+    unseen on 2026-10-20), one high-priority reminder after OWNER_WAIT_H, nothing for an answered one (#28)."""
     disk = [r for r in b.get("reasons", []) if r.startswith("disk almost full") or r.startswith("inodes almost gone")]
     if disk:
         notify("disk-red", "churn: disk almost full", "; ".join(disk) + "\nThe gate launches nothing while RED.",
@@ -3012,10 +3041,16 @@ def gate_alerts(state: dict, b: dict, snap: dict) -> None:
     if not cfg.get("topic"):
         return
     seen, keep = cfg.get("owner_seen") or {}, {}
+    answered = answered_refs()
     for item in owner_items(state, snap):
         k = item.split(":")[0]
         keep[k] = seen.get(k) or iso(now())
-        if now() - parse_iso(keep[k]) >= dt.timedelta(hours=OWNER_WAIT_H):
+        if owner_ref(item) in answered:
+            continue
+        if k not in seen:
+            notify(f"owner-new:{k}", f"churn: {k} needs you", owner_question(owner_ref(item)) or item,
+                   cooldown_h=24 * 365, tags="raising_hand")
+        elif now() - parse_iso(keep[k]) >= dt.timedelta(hours=OWNER_WAIT_H):
             notify(f"owner:{k}", f"churn: {k} waits on you", item, priority="high", cooldown_h=24 * 365, tags="raising_hand")
     cfg = notify_cfg()
     cfg["owner_seen"] = keep
@@ -6058,8 +6093,9 @@ def cmd_status(a) -> int:
     for f in state.get("followups", []):
         print(f"followup: PR #{f['pr']} {f['kind']}" + (f" (issue #{f['issue']})" if f.get("issue") else "") + f" since {f.get('since')}")
     snap = json.loads(SNAP.read_text()) if SNAP.exists() else {}
+    answered = answered_refs()
     for line in owner_items(state, snap):
-        print(f"WAITING ON OWNER: {line}")
+        print(f"{'ANSWERED, applying' if owner_ref(line) in answered else 'WAITING ON OWNER'}: {line}")
     for k in state.get("orphans", []):
         print(f"LIVENESS (no next step): {k}")
     if state.get("quarantine"):

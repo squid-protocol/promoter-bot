@@ -2334,14 +2334,38 @@ def test_gate_alerts_disk_red_and_owner_waits_past_twelve_hours(churn, monkeypat
     st = {"queue": [item(7, needs_owner=True)], "prs": []}
     monkeypatch.setattr(churn, "owner_holds", lambda s, snap: [])
     churn.gate_alerts(st, {"reasons": ["disk almost full, /: 20 GB free of 1900 GB (1%)"]}, {})
-    assert pages == ["disk-red"]
+    assert pages == ["disk-red", "owner-new:queue #7"]  # #29: pinged as soon as it appears
+    churn.gate_alerts(st, {"reasons": []}, {})
+    assert pages == ["disk-red", "owner-new:queue #7"]  # nothing more until the reminder
     cfg = churn.notify_cfg()
     cfg["owner_seen"]["queue #7"] = churn.iso(churn.now() - churn.dt.timedelta(hours=13))
     churn.NOTIFY.write_text(json.dumps(cfg))
     churn.gate_alerts(st, {"reasons": []}, {})
-    assert pages == ["disk-red", "owner:queue #7"]
+    assert pages == ["disk-red", "owner-new:queue #7", "owner:queue #7"]
     churn.gate_alerts({"queue": [], "prs": []}, {"reasons": []}, {})  # answered: forgotten
     assert churn.notify_cfg()["owner_seen"] == {}
+
+
+def test_owner_ping_carries_the_question_and_an_answered_item_stays_quiet(churn, monkeypatch, capsys):
+    _topic(churn)
+    sent = []
+    monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: sent.append((key, msg)) or True)
+    monkeypatch.setattr(churn, "owner_holds", lambda s, snap: [])
+    (churn.H / "owner-questions").mkdir()
+    (churn.H / "owner-questions" / "q.md").write_text(
+        "## Owner question\nItem: queue #7\nQuestion: Count lambdas as functions?\nContext: c\n"
+        "yes: Count them -- I will ...\nno: Do not count -- I will ...\nhold: Wait -- I leave it\n")
+    st = {"queue": [item(7, needs_owner=True), item(8, needs_owner=True)], "prs": []}
+    (churn.H / "owner-answers.jsonl").write_text(json.dumps({"id": "o1", "item": "queue #8: x", "applied": False}) + "\n")
+    churn.gate_alerts(st, {"reasons": []}, {})
+    assert sent == [("owner-new:queue #7", "Count lambdas as functions?\nyes: Count them\nno: Do not count\nhold: Wait")]
+    cfg = churn.notify_cfg()
+    cfg["owner_seen"]["queue #8"] = churn.iso(churn.now() - churn.dt.timedelta(hours=13))
+    churn.NOTIFY.write_text(json.dumps(cfg))
+    churn.gate_alerts(st, {"reasons": []}, {})
+    assert [k for k, _ in sent] == ["owner-new:queue #7"]  # #28: answered, so no reminder either
+    assert churn.owner_ref("PR #12 on hold: x") == ("PR", "12") and churn.owner_ref("stalled: review #3@a") == ("stalled", "review")
+    assert churn.owner_ref("none") is None
 
 
 def test_watchdog_flags_a_stale_gate_a_dead_timer_and_gh_auth_but_not_a_stop(churn):
