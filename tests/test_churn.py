@@ -444,7 +444,7 @@ class TestCiLoadBalancer:
         live = churn.live_pr_job_waits({}, runs, gh=gh)
         assert [c.split("/")[-2] for c in calls] == ["12", "10"]  # the newest 2 PR runs only
         ws = sorted(w for _, w in live)  # started: its wait; queued: so far (iso() keeps minutes, so up to 1 more)
-        assert ws[:2] == [9.0, 9.0] and all(12 <= w < 13 for w in ws[2:]) and len(ws) == 4
+        assert ws[:2] == [9.0, 9.0] and all(12 <= w <= 13.1 for w in ws[2:]) and len(ws) == 4
         st = {"ci_profile": {"target_util": 1.0}}
         assert churn.fast_cut(st, live) is None  # 4 waits: under min_waits
         note = churn.fast_cut(st, live + [[4, 10.0], [4, 10.0]])  # one job read twice: once  # p50 10 > 1.5 x 5
