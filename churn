@@ -847,6 +847,12 @@ def live_opus_count(state: dict) -> int:
                and r.get("lane") != "credit" and r.get("model") == "opus" and pid_alive(r.get("pid")))
 
 
+def ci_priced(state: dict, x: dict) -> bool:
+    """A new normal-lane item whose PR runs on this repo's CI: what CI admission meters (#38)."""
+    return (x.get("lane") in (None, "normal") and not x.get("pr") and not x.get("repo") and x.get("backend") != "agy"
+            and not (x.get("scope") == "core" and core_short(state)))
+
+
 def budget_picks(state: dict, snap: dict | None, mode: str, n: int, plan: dict | None) -> list[tuple[int, dict]]:
     """Up to n queue items in pick_item order, taking only what fits: the opus cap always (state.max_opus, or the
     plan's burst cap), and with a rate plan the block's room, spent down pick by pick. An item that doesn't fit steps
@@ -858,11 +864,17 @@ def budget_picks(state: dict, snap: dict | None, mode: str, n: int, plan: dict |
     slot_models = [r.get("model", "sonnet") for r in claude_slot_holders(state)]
     out, taken = [], set()
     running = list(state.get("running", []))
+    # #38 step 3: CI admission's launch count caps the CI-priced picks in one tick (the next tick's admission counts
+    # them as committed). PR fixes, the ci lane, the core reserve and crucible-repo work stay outside it, as under busy.
+    adm = state.get("ci_admission") or {}
+    ci_left = int(adm["admit"]) if "admit" in adm else n
     for _ in range(max(0, n)):
-        def fits(x, room=room, opus=opus, models=tuple(slot_models)):
+        def fits(x, room=room, opus=opus, models=tuple(slot_models), ci_left=ci_left):
             m = x.get("model", "sonnet")
             if x.get("lane") != "backfill" and len(models) + 1 > worker_cap(state, plan, [*models, m]):
                 return False  # backfill takes no Claude slot
+            if ci_left < 1 and ci_priced(state, x):
+                return False
             return (m != "opus" or opus < cap) and (not plan or plan["cost"].get(m, 0.0) <= room)
         q = [(k, x) for k, x in enumerate(queue) if k not in taken and fits(x)]
         if plan and plan["mode"] == "surplus":
@@ -876,6 +888,7 @@ def budget_picks(state: dict, snap: dict | None, mode: str, n: int, plan: dict |
         out.append((k, x))
         m = x.get("model", "sonnet")
         room -= plan["cost"].get(m, 0.0) if plan else 0.0
+        ci_left -= ci_priced(state, x)
         opus += m == "opus"
         if x.get("lane") != "backfill":
             slot_models.append(m)
@@ -2548,10 +2561,13 @@ def bump_attempts(state: dict, keys: list[str]) -> None:
 # has run backfill_drain_max_min; a (re)launch waits until CI has been busy for backfill_min_busy_min.
 # #35 (2026-10-21): 35 of 53 queued runs were one-job, ~1-min shepherd label-event runs (35% of all runs, 1.6-2.2k/day,
 # mostly our own PRs' labels) while 6 ran: they held both hosts busy. ignore_workflows (workflow file names) don't count.
-CI_PRESSURE_DEFAULT = {"busy_queued": 20, "busy_wait_min": 20, "calm_queued": 8, "calm_wait_min": 10, "backfill_max": 1,
-                       "backfill_calm_cores": 3, "busy_count_min_wait": 5, "backfill_cores": 4, "backfill_drain_max_min": 45,
+# #38 step 3 (2026-10-22): busy/calm comes from CI admission now (busy = no room for one normal launch). The queued-run
+# and median-wait thresholds below were retired: overnight 10-21/22 they held work on 95 ticks across both hosts while
+# PR jobs waited ~1 min for a runner, and admission never wanted to hold.
+CI_PRESSURE_DEFAULT = {"backfill_max": 1, "backfill_calm_cores": 3, "backfill_cores": 4, "backfill_drain_max_min": 45,
                        "backfill_min_busy_min": 20, "backfill_idle_ticks": 2,
                        "ignore_workflows": ["shepherd-event.yml", "shepherd-reconcile.yml", "main-watch.yml"]}
+CI_PRESSURE_RETIRED = ("busy_queued", "busy_wait_min", "calm_queued", "calm_wait_min", "busy_count_min_wait")
 
 
 def ci_cfg(state: dict) -> dict:
@@ -3338,24 +3354,29 @@ def ci_queue(gh=None, ignore=()) -> dict:
             **({"unseen": unseen} if unseen > 0 else {}), "by_workflow": dict(by_wf)}
 
 
-def ci_mode(state: dict, q: dict) -> tuple[str, str]:
-    """calm / busy with hysteresis; an API error keeps the previous mode."""
-    cfg = {**CI_PRESSURE_DEFAULT, **state.get("ci_pressure", {})}
+def ci_mode(state: dict, q: dict, adm: dict | None = None) -> tuple[str, str]:
+    """busy when CI admission has no room for one normal launch (`adm`, else state's ci_admission), calm otherwise.
+    An unreadable queue, or no admission reading yet, keeps the previous mode."""
     prev = state.get("ci_mode", "calm")
     if "error" in q:
         return prev, f"CI queue unknown ({q['error']}); stays {prev}"
-    n, w = q["queued"], q["median_wait_min"]
-    # 2026-10-14 13:05Z: one push fans out ~20 workflows at once (21 queued, median wait 0.2 min): a burst, not a jam.
-    # A high count only means busy when those runs are also waiting.
-    if (n >= cfg["busy_queued"] and w >= cfg["busy_count_min_wait"]) or w >= cfg["busy_wait_min"]:
-        mode = "busy"
-    elif n <= cfg["calm_queued"] and w < cfg["calm_wait_min"]:
-        mode = "calm"
-    else:
-        mode = prev
+    adm = adm if adm is not None else state.get("ci_admission")
+    if not adm or "admit" not in adm:
+        return prev, f"no CI admission reading yet; stays {prev}"
+    mode = "busy" if int(adm["admit"]) < 1 else "calm"
     extra = ", ".join(f"{q[k]} {label}" for k, label in (("ignored", "lightweight ignored"), ("unseen", "past the pages read"))
                       if q.get(k))
-    return mode, f"CI {mode}: {n} runs queued{f' ({extra})' if extra else ''}, median wait {w} min"
+    return mode, (f"CI {mode}: admission room {adm.get('room_rm')} runner-min, {adm['admit']} launch(es) at "
+                  f"{adm.get('per_launch_rm')} each, target_util {adm.get('target_util')}; {q.get('queued')} runs queued"
+                  + (f" ({extra})" if extra else ""))
+
+
+def retire_ci_pressure(state: dict) -> list[str]:
+    """#38 step 3: drop busy/calm threshold overrides from state.ci_pressure (they decide nothing now), loudly."""
+    cp = state.get("ci_pressure") or {}
+    gone = {k: cp.pop(k) for k in CI_PRESSURE_RETIRED if k in cp}
+    return ["ci_pressure: retired busy/calm override(s) removed, admission decides now (#38): "
+            + ", ".join(f"{k}={v}" for k, v in gone.items())] if gone else []
 
 
 # #38 step 1 (shadow): measure CI load in runner-minutes against the pool instead of counting runs. The busy/calm counts
@@ -3475,8 +3496,12 @@ def per_push_cost(runs: list[dict], prof: dict, cfg: dict) -> float | None:
 # #38 step 2 (shadow): admission instead of a busy/calm switch. Each launch is priced at its expected CI cost and
 # admitted while the pool has room under target_util; target_util follows the outcome (PR job queue wait) by AIMD, so
 # nothing here is a hand-set congestion threshold. pushes_per_pr is a setting until PR history is measured (step 3).
+# #38 step 3: the hourly AIMD alone let a 22:20Z-23:20Z overrun (p50 5.28 min) stand for an hour while admission still
+# admitted 2-5. Every tick now reads the job waits of the newest live PR runs (live_runs API calls); their p50 over
+# fast_factor x target cuts target_util at once, at most every fast_every_min.
 CI_ADMISSION_DEFAULT = {"target_wait_min": 5.0, "util_init": 0.8, "util_min": 0.3, "util_max": 1.0, "util_step": 0.05,
-                        "util_cut": 0.8, "pushes_per_pr": 2.0, "horizon_min": 60, "min_waits": 5}
+                        "util_cut": 0.8, "pushes_per_pr": 2.0, "horizon_min": 60, "min_waits": 5,
+                        "live_runs": 2, "fast_factor": 1.5, "fast_window_min": 30, "fast_every_min": 20}
 
 
 def ci_admission_cfg(state: dict) -> dict:
@@ -3509,6 +3534,49 @@ def adjust_target_util(state: dict) -> str | None:
     prof["target_util"] = round(new, 3)
     return f"ci admission: PR job wait p50 {p50} min vs target {target}: target_util {u:.2f} -> {new:.2f}" \
         if round(new, 3) != round(u, 3) else None
+
+
+def live_pr_job_waits(state: dict, in_progress: list[dict] | None, gh=None) -> list[list]:
+    """[job id, wait min] for the jobs of the newest live_runs pull_request runs in progress: a started job's queue
+    wait, or a queued job's wait so far (a lower bound). One API call per run read."""
+    n = int(ci_admission_cfg(state)["live_runs"])
+    runs = sorted((r for r in in_progress or [] if r.get("event") == "pull_request" and r.get("id")),
+                  key=lambda r: str(r.get("created_at") or ""), reverse=True)[:n]
+    out = []
+    for r in runs:
+        try:
+            jobs = (gh or gh_json)(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100").get("jobs", [])
+        except RuntimeError:
+            continue
+        for j in jobs:
+            if j.get("conclusion") == "skipped" or not (c := parse_iso(j.get("created_at"))):
+                continue
+            s = None if j.get("status") == "queued" else parse_iso(j.get("started_at"))
+            out.append([j.get("id"), round(max(0.0, ((s or now()) - c).total_seconds() / 60), 2)])
+    return out
+
+
+def fast_cut(state: dict, live: list[list]) -> str | None:
+    """Fold this tick's live job waits into ci_profile.live_waits (by job id, fast_window_min kept) and cut target_util
+    (x util_cut) when their p50 is over fast_factor x target_wait_min; at most every fast_every_min."""
+    cfg = ci_admission_cfg(state)
+    prof = state.setdefault("ci_profile", {"workflows": {}, "waits": []})
+    keep = now() - dt.timedelta(minutes=float(cfg["fast_window_min"]))
+    seen = {str(x[0]): x for x in prof.get("live_waits", []) if (t := parse_iso(x[1])) and t >= keep}
+    for jid, w in live:
+        seen[str(jid)] = [jid, iso(now()), w]
+    prof["live_waits"] = list(seen.values())[-300:]
+    waits = sorted(x[2] for x in prof["live_waits"])
+    if len(waits) < int(cfg["min_waits"]):
+        return None
+    p50, limit = waits[len(waits) // 2], float(cfg["fast_factor"]) * float(cfg["target_wait_min"])
+    last = parse_iso(prof.get("fast_cut_at"))
+    if p50 <= limit or (last and now() - last < dt.timedelta(minutes=float(cfg["fast_every_min"]))):
+        return None
+    u = float(prof.get("target_util", cfg["util_init"]))
+    new = max(float(cfg["util_min"]), u * float(cfg["util_cut"]))
+    prof["target_util"], prof["fast_cut_at"] = round(new, 3), iso(now())
+    return f"ci admission: live PR job wait p50 {p50} min over {limit:g}: target_util {u:.2f} -> {new:.2f} (fast cut)"
 
 
 def ci_admission(state: dict, backlog: dict) -> dict:
@@ -3622,12 +3690,11 @@ def ci_snapshot_summary(hours: float = 24, path: Path | None = None) -> str:
     idle_busy = sum(r.get("mode") == "busy" and not r.get("running") for r in rows)
     out = (f"CI last {hours:g} h: busy {100 * busy // len(rows)}% of {len(rows)} ticks ({idle_busy} with 0 running); "
            f"median queued {mid('queued')}, median wait {mid('median_wait_min')} min")
-    # #38 step 2: where the shadow admission disagrees with busy/calm -- the evidence for switching over (step 3)
-    if adm := [r for r in rows if "admit" in r]:
-        held = sum(r.get("mode") == "busy" and r["admit"] >= 1 for r in adm)
-        over = sum(r.get("mode") != "busy" and r["admit"] < 1 for r in adm)
-        out += (f"; admission (shadow) over {len(adm)} ticks: busy held while it would admit {held}, calm while it "
-                f"would hold {over}")
+    # #38 step 3: admission decides; a hold is earned when PR jobs really waited over the target at the time
+    if held := [r for r in rows if "admit" in r and r["admit"] < 1]:
+        tw = float(CI_ADMISSION_DEFAULT["target_wait_min"])
+        over = sum((r.get("job_wait_p50") or 0) > tw for r in held)
+        out += f"; admission held {len(held)} ticks, {over} of them with PR job wait p50 over {tw:g} min"
     return out
 
 
@@ -3844,13 +3911,16 @@ def idle_causes(state: dict, snap: dict | None, mode: str) -> str:
         elif x.get("lane") == "backfill" and mode != "busy":
             c["backfill-calm"] += 1
         elif x.get("lane") in (None, "normal") and not x.get("pr") and mode == "busy":
-            c["ci-busy"] += 1
+            c["ci-admission"] += 1
         else:
             c["other"] += 1  # launchable by its own rule (a pace or plan hold, or a backfill already running)
     if not c:
         return "idle: empty"
+    room = (state.get("ci_admission") or {}).get("room_rm")
     return "idle: " + ", ".join(f"{k} {v}" + (" (" + " ".join(f"#{n}x{m}" for n, m in blockers.most_common(3)) + ")"
-                                               if k == "blocked" else "") for k, v in c.most_common())
+                                               if k == "blocked" else f" (room {room} runner-min)"
+                                               if k == "ci-admission" and room is not None else "")
+                                for k, v in c.most_common())
 
 
 def gate(state: dict, b: dict, force: list[str], needs: dict[str, str] | None = None,
@@ -5264,14 +5334,20 @@ def cmd_tick(a) -> int:
                     *(os.path.basename(str(r.get("path", ""))) for r in inprog or [])]
             for note in ci_profile_sample(state, ignore=ign, want=want):  # GitHub calls outside the state lock
                 log(note, quiet=True)
+            live_waits = live_pr_job_waits(state, inprog)
             with edit_state() as st:
+                for note in retire_ci_pressure(st):
+                    log(note)
                 st["ci_profile"] = state.get("ci_profile") or st.get("ci_profile")
-                st["ci_backlog"] = {**ci_backlog(st, cq, inprog), "t": iso(now())}  # #38 shadow: logged, decides nothing
-                st["ci_admission"] = {**ci_admission(st, st["ci_backlog"]), "t": iso(now())}
+                if note := fast_cut(st, live_waits):
+                    log(note)
+                st["ci_backlog"] = {**ci_backlog(st, cq, inprog), "t": iso(now())}
+                st["ci_admission"] = {**ci_admission(st, st["ci_backlog"]), "t": iso(now())}  # #38: decides the mode
                 mode, why = ci_mode(st, cq)
                 if mode != st.get("ci_mode", "calm"):
                     log(f"CI mode {st.get('ci_mode', 'calm')} -> {mode} ({why}); "
-                        + ("normal work holds, backfill may run" if mode == "busy" else "normal churn resumes"))
+                        + ("no admission room: normal work holds, backfill may run" if mode == "busy"
+                           else "normal churn resumes"))
                     st["ci_mode_since"] = iso(now())
                 st["ci_mode"], st["ci_queue"] = mode, {**cq, "t": iso(now())}
                 throttled = yield_backfill(st, snap, b, mode=mode)  # backfill stops only for waiting work, not on calm
@@ -5887,18 +5963,21 @@ def cmd_status(a) -> int:
     print(f"weekly retro: {retro_due(state)[1]}")
     usage = state.get("usage", {})
     cq = state.get("ci_queue", {})
-    print(f"CI mode: {state.get('ci_mode', 'calm')} ({cq.get('queued', '?')} runs queued, median wait "
+    print(f"CI mode: {state.get('ci_mode', 'calm')} from admission ({cq.get('queued', '?')} runs queued, median wait "
           f"{cq.get('median_wait_min', '?')} min at {cq.get('t', '?')}); backfill: busy, or calm with idle slots")
     print(ci_snapshot_summary())
     if bl := state.get("ci_backlog"):
         wfs = (state.get("ci_profile") or {}).get("workflows") or {}
-        print(f"CI backlog (#38 shadow): {bl.get('backlog_min')} min to drain on {bl.get('pool')} runners "
+        print(f"CI backlog: {bl.get('backlog_min')} min to drain on {bl.get('pool')} runners "
               f"({bl.get('queued_rm')} queued + {bl.get('active_rm')} in-progress runner-min); PR job wait p50 "
               f"{bl.get('job_wait_p50')} min (n={bl.get('job_wait_n')}); {len(wfs)} workflows profiled")
     if ad := state.get("ci_admission"):
-        print(f"CI admission (#38 shadow): would admit {ad.get('admit')} launch(es) now: room {ad.get('room_rm')} "
+        lw = sorted(x[2] for x in (state.get("ci_profile") or {}).get("live_waits", []))
+        print(f"CI admission: admits {ad.get('admit')} launch(es) now: room {ad.get('room_rm')} "
               f"runner-min at target_util {ad.get('target_util')}, {ad.get('per_launch_rm')} per launch, "
-              f"{ad.get('committed_rm')} committed by live workers; busy/calm still decides ({state.get('ci_mode', 'calm')})")
+              f"{ad.get('committed_rm')} committed by live workers; live PR job wait p50 "
+              f"{lw[len(lw) // 2] if lw else '?'} min (n={len(lw)}); last fast cut "
+              f"{(state.get('ci_profile') or {}).get('fast_cut_at') or 'never'}")
     print(f"window ${window_usd(state):.2f} / {WINDOW_H}h; learned budget ${usage.get('learned_budget_usd')}; last model tick {state.get('last_model_tick')}")
     print(f"pace: {usage.get('pace') or 'ledger'}; max_workers {state.get('max_workers', 2)}, max_opus {state.get('max_opus', 1)}")
     sy = state.get("sync") or {}
