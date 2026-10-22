@@ -1125,11 +1125,16 @@ def self_sync(sync: dict, live: int, src: Path | None = None, force: bool = Fals
     try:
         if git("worktree", "add", "-q", "--detach", str(tmp / "t"), target).returncode:
             return None
-        try:
-            r = run(test_cmd or [SELFSCAN_PY, "-m", "pytest", "-q", "-x", "tests"], cwd=str(tmp / "t"),
-                    timeout=SYNC_TEST_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            r = subprocess.CompletedProcess([], 1, "", "tests timed out")
+        # A second run before pinning main as failed (nyx 2026-10-22: one flaky test at 10:31Z held the host 4
+        # commits behind all day, since a failed target is never retested).
+        for _ in range(2):
+            try:
+                r = run(test_cmd or [SELFSCAN_PY, "-m", "pytest", "-q", "-x", "tests"], cwd=str(tmp / "t"),
+                        timeout=SYNC_TEST_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                r = subprocess.CompletedProcess([], 1, "", "tests timed out")
+            if not r.returncode:
+                break
     finally:
         git("worktree", "remove", "--force", str(tmp / "t"))
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1138,7 +1143,7 @@ def self_sync(sync: dict, live: int, src: Path | None = None, force: bool = Fals
         tail = " ".join((r.stdout + r.stderr).split())[-300:]
         notify(f"sync-tests-{target[:8]}", "promoter-bot: main fails its tests here",
                f"Not updating {head[:8]} -> {target[:8]}: {tail}", priority="high", cooldown_h=24)
-        return f"sync: origin/main {target[:8]} fails its tests here; staying on {head[:8]}"
+        return f"sync: origin/main {target[:8]} fails its tests here (twice); staying on {head[:8]}: {tail}"
     if git("merge", "-q", "--ff-only", target).returncode:
         return f"sync: fast-forward to {target[:8]} failed; staying on {head[:8]}"
     note = f"sync: promoter-bot {head[:8]} -> {target[:8]} ({behind} commit(s))"
