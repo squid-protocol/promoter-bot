@@ -2226,6 +2226,59 @@ def test_gc_runs_every_six_hours_and_not_on_red(churn, monkeypatch):
     assert churn.gc_worktrees_if_due({"verdict": "GREEN"}) == [] and len(calls) == 1  # within every_h
 
 
+def test_disk_pressure_runs_the_gc_hourly_with_a_short_grace_even_on_red(churn, monkeypatch):  # #31
+    monkeypatch.setitem(churn.WT_GC_DEFAULT, "enabled", True)
+    calls = []
+    monkeypatch.setattr(churn, "gc_worktrees", lambda st, **kw: calls.append(kw) or ["removed 1"])
+    yellow = {"verdict": "YELLOW", "reasons": ["disk filling, /: 42 GB free of 491 GB (8%)"]}
+    assert churn.gc_worktrees_if_due({"verdict": "GREEN"}) == ["removed 1"] and calls == [{}]
+    assert churn.gc_worktrees_if_due(yellow) == []  # within disk_every_h (1 h)
+    with churn.edit_state() as st:
+        st["worktree_gc_at"] = churn.iso(churn.now() - churn.dt.timedelta(hours=2))  # < every_h 6, > disk_every_h 1
+    assert churn.gc_worktrees_if_due(yellow) == ["removed 1"] and calls[-1] == {"limit": 100, "grace_h": 1}
+    with churn.edit_state() as st:
+        st["worktree_gc_at"] = churn.iso(churn.now() - churn.dt.timedelta(hours=2))
+    assert churn.gc_worktrees_if_due({"verdict": "RED", "reasons": ["load1 9 >= 6 cores"]}) == []  # RED, not disk
+    assert churn.gc_worktrees_if_due({"verdict": "RED", "reasons": ["disk almost full, /: 9 GB free"]}) == ["removed 1"]
+
+
+def test_gc_takes_an_idle_worker_tree_that_never_had_a_pr(churn, tmp_path, monkeypatch):  # #31
+    monkeypatch.setattr(churn, "WT", tmp_path)
+    old, fresh = churn.now() - churn.dt.timedelta(hours=3), churn.now()
+    trees = [(str(tmp_path / "nopr-old"), "churn/5623-20261020T0736Z"), (str(tmp_path / "nopr-live"), "churn/7-x"),
+             (str(tmp_path / "has-open-pr"), "churn/8-x"), (str(tmp_path / "hand"), "feature/mine"),
+             (str(tmp_path / "busy"), "churn/9-x")]
+    _run(churn, "9-x", worktree=str(tmp_path / "busy"))
+    st = {"running": [{"run_id": "9-x", "pid": 1}], "queue": [], "reports_pending": []}
+    seen = {str(tmp_path / "nopr-live"): fresh}
+    notes = churn.gc_worktrees(st, dry_run=True, grace_h=1, worktrees=trees, closed={}, pr_heads={"churn/8-x"},
+                               activity=lambda p: seen.get(p, old))
+    assert notes == [f"would remove nopr-old (churn/5623-20261020T0736Z, no PR, idle since {churn.iso(old)})"]
+    assert not [n for n in churn.gc_worktrees(st, dry_run=True, grace_h=1, worktrees=trees, closed={},
+                                               activity=lambda p: old) if "would remove" in n]  # no PR list: skipped
+
+
+def test_a_box_held_two_hours_with_work_queued_and_nothing_running_pages_once(churn, monkeypatch):  # #31
+    sent = []
+    monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: sent.append(key) or True)
+    put(churn, queue=[item(1)], running=[])
+    yellow = {"verdict": "YELLOW", "reasons": ["disk filling, /: 42 GB free of 491 GB (8%)"]}
+    churn.note_box(churn.load_state(), yellow)
+    assert sent == []  # just turned YELLOW
+    with churn.edit_state() as st:
+        st["box_streak"]["since"] = churn.iso(churn.now() - churn.dt.timedelta(hours=3))
+    churn.note_box(churn.load_state(), yellow)
+    assert len(sent) == 1 and sent[0].startswith("box-held-YELLOW-")
+    _run(churn, "2-x", issue=2, worktree="/x")
+    with churn.edit_state() as st:
+        st["running"] = [{"run_id": "2-x", "pid": 1, "issue": 2, "agent": "churn"}]
+    sent.clear()
+    churn.note_box(churn.load_state(), yellow)  # a worker is running: the box is busy, not stuck
+    assert sent == []
+    churn.note_box(churn.load_state(), {"verdict": "GREEN", "reasons": []})
+    assert "since" in churn.load_state()["box_streak"] and churn.load_state()["box_streak"]["verdict"] == "GREEN"
+
+
 def test_closed_branches_drops_a_branch_with_an_open_pr(churn, monkeypatch):
     out = json.dumps([{"headRefName": "a", "state": "MERGED", "closedAt": "2026-10-10T00:00:00Z"},
                       {"headRefName": "b", "state": "CLOSED", "closedAt": "2026-10-10T00:00:00Z"},
