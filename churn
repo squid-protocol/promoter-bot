@@ -3031,8 +3031,10 @@ def owner_question(ref: tuple[str, str] | None) -> str | None:
 
 
 def gate_alerts(state: dict, b: dict, snap: dict) -> None:
-    """Disk RED from box_status, and the owner's items: one ping when an item first appears (#29: a hold sat 12 h
-    unseen on 2026-10-20), one high-priority reminder after OWNER_WAIT_H, nothing for an answered one (#28)."""
+    """Disk RED from box_status, and the owner's items: one ping when an item first appears on a host with
+    host.owner_pings (#29: a hold sat 12 h unseen on nyx 2026-10-20; melek's comms-bot already pushes each owner call
+    with answer buttons, so it leaves this off), one high-priority reminder after OWNER_WAIT_H, nothing for an answered
+    one (#28)."""
     disk = [r for r in b.get("reasons", []) if r.startswith("disk almost full") or r.startswith("inodes almost gone")]
     if disk:
         notify("disk-red", "churn: disk almost full", "; ".join(disk) + "\nThe gate launches nothing while RED.",
@@ -3047,7 +3049,7 @@ def gate_alerts(state: dict, b: dict, snap: dict) -> None:
         keep[k] = seen.get(k) or iso(now())
         if owner_ref(item) in answered:
             continue
-        if k not in seen:
+        if k not in seen and HOST.get("owner_pings"):  # off where comms-bot already pushes owner calls (melek)
             notify(f"owner-new:{k}", f"churn: {k} needs you", owner_question(owner_ref(item)) or item,
                    cooldown_h=24 * 365, tags="raising_hand")
         elif now() - parse_iso(keep[k]) >= dt.timedelta(hours=OWNER_WAIT_H):

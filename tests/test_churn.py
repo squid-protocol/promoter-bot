@@ -2333,6 +2333,7 @@ def test_gate_alerts_disk_red_and_owner_waits_past_twelve_hours(churn, monkeypat
     monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: pages.append(key) or True)
     st = {"queue": [item(7, needs_owner=True)], "prs": []}
     monkeypatch.setattr(churn, "owner_holds", lambda s, snap: [])
+    monkeypatch.setattr(churn, "HOST", {"owner_pings": True})
     churn.gate_alerts(st, {"reasons": ["disk almost full, /: 20 GB free of 1900 GB (1%)"]}, {})
     assert pages == ["disk-red", "owner-new:queue #7"]  # #29: pinged as soon as it appears
     churn.gate_alerts(st, {"reasons": []}, {})
@@ -2351,6 +2352,9 @@ def test_owner_ping_carries_the_question_and_an_answered_item_stays_quiet(churn,
     sent = []
     monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: sent.append((key, msg)) or True)
     monkeypatch.setattr(churn, "owner_holds", lambda s, snap: [])
+    churn.gate_alerts({"queue": [item(6, needs_owner=True)], "prs": []}, {"reasons": []}, {})
+    assert sent == []  # no host.owner_pings (melek: comms-bot pushes the call): only the 12 h reminder
+    monkeypatch.setattr(churn, "HOST", {"owner_pings": True})
     (churn.H / "owner-questions").mkdir()
     (churn.H / "owner-questions" / "q.md").write_text(
         "## Owner question\nItem: queue #7\nQuestion: Count lambdas as functions?\nContext: c\n"
