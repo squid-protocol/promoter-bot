@@ -551,7 +551,7 @@ class TestCiLoadBalancer:
                 raise RuntimeError("rate limited")
             return {"total_count": 450, "workflow_runs": pages[1]}
         q = churn.ci_queue(gh=flaky)  # a later page failing keeps the first page's reading
-        assert q["queued"] == 450 and q["unseen"] == 350 and q["median_wait_min"] < 3
+        assert q["queued"] == 450 and q["unseen"] == 350 and q["median_wait_min"] <= 3  # iso() drops seconds: 2-3 min
 
     def test_lane_is_validated_and_copied_to_the_running_entry(self, churn):
         st = {"queue": [item(1, lane="fast")]}
@@ -3292,6 +3292,16 @@ def test_sync_stays_put_when_main_fails_its_tests(churn, tmp_path):
     note = churn.self_sync(sync, 0, src=install, force=True, test_cmd=["false"], units=False)
     assert "fails its tests" in note and sync["failed"] == target and git(install, "rev-parse", "HEAD") == head
     assert churn.self_sync(sync, 0, src=install, force=True, test_cmd=["true"], units=False) is None  # not retested
+
+
+def test_sync_runs_the_tests_twice_before_pinning_main_as_failed(churn, tmp_path):
+    _, seed, install, git = _sync_repos(tmp_path)
+    target = _land_on_main(seed, git)
+    flag = tmp_path / "ran-once"
+    sync = {}
+    note = churn.self_sync(sync, 0, src=install, force=True, units=False,
+                           test_cmd=["sh", "-c", f"test -f {flag} || {{ touch {flag}; exit 1; }}"])
+    assert note.startswith("sync: promoter-bot") and "failed" not in sync and git(install, "rev-parse", "HEAD") == target
 
 
 def test_sync_never_touches_a_dirty_or_diverged_install(churn, tmp_path):
