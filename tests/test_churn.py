@@ -3045,6 +3045,18 @@ def test_host_capabilities_and_excluded_milestones(churn, monkeypatch):
     assert churn.host_skips(gh_issue(4, [f"lane:{churn.HOST_ID}", "needs:db2"])) == "needs db2"  # routing can't add a box
 
 
+def test_preferred_milestones_and_lane_go_first_in_refill_but_skip_nothing(churn, monkeypatch):
+    monkeypatch.setattr(churn, "HOST", {"prefer_milestones": ["DOOM"]})
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "batch", 9)
+    issues = [gh_issue(1, ms="Side Quests"), gh_issue(2, ["scope:infra"], ms="DOOM"), gh_issue(3),
+              gh_issue(4, [f"lane:{churn.HOST_ID}"]), gh_issue(5, ms="DOOM")]
+    for i in issues:
+        i["labels"] = [x for x in i["labels"] if x["name"] != "scope:core" or i["number"] != 2]
+    assert all(churn.host_skips(i) is None for i in issues)
+    st = {"queue": [], "running": []}
+    assert [i["number"] for i in churn.refill_candidates(st, issues, set())] == [4, 5, 2, 1, 3]
+
+
 def test_host_roles_limit_the_one_host_jobs(churn, monkeypatch):
     monkeypatch.setattr(churn, "HOST", {"roles": ["retro"]})
     assert churn.host_role("retro") and not churn.host_role("bot_prs") and not churn.host_role("main_red")

@@ -4839,7 +4839,7 @@ def refill_candidates(state: dict, issues: list[dict], in_pr: set[int], callgrap
     def rank(i):
         names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
         sc = next((x[6:] for x in names if x.startswith("scope:")), None)
-        return (goal_rank(state, {"issue": i["number"]}), SCOPE_RANK.get(sc, 1), "bug" not in names,
+        return (goal_rank(state, {"issue": i["number"]}), not host_prefers(i), SCOPE_RANK.get(sc, 1), "bug" not in names,
                 min((PRIO_RANK[n] for n in names if n in PRIO_RANK), default=2), i["number"])
     return sorted(out, key=rank)[:int(cfg["batch"])]
 
@@ -5150,7 +5150,8 @@ def host_skips(i: dict) -> str | None:
     """Why issue `i` (a gh issue dict with labels + milestone) is not this host's work; None if it is.
     A `lane:<host_id>` label routes an issue to that host whatever its milestone. Otherwise an issue must be in one of
     host.milestones or carry one of host.labels (both empty: anything), must not be in host.exclude_milestones, and
-    every `needs:<x>` label it carries must be in host.capabilities (unset: this host can do anything)."""
+    every `needs:<x>` label it carries must be in host.capabilities (unset: this host can do anything).
+    host.prefer_milestones only orders refill (host_prefers), it skips nothing."""
     names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
     ms = str((i.get("milestone") or {}).get("title", ""))
     lanes = {n[5:] for n in names if n.startswith("lane:")}
@@ -5167,6 +5168,14 @@ def host_skips(i: dict) -> str | None:
     if (want_ms or want_labels) and ms not in want_ms and not names & set(want_labels):
         return "outside this host's lanes"
     return None
+
+
+def host_prefers(i: dict) -> bool:
+    """Issue `i` is in one of host.prefer_milestones or routed here by `lane:<host_id>`: refill takes it first. Unlike
+    host.milestones this never skips anything (owner 2026-10-22: nyx sat idle half the day with its two milestones
+    all frontier, claimed or needing docker, while 55 other open issues were fair game)."""
+    names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
+    return f"lane:{HOST_ID}" in names or str((i.get("milestone") or {}).get("title", "")) in (HOST.get("prefer_milestones") or [])
 
 
 def claim(state: dict, n: int, dry_run: bool = False) -> tuple[bool, str, dict | None]:
