@@ -3984,12 +3984,35 @@ def idle_causes(state: dict, snap: dict | None, mode: str) -> str:
                                 for k, v in c.most_common())
 
 
+def unapplied_owner_answers() -> list[dict]:
+    """Owner replies in owner-answers.jsonl the tick has not applied yet. One the tick looked at and could not map stays
+    `applied: false` with an `applied_note` saying why; that one waits for the owner, so it does not wake the model."""
+    try:
+        lines = (H / "owner-answers.jsonl").read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and not e.get("applied") and not e.get("applied_note"):
+            out.append(e)
+    return out
+
+
 def gate(state: dict, b: dict, force: list[str], needs: dict[str, str] | None = None,
          snap: dict | None = None) -> tuple[list[str], str]:
     """needs: {key: reason} from reconcile (review #n@head, followup #n), already filtered by the stall rule."""
     reasons = list(force)
     if needs:
         reasons += list(needs.values())
+    # 2026-10-22: the gate never looked at owner answers, so seven 10-21 rulings sat unapplied for a day while the
+    # ticks it did wake (refill, launch) stayed on their own reason. Step 0b applies them.
+    if answers := unapplied_owner_answers():
+        reasons.append("owner answers to apply (step 0b, owner-answers.jsonl): " + ", ".join(
+            f"{e.get('id', '?')} ({str(e.get('question') or e.get('item') or '')[:60]})" for e in answers))
     pending = [e for e in state.get("reports_pending", []) if not auto_checkable(e)  # agy `done`: the lane launches a checker
                and not precheck_holds(e)]
     if pending:
