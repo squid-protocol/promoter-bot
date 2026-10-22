@@ -391,18 +391,56 @@ def test_owner_holds_do_not_block_launches_and_merge_labels_come_back(churn, mon
 
 # ---------------------------------------------------------------- CI pressure load balancer (owner 2026-10-14)
 class TestCiLoadBalancer:
-    def test_mode_has_hysteresis(self, churn):
-        st = {}
-        assert churn.ci_mode(st, {"queued": 31, "median_wait_min": 24})[0] == "busy"
-        assert churn.ci_mode({}, {"queued": 21, "median_wait_min": 0.2})[0] == "calm"  # a push's burst, not a jam
-        assert churn.ci_mode({}, {"queued": 21, "median_wait_min": 6})[0] == "busy"
-        st["ci_mode"] = "busy"
-        assert churn.ci_mode(st, {"queued": 12, "median_wait_min": 5})[0] == "busy"  # between thresholds: stays
-        assert churn.ci_mode(st, {"queued": 8, "median_wait_min": 9})[0] == "calm"
-        st["ci_mode"] = "calm"
-        assert churn.ci_mode(st, {"queued": 12, "median_wait_min": 5})[0] == "calm"
-        assert churn.ci_mode(st, {"queued": 3, "median_wait_min": 25})[0] == "busy"  # long waits alone count
-        assert churn.ci_mode({"ci_mode": "busy"}, {"error": "gh down"})[0] == "busy"
+    def test_mode_follows_ci_admission(self, churn):
+        # #38 step 3: busy only when admission has no room for one launch, whatever the queued-run count says
+        q = {"queued": 31, "median_wait_min": 24}
+        assert churn.ci_mode({}, q, {"admit": 3, "room_rm": 300, "per_launch_rm": 90})[0] == "calm"
+        mode, why = churn.ci_mode({}, {"queued": 3, "median_wait_min": 0.5}, {"admit": 0, "room_rm": -40})
+        assert mode == "busy" and "room -40 runner-min" in why
+        assert churn.ci_mode({"ci_admission": {"admit": 0}}, q)[0] == "busy"  # read from state by default
+        assert churn.ci_mode({"ci_mode": "busy"}, {"error": "gh down"}, {"admit": 5})[0] == "busy"
+        assert churn.ci_mode({"ci_mode": "busy"}, q)[0] == "busy"  # no admission reading yet: stays
+
+    def test_retired_busy_calm_overrides_are_removed_loudly(self, churn):
+        st = {"ci_pressure": {"busy_queued": 40, "backfill_cores": 6}}
+        notes = churn.retire_ci_pressure(st)
+        assert st["ci_pressure"] == {"backfill_cores": 6} and "busy_queued=40" in notes[0]
+        assert churn.retire_ci_pressure(st) == [] and churn.retire_ci_pressure({}) == []
+
+    def test_admission_caps_ci_priced_picks_in_one_tick(self, churn):
+        st = {"max_workers": 4, "running": [], "ci_admission": {"admit": 1},
+              "queue": [item(1), item(2), item(3, pr=33), item(4, lane="ci"), item(5, repo="cics-crucible")]}
+        got = [x["issue"] for _, x in churn.budget_picks(st, {}, "calm", 4, None)]
+        assert got.count(1) + got.count(2) == 1 and {3, 4, 5} <= set(got)  # one normal launch; the rest are unpriced
+        st["ci_admission"] = {"admit": 3}
+        assert {1, 2} <= {x["issue"] for _, x in churn.budget_picks(st, {}, "calm", 5, None)}
+
+    def test_live_pr_job_waits_and_the_fast_cut(self, churn):
+        t0 = churn.now()
+        def ago(m):
+            return churn.iso(t0 - churn.dt.timedelta(minutes=m))
+        calls = []
+        def gh(path):
+            calls.append(path)
+            k = 10 * int(path.split("/")[-2])
+            return {"jobs": [{"id": k + 1, "status": "completed", "created_at": ago(20), "started_at": ago(11)},
+                             {"id": k + 2, "status": "queued", "created_at": ago(12), "started_at": ago(12)},
+                             {"id": k + 3, "conclusion": "skipped", "created_at": ago(9)}]}
+        runs = [{"id": 10, "event": "pull_request", "created_at": ago(30)},
+                {"id": 11, "event": "push", "created_at": ago(5)},
+                {"id": 12, "event": "pull_request", "created_at": ago(25)},
+                {"id": 13, "event": "pull_request", "created_at": ago(40)}]
+        live = churn.live_pr_job_waits({}, runs, gh=gh)
+        assert [c.split("/")[-2] for c in calls] == ["12", "10"]  # the newest 2 PR runs only
+        ws = sorted(w for _, w in live)  # started: its wait; queued: so far (iso() keeps minutes, so up to 1 more)
+        assert ws[:2] == [9.0, 9.0] and all(12 <= w < 13 for w in ws[2:]) and len(ws) == 4
+        st = {"ci_profile": {"target_util": 1.0}}
+        assert churn.fast_cut(st, live) is None  # 4 waits: under min_waits
+        note = churn.fast_cut(st, live + [[4, 10.0], [4, 10.0]])  # one job read twice: once  # p50 10 > 1.5 x 5
+        assert "fast cut" in note and st["ci_profile"]["target_util"] == 0.8
+        assert churn.fast_cut(st, [[5, 30.0]]) is None and st["ci_profile"]["target_util"] == 0.8  # once per 20 min
+        st = {"ci_profile": {"target_util": 1.0}}
+        assert churn.fast_cut(st, [[k, 2.0] for k in range(6)]) is None  # under target: nothing
 
     def test_lane_order_follows_the_mode(self, churn):
         st = {"running": [], "queue": [item(1), item(2, lane="backfill"), item(3, lane="ci"), item(4, pr=44)]}
@@ -479,7 +517,7 @@ class TestCiLoadBalancer:
         q = churn.ci_queue(gh=lambda path: {"total_count": 53, "workflow_runs": runs},
                            ignore=churn.CI_PRESSURE_DEFAULT["ignore_workflows"])
         assert q["queued"] == 18 and q["ignored"] == 35 and 5 <= q["median_wait_min"] <= 7
-        mode, why = churn.ci_mode({"ci_mode": "calm"}, q)
+        mode, why = churn.ci_mode({"ci_mode": "calm"}, q, {"admit": 2})
         assert mode == "calm" and "18 runs queued (35 lightweight ignored)" in why
         assert churn.ci_queue(gh=lambda path: {"total_count": 53, "workflow_runs": runs})["queued"] == 53
 
@@ -1375,7 +1413,9 @@ def test_idle_causes_name_why_each_queue_item_could_not_launch(churn):
     out = churn.idle_causes(st, snap, "calm")
     assert out.startswith("idle: blocked 2 (#5204x2)") and "backfill-calm 1" in out and "owner 1" in out
     assert "agy 1" in out and "wait 1" in out
-    assert churn.idle_causes({**st, "queue": [{"issue": 7}]}, snap, "busy") == "idle: ci-busy 1"
+    assert churn.idle_causes({**st, "queue": [{"issue": 7}]}, snap, "busy") == "idle: ci-admission 1"
+    assert churn.idle_causes({**st, "queue": [{"issue": 7}], "ci_admission": {"admit": 0, "room_rm": -40}}, snap,
+                             "busy") == "idle: ci-admission 1 (room -40 runner-min)"
     assert churn.idle_causes({**st, "queue": []}, snap, "calm") == "idle: empty"
 
 
@@ -1528,7 +1568,7 @@ def test_a_run_queued_for_hours_does_not_hold_ci_busy(churn):
     q = churn.ci_queue(lambda path: {"total_count": 3, "workflow_runs": [{"created_at": old}, {"created_at": new},
                                                                           {"created_at": new}]})
     assert q["queued"] == 2 and q["median_wait_min"] < 5 and q["stale"] == 1
-    assert churn.ci_mode({"ci_mode": "busy"}, q)[0] == "calm"
+    assert churn.ci_mode({"ci_mode": "busy"}, q, {"admit": 4})[0] == "calm"
 
 
 def test_every_tick_logs_a_ci_snapshot_and_status_summarizes_them(churn, monkeypatch):
@@ -1670,12 +1710,13 @@ def test_ci_admission_prices_launches_against_room_in_the_pool(churn, monkeypatc
     assert churn.ci_admission({}, {"pool": 20})["per_launch_rm"] == 20  # nothing learned: 2 x default 5 a push, 2 pushes
 
 
-def test_the_ci_summary_counts_where_shadow_admission_disagrees(churn):
-    for mode, admit in (("busy", 3), ("busy", 0), ("calm", 0), ("calm", 2)):
-        churn.log_ci_snapshot({"ci_mode": mode, "ci_admission": {"admit": admit}, "queue": [], "running": []},
+def test_the_ci_summary_counts_admission_holds_and_whether_waits_earned_them(churn):
+    for admit, wait in ((3, 1.0), (0, 7.5), (0, 2.0), (2, 9.0)):
+        churn.log_ci_snapshot({"ci_mode": "busy" if admit < 1 else "calm", "ci_admission": {"admit": admit},
+                               "ci_backlog": {"job_wait_p50": wait}, "queue": [], "running": []},
                               {"queued": 1, "median_wait_min": 1.0})
     s = churn.ci_snapshot_summary()
-    assert "admission (shadow) over 4 ticks: busy held while it would admit 1, calm while it would hold 1" in s
+    assert "busy 50% of 4 ticks" in s and "admission held 2 ticks, 1 of them with PR job wait p50 over 5 min" in s
 
 
 def test_a_refused_precheck_send_back_keeps_the_report(churn, monkeypatch):
