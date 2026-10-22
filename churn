@@ -228,6 +228,11 @@ TIER_RANK = {"era-core": 0, "customer": 1, "score": 2, None: 3, "followup": 4}
 # owner promotes the item (`churn queue promote`), which also gives it core priority. PR fixes, the ci lane and RESUME
 # items are work in flight and are never held by scope.
 SCOPES = ("core", "sweep", "frontier", "infra")
+# Owner 2026-10-22: a promotion is the owner's word on the ISSUE, not on one queue item. It was lost at every launch, so
+# each followup slice of a promoted frontier issue came back held (nyx: #5620 and #5640, three times in a day).
+# state["promoted_issues"] {issue: when} makes every queue item for that issue promoted, for PROMOTE_DAYS after the
+# last promote; `churn queue unpromote --issue N` ends it.
+PROMOTE_DAYS = 30
 SCOPE_RANK = {"core": 0, None: 1, "sweep": 1, "infra": 2, "frontier": 3}
 
 
@@ -399,6 +404,19 @@ def normalize_state(state: dict) -> list[str]:
     except ValueError as e:
         quarantine("max_workers", state.get("max_workers"), str(e))
         state["max_workers"] = 2
+    promo = state.get("promoted_issues", {})
+    if not isinstance(promo, dict):
+        quarantine("promoted_issues", promo, "not an object")
+        promo = {}
+    promo = {str(k): t for k, t in promo.items()
+             if (ts := parse_iso(t)) and now() - ts < dt.timedelta(days=PROMOTE_DAYS)}
+    if promo:
+        state["promoted_issues"] = promo
+        for x in state["queue"]:
+            if str(x.get("issue")) in promo:
+                x["promoted"] = True
+    else:
+        state.pop("promoted_issues", None)
     for key in ("agy", "features", "usage", "credit", "retro", "goal"):
         if not isinstance(state.get(key, {}), dict):
             quarantine(key, state[key], "not an object")
@@ -6135,6 +6153,7 @@ def cmd_queue(a) -> int:
                 item["scope"] = sc
             if getattr(a, "promote", False):
                 item["promoted"] = True
+                state.setdefault("promoted_issues", {})[str(a.issue)] = iso(now())
             at = next((k for k, x in enumerate(q) if x.get("issue") == a.before_issue), None) if a.before_issue else None
             if a.front:
                 q.insert(0, item)
@@ -6209,8 +6228,17 @@ def cmd_queue(a) -> int:
             if a.index is None or not 0 <= a.index < len(q):
                 raise SystemExit("queue promote needs --index N from `churn queue`")
             q[a.index]["promoted"] = True
-            log(f"promoted #{q[a.index]['issue']} (owner): launches with core priority"
+            state.setdefault("promoted_issues", {})[str(q[a.index]["issue"])] = iso(now())
+            log(f"promoted #{q[a.index]['issue']} (owner): launches with core priority, its later slices too"
                 + (f": {a.note[:120]}" if a.note else ""))
+        elif a.action == "unpromote":  # owner: the issue's items go back to their scope (frontier: held)
+            if a.issue is None:
+                raise SystemExit("queue unpromote needs --issue N")
+            (state.get("promoted_issues") or {}).pop(str(a.issue), None)
+            for x in q:
+                if x.get("issue") == a.issue:
+                    x.pop("promoted", None)
+            log(f"unpromoted #{a.issue} (owner)" + (f": {a.note[:120]}" if a.note else ""))
         elif a.action == "top":
             if a.index is None or not 0 <= a.index < len(q):
                 raise SystemExit("queue top needs --index N from `churn queue`")
@@ -6584,7 +6612,8 @@ def main() -> int:
     sub.add_parser("status")
     qp = sub.add_parser("queue", help="list (default) / add / rm / top queue items")
     qp.add_argument("action", nargs="?", default="list", choices=["list", "add", "rm", "top", "route", "park", "lane",
-                                                                                "tier", "retier", "wait", "promote"])
+                                                                                "tier", "retier", "wait", "promote",
+                                                                                "unpromote"])
     qp.add_argument("--run", type=int, help="wait: hold the item until this GitHub Actions run completes")
     qp.add_argument("--minutes", type=int, help="wait: hold the item this long")
     qp.add_argument("--backend", choices=["claude", "agy"], help="agy = run by the agy lane (own quota), Sonnet-checked")
