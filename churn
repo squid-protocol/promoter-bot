@@ -2750,7 +2750,17 @@ def reap_containers(max_age_h: float, docker=None) -> list[str]:
 
 # Owner 2026-10-17: nothing ever removed a worker's worktree -- 607 had piled up, 499 of them on merged/closed PRs, clean.
 # The gate removes those (gitgalaxy worktrees directly under WT) once the PR has been closed grace_h, a few per run.
-WT_GC_DEFAULT = {"enabled": True, "every_h": 6, "grace_h": 48, "limit": 25}
+# #31 (nyx 2026-10-19/20: disk YELLOW held every launch 21 h): under disk pressure the gc runs hourly with a 1 h grace and
+# a higher limit, even on a RED box, and it also takes idle worktrees whose branch never had a PR.
+WT_GC_DEFAULT = {"enabled": True, "every_h": 6, "grace_h": 48, "limit": 25, "disk_every_h": 1, "disk_grace_h": 1,
+                 "disk_limit": 100}
+DISK_REASONS = ("disk almost full", "disk filling", "inodes almost gone", "inodes low")
+NO_PR_BRANCH_RE = re.compile(r"^(?:churn|agy|claude)/\d+-")
+
+
+def disk_pressure(b: dict) -> list[str]:
+    """box_status's disk/inode reasons (YELLOW or RED)."""
+    return [r for r in b.get("reasons", []) if r.startswith(DISK_REASONS)]
 
 
 def wt_gc_cfg(state: dict) -> dict:
@@ -2782,6 +2792,11 @@ def worktrees_in_use(state: dict) -> set[str]:
 
 def closed_branches() -> dict[str, dt.datetime]:
     """branch -> when its last PR closed, for branches whose PRs are all merged or closed (none open)."""
+    return pr_branch_states()[0]
+
+
+def pr_branch_states() -> tuple[dict[str, dt.datetime], set[str]]:
+    """(closed_branches, every branch that ever had a PR), from one gh call."""
     r = run(["gh", "pr", "list", "--repo", REPO, "--state", "all", "--limit", "20000", "--json", "headRefName,state,closedAt"],
             timeout=300)
     if r.returncode:
@@ -2793,35 +2808,54 @@ def closed_branches() -> dict[str, dt.datetime]:
             still_open.add(b)
         elif t and (b not in out or t > out[b]):
             out[b] = t
-    return {b: t for b, t in out.items() if b not in still_open}
+    return {b: t for b, t in out.items() if b not in still_open}, still_open | set(out)
+
+
+def wt_activity(path: str) -> dt.datetime:
+    """When a worktree was last touched: its HEAD commit or the directory itself, whichever is later."""
+    t = Path(path).stat().st_mtime
+    with contextlib.suppress(ValueError):
+        t = max(t, float(run(["git", "-C", path, "log", "-1", "--format=%ct"]).stdout.strip() or 0))
+    return dt.datetime.fromtimestamp(t, dt.timezone.utc)
 
 
 def gc_worktrees(state: dict, dry_run: bool = False, limit: int | None = None, grace_h: float | None = None,
-                 worktrees=None, closed=None, remove=None) -> list[str]:
+                 worktrees=None, closed=None, remove=None, pr_heads=None, activity=None) -> list[str]:
     """Remove finished worktrees: directly under WT (not churn-tools, not `_`-prefixed), not in use, on a branch whose
-    PRs all closed more than grace_h ago. `git worktree remove` without --force refuses a tree with modified or
+    PRs all closed more than grace_h ago, or on a worker branch that never had a PR and was idle grace_h (#31: such a
+    tree was never collected, however old). `git worktree remove` without --force refuses a tree with modified or
     untracked files, so uncommitted work stays; the branch itself is kept."""
     cfg = wt_gc_cfg(state)
     limit = cfg["limit"] if limit is None else limit
     grace_h = cfg["grace_h"] if grace_h is None else grace_h
     cut = now() - dt.timedelta(hours=grace_h)
     worktrees = git_worktrees() if worktrees is None else worktrees
-    closed = closed_branches() if closed is None else closed
+    if closed is None:
+        closed, pr_heads = pr_branch_states()
+    activity = activity or wt_activity
     remove = remove or (lambda path: run(["git", "-C", str(V6), "worktree", "remove", path], timeout=300))
     used = worktrees_in_use(state)
-    picks = sorted((closed[b], path, b) for path, b in worktrees
-                   if b in closed and closed[b] < cut and Path(path).parent == WT and Path(path) != TOOLS
-                   and not Path(path).name.startswith("_") and str(Path(path)) not in used)
+    ours = [(path, b) for path, b in worktrees if Path(path).parent == WT and Path(path) != TOOLS
+            and not Path(path).name.startswith("_") and str(Path(path)) not in used]
+    picks = [(closed[b], path, b) for path, b in ours if b in closed and closed[b] < cut]
+    if pr_heads is not None:  # None: the caller passed no PR list, so no-PR trees can't be told apart
+        for path, b in ours:
+            if b and b not in pr_heads and NO_PR_BRANCH_RE.match(b):
+                with contextlib.suppress(OSError):
+                    if (t := activity(path)) < cut:
+                        picks.append((t, path, b))
+    picks.sort()
     more = [f"{len(picks) - limit} more finished worktree(s) left for the next run"] if len(picks) > limit else []
     if dry_run:
-        return [f"would remove {Path(p).name} ({b}, PR closed {iso(t)})" for t, p, b in picks[:limit]] + more
+        return [f"would remove {Path(p).name} ({b}, " + (f"PR closed {iso(t)})" if b in closed else f"no PR, idle since {iso(t)})")
+                for t, p, b in picks[:limit]] + more
     gone, kept = [], []
     for _, path, _b in picks[:limit]:
         r = remove(path)
         (gone if getattr(r, "returncode", 1) == 0 else kept).append(Path(path).name)
     if gone or kept:
         run(["git", "-C", str(V6), "worktree", "prune"])
-    notes = [f"removed {len(gone)} finished worktree(s) (PR closed > {grace_h:g} h): "
+    notes = [f"removed {len(gone)} finished worktree(s) (PR closed or no PR, idle > {grace_h:g} h): "
              + ", ".join(gone[:8]) + (" ..." if len(gone) > 8 else "")] if gone else []
     if kept:
         notes.append(f"kept {len(kept)} finished worktree(s) with local changes: " + ", ".join(kept[:8]))
@@ -2829,15 +2863,20 @@ def gc_worktrees(state: dict, dry_run: bool = False, limit: int | None = None, g
 
 
 def gc_worktrees_if_due(b: dict) -> list[str]:
-    """Every cfg.every_h, and not on a RED box (removal is disk I/O)."""
+    """Every cfg.every_h, not on a RED box (removal is disk I/O); under disk pressure every disk_every_h with the short
+    disk_grace_h, RED included: freeing the disk is the way out of that RED."""
     state = load_state()
     cfg = wt_gc_cfg(state)
     last = parse_iso(state.get("worktree_gc_at"))
-    if not cfg["enabled"] or b.get("verdict") == "RED" or (last and now() - last < dt.timedelta(hours=cfg["every_h"])):
+    disk = disk_pressure(b)
+    every = cfg["disk_every_h"] if disk else cfg["every_h"]
+    if not cfg["enabled"] or (b.get("verdict") == "RED" and not disk) or (last and now() - last < dt.timedelta(hours=every)):
         return []
     with edit_state() as st:
         st["worktree_gc_at"] = iso(now())
     try:
+        if disk:
+            return gc_worktrees(state, limit=cfg["disk_limit"], grace_h=cfg["disk_grace_h"])
         return gc_worktrees(state)
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
         return [f"worktree gc skipped: {str(e)[:160]}"]
@@ -4646,14 +4685,19 @@ def direct_launches(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
     return did
 
 
+BOX_HELD_ALERT_H = 2  # #31: a box non-GREEN this long with work queued and no worker running pages the owner once
+
+
 def note_box(state: dict, b: dict) -> None:
     """A box that stays non-GREEN blocks every launch: say why in churn-log (not just the quiet log) after two ticks in a
     row, and at once when box_status names a probable stray (#4930: a stray `find /` held it YELLOW for 40 min)."""
     verdict = b.get("verdict")
     with edit_state() as st:
         streak = st.get("box_streak", {})
-        streak = {"verdict": verdict, "ticks": streak.get("ticks", 0) + 1 if streak.get("verdict") == verdict else 1,
-                  "logged": streak.get("logged") if streak.get("verdict") == verdict else False}
+        same = streak.get("verdict") == verdict
+        streak = {"verdict": verdict, "ticks": streak.get("ticks", 0) + 1 if same else 1,
+                  "logged": streak.get("logged") if same else False,
+                  "since": (streak.get("since") if same else None) or iso(now())}
         strays = b.get("strays") or []
         if verdict != "GREEN" and not streak["logged"] and (streak["ticks"] >= 2 or strays):
             why = "; ".join(b.get("reasons", []))[:300]
@@ -4661,10 +4705,17 @@ def note_box(state: dict, b: dict) -> None:
                 + (f" | culprit: {b['culprit']}" if b.get("culprit") else "")
                 + ("" if not strays else " | probable strays: " + ", ".join(f"pid {x['pid']} ({x['age_min']} min) {x['cmd'][:60]}" for x in strays)))
             streak["logged"] = True
+        held = now() - (parse_iso(streak["since"]) or now())
+        page = (verdict != "GREEN" and held >= dt.timedelta(hours=BOX_HELD_ALERT_H) and not claude_slot_holders(st)
+                and launchable(st, None))
         if verdict == "GREEN" and st.get("box_streak", {}).get("logged"):
             log(f"box GREEN again after {st['box_streak'].get('ticks')} {st['box_streak'].get('verdict')} tick(s)")
         st["box_streak"] = streak
         state["box_streak"] = streak
+    if page:  # outside the state lock: a slow ntfy must not hold it
+        notify(f"box-held-{verdict}-{streak['since']}", f"churn: box {verdict} {held.total_seconds() / 3600:.0f} h, nothing running",
+               f"{page} queued item(s) wait. Why: " + "; ".join(b.get("reasons", []))[:600], priority="high",
+               cooldown_h=24, tags="hourglass")
 
 
 TICK_CLI = """NEVER edit churn-state.json yourself (not with Edit/Write, python or jq): change state ONLY with these
