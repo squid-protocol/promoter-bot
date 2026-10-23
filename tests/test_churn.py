@@ -457,6 +457,30 @@ class TestCiLoadBalancer:
         note = churn.fast_cut(st, [], queued_wait=14.4)
         assert "queued runs' median wait 14.4 min over 7.5" in note and st["ci_profile"]["target_util"] == 0.8
 
+    def test_the_fast_climb_raises_target_util_when_live_and_queued_waits_are_calm(self, churn):
+        calm = [[k, 1.0] for k in range(6)]
+        st = {"ci_profile": {"target_util": 0.3}}
+        churn.fast_cut(st, calm)  # folds the live waits; nothing over the limit, no cut
+        note = churn.fast_climb(st, 0.9)
+        assert "fast climb" in note and st["ci_profile"]["target_util"] == 0.35
+        assert churn.fast_climb(st, 0.9) is None  # once per climb_every_min
+        st["ci_profile"]["fast_climb_at"] = churn.iso(churn.now() - churn.dt.timedelta(minutes=21))
+        assert churn.fast_climb(st, 0.9) and st["ci_profile"]["target_util"] == 0.4
+        st["ci_profile"]["fast_climb_at"] = None
+        assert churn.fast_climb(st, 4.0) is None  # queued runs wait 4 min: not calm (60% of 5 = 3)
+        assert churn.fast_climb(st, None) is None  # queue unread: hold
+        st2 = {"ci_profile": {"target_util": 0.3, "live_waits": [[k, churn.iso(churn.now()), 3.5] for k in range(6)]}}
+        assert churn.fast_climb(st2, 0.5) is None  # live PR waits 3.5 min: not calm
+        st3 = {"ci_profile": {"target_util": 0.3, "fast_cut_at": churn.iso(churn.now())}}
+        churn.fast_cut(st3, calm)
+        assert churn.fast_climb(st3, 0.5) is None  # just cut: no climb in the same window
+        st4 = {"ci_profile": {"target_util": 1.0}}
+        churn.fast_cut(st4, calm)
+        assert churn.fast_climb(st4, 0.5) is None  # at util_max
+        st5 = {"ci_profile": {"target_util": 0.3}, "ci_admission_cfg": {"util_step": 0.2}}
+        churn.fast_cut(st5, calm)
+        assert churn.fast_climb(st5, 0.5) and st5["ci_profile"]["target_util"] == 0.5  # `churn config ci.util_step 0.2`
+
     def test_lane_order_follows_the_mode(self, churn):
         st = {"running": [], "queue": [item(1), item(2, lane="backfill"), item(3, lane="ci"), item(4, pr=44)]}
         assert churn.pick_item(st, {}, "calm")[1]["issue"] == 4   # PR fixes first, always

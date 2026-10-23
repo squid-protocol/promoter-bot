@@ -3667,7 +3667,7 @@ def per_push_cost(runs: list[dict], prof: dict, cfg: dict) -> float | None:
 CI_ADMISSION_DEFAULT = {"target_wait_min": 5.0, "util_init": 0.8, "util_min": 0.3, "util_max": 1.0, "util_step": 0.05,
                         "util_cut": 0.8, "pushes_per_pr": 2.0, "horizon_min": 60, "min_waits": 5,
                         "live_runs": 2, "fast_factor": 1.5, "fast_window_min": 30, "fast_every_min": 20,
-                        "hold_queue_wait_min": 10.0}
+                        "hold_queue_wait_min": 10.0, "climb_every_min": 20}
 
 
 def ci_admission_cfg(state: dict) -> dict:
@@ -3746,6 +3746,28 @@ def fast_cut(state: dict, live: list[list], queued_wait: float | None = None) ->
     new = max(float(cfg["util_min"]), u * float(cfg["util_cut"]))
     prof["target_util"], prof["fast_cut_at"] = round(new, 3), iso(now())
     return f"ci admission: {what} {v} min over {limit:g}: target_util {u:.2f} -> {new:.2f} (fast cut)"
+
+
+def fast_climb(state: dict, queued_wait: float | None) -> str | None:
+    """The fast cut's other half (2026-10-23): cuts came every tick but the climb only hourly, on completed-run waits,
+    so the 2026-10-23 storm left target_util at the 0.3 floor for half a day while live waits were 2 min. Raise it by
+    util_step at most every climb_every_min while the live PR job wait p50 (as folded by fast_cut) and the queued runs'
+    median wait are both under 60% of target_wait_min; never within climb_every_min of a cut."""
+    cfg = ci_admission_cfg(state)
+    prof = state.setdefault("ci_profile", {"workflows": {}, "waits": []})
+    u = float(prof.get("target_util", cfg["util_init"]))
+    waits = sorted(x[2] for x in prof.get("live_waits", []))
+    calm = 0.6 * float(cfg["target_wait_min"])
+    if (u >= float(cfg["util_max"]) or queued_wait is None or float(queued_wait) >= calm
+            or len(waits) < int(cfg["min_waits"]) or waits[len(waits) // 2] >= calm):
+        return None
+    every = dt.timedelta(minutes=float(cfg["climb_every_min"]))
+    if any((t := parse_iso(prof.get(k))) and now() - t < every for k in ("fast_cut_at", "fast_climb_at")):
+        return None
+    new = min(float(cfg["util_max"]), u + float(cfg["util_step"]))
+    prof["target_util"], prof["fast_climb_at"] = round(new, 3), iso(now())
+    return (f"ci admission: live PR job wait p50 {waits[len(waits) // 2]} min, queued {queued_wait} min, both under "
+            f"{calm:g}: target_util {u:.2f} -> {new:.2f} (fast climb)")
 
 
 def ci_admission(state: dict, backlog: dict, q: dict | None = None) -> dict:
@@ -5557,7 +5579,8 @@ def cmd_tick(a) -> int:
                 for note in retire_ci_pressure(st):
                     log(note)
                 st["ci_profile"] = state.get("ci_profile") or st.get("ci_profile")
-                if note := fast_cut(st, live_waits, None if "error" in cq else cq.get("median_wait_min")):
+                qw = None if "error" in cq else cq.get("median_wait_min")
+                if note := fast_cut(st, live_waits, qw) or fast_climb(st, qw):
                     log(note)
                 st["ci_backlog"] = {**ci_backlog(st, cq, inprog), "t": iso(now())}
                 st["ci_admission"] = {**ci_admission(st, st["ci_backlog"], cq), "t": iso(now())}  # #38: decides the mode
@@ -6564,6 +6587,7 @@ CONFIG_KEYS = {
     "pace": (("usage", "pace"), _parse_pace),
     "block_start": (("usage", "block_start"), _parse_time),
     **{f"rate.{k}": (("usage", "rate", k), int if isinstance(d, int) else float) for k, d in RATE_DEFAULT.items()},
+    **{f"ci.{k}": (("ci_admission_cfg", k), int if isinstance(d, int) else float) for k, d in CI_ADMISSION_DEFAULT.items()},
 }
 
 
@@ -6658,7 +6682,8 @@ def cmd_config(a) -> int:
             v = state
             for p in path:
                 v = v.get(p) if isinstance(v, dict) else None
-            dflt = RATE_DEFAULT.get(k[5:]) if k.startswith("rate.") else {"max_workers": 2, "max_opus": 1, "pace": "ledger",
+            dflt = RATE_DEFAULT.get(k[5:]) if k.startswith("rate.") else CI_ADMISSION_DEFAULT.get(k[3:]) \
+                if k.startswith("ci.") else {"max_workers": 2, "max_opus": 1, "pace": "ledger",
                                                                                           "core_reserve": CORE_RESERVE}.get(k)
             print(f"{k} = {v if v is not None else dflt}" + (" (default)" if v is None else ""))
         return 0
