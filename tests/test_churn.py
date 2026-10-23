@@ -452,6 +452,10 @@ class TestCiLoadBalancer:
         assert churn.fast_cut(st, [[5, 30.0]]) is None and st["ci_profile"]["target_util"] == 0.8  # once per 20 min
         st = {"ci_profile": {"target_util": 1.0}}
         assert churn.fast_cut(st, [[k, 2.0] for k in range(6)]) is None  # under target: nothing
+        # 2026-10-23: no started job shows a long queue; the queued runs' median wait does, and cuts on its own
+        assert churn.fast_cut(st, [], queued_wait=7.0) is None  # under 1.5 x 5
+        note = churn.fast_cut(st, [], queued_wait=14.4)
+        assert "queued runs' median wait 14.4 min over 7.5" in note and st["ci_profile"]["target_util"] == 0.8
 
     def test_lane_order_follows_the_mode(self, churn):
         st = {"running": [], "queue": [item(1), item(2, lane="backfill"), item(3, lane="ci"), item(4, pr=44)]}
@@ -1747,6 +1751,13 @@ def test_ci_admission_prices_launches_against_room_in_the_pool(churn, monkeypatc
     assert ad == {"target_util": 0.5, "per_launch_rm": 80, "committed_rm": 80, "room_rm": 400, "admit": 5}
     assert churn.ci_admission(st, {"queued_rm": 900, "active_rm": 0, "pool": 20})["admit"] == 0  # no room: holds
     assert churn.ci_admission({}, {"pool": 20})["per_launch_rm"] == 20  # nothing learned: 2 x default 5 a push, 2 pushes
+    # 2026-10-23 storm: room for 5, but the queued runs' median wait is 14.4 min -> held, and ci_mode says why
+    ad = churn.ci_admission(st, {"queued_rm": 100, "active_rm": 20, "pool": 20}, {"queued": 80, "median_wait_min": 14.4})
+    assert ad["admit"] == 0 and ad["room_rm"] == 400 and "14.4 min over 10" in ad["held"]
+    mode, why = churn.ci_mode({}, {"queued": 80, "median_wait_min": 14.4}, ad)
+    assert mode == "busy" and "held (queued runs' median wait 14.4" in why
+    for q in ({"queued": 5, "median_wait_min": 9.9}, {"error": "gh down", "median_wait_min": 30}, None):
+        assert churn.ci_admission(st, {"queued_rm": 100, "active_rm": 20, "pool": 20}, q)["admit"] == 5
 
 
 def test_the_ci_summary_counts_admission_holds_and_whether_waits_earned_them(churn):

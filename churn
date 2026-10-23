@@ -3526,7 +3526,8 @@ def ci_mode(state: dict, q: dict, adm: dict | None = None) -> tuple[str, str]:
     mode = "busy" if int(adm["admit"]) < 1 else "calm"
     extra = ", ".join(f"{q[k]} {label}" for k, label in (("ignored", "lightweight ignored"), ("unseen", "past the pages read"))
                       if q.get(k))
-    return mode, (f"CI {mode}: admission room {adm.get('room_rm')} runner-min, {adm['admit']} launch(es) at "
+    return mode, (f"CI {mode}: " + (f"held ({adm['held']}), " if adm.get("held") else "")
+                  + f"admission room {adm.get('room_rm')} runner-min, {adm['admit']} launch(es) at "
                   f"{adm.get('per_launch_rm')} each, target_util {adm.get('target_util')}; {q.get('queued')} runs queued"
                   + (f" ({extra})" if extra else ""))
 
@@ -3659,9 +3660,14 @@ def per_push_cost(runs: list[dict], prof: dict, cfg: dict) -> float | None:
 # #38 step 3: the hourly AIMD alone let a 22:20Z-23:20Z overrun (p50 5.28 min) stand for an hour while admission still
 # admitted 2-5. Every tick now reads the job waits of the newest live PR runs (live_runs API calls); their p50 over
 # fast_factor x target cuts target_util at once, at most every fast_every_min.
+# 2026-10-23 storm: both wait gauges read jobs that had STARTED (completed runs; the newest 2 live runs), so 01:30Z-02:34Z
+# the queue grew 28 -> 121 runs, the oldest jobs waited 35 min, and the gauges read 1.3 / 5.4 min while admission
+# admitted 4-8 a tick. The queued runs' own median wait (ci_queue) now feeds the fast cut too, and over
+# hold_queue_wait_min it holds admission outright.
 CI_ADMISSION_DEFAULT = {"target_wait_min": 5.0, "util_init": 0.8, "util_min": 0.3, "util_max": 1.0, "util_step": 0.05,
                         "util_cut": 0.8, "pushes_per_pr": 2.0, "horizon_min": 60, "min_waits": 5,
-                        "live_runs": 2, "fast_factor": 1.5, "fast_window_min": 30, "fast_every_min": 20}
+                        "live_runs": 2, "fast_factor": 1.5, "fast_window_min": 30, "fast_every_min": 20,
+                        "hold_queue_wait_min": 10.0}
 
 
 def ci_admission_cfg(state: dict) -> dict:
@@ -3716,9 +3722,10 @@ def live_pr_job_waits(state: dict, in_progress: list[dict] | None, gh=None) -> l
     return out
 
 
-def fast_cut(state: dict, live: list[list]) -> str | None:
+def fast_cut(state: dict, live: list[list], queued_wait: float | None = None) -> str | None:
     """Fold this tick's live job waits into ci_profile.live_waits (by job id, fast_window_min kept) and cut target_util
-    (x util_cut) when their p50 is over fast_factor x target_wait_min; at most every fast_every_min."""
+    (x util_cut) when their p50, or `queued_wait` (the queued runs' median wait, which no started job shows), is over
+    fast_factor x target_wait_min; at most every fast_every_min."""
     cfg = ci_admission_cfg(state)
     prof = state.setdefault("ci_profile", {"workflows": {}, "waits": []})
     keep = now() - dt.timedelta(minutes=float(cfg["fast_window_min"]))
@@ -3727,22 +3734,25 @@ def fast_cut(state: dict, live: list[list]) -> str | None:
         seen[str(jid)] = [jid, iso(now()), w]
     prof["live_waits"] = list(seen.values())[-300:]
     waits = sorted(x[2] for x in prof["live_waits"])
-    if len(waits) < int(cfg["min_waits"]):
-        return None
-    p50, limit = waits[len(waits) // 2], float(cfg["fast_factor"]) * float(cfg["target_wait_min"])
+    limit = float(cfg["fast_factor"]) * float(cfg["target_wait_min"])
+    over = [(v, what) for v, what in ((waits[len(waits) // 2] if len(waits) >= int(cfg["min_waits"]) else None,
+                                       "live PR job wait p50"), (queued_wait, "queued runs' median wait"))
+            if v is not None and float(v) > limit]
     last = parse_iso(prof.get("fast_cut_at"))
-    if p50 <= limit or (last and now() - last < dt.timedelta(minutes=float(cfg["fast_every_min"]))):
+    if not over or (last and now() - last < dt.timedelta(minutes=float(cfg["fast_every_min"]))):
         return None
+    v, what = max(over)
     u = float(prof.get("target_util", cfg["util_init"]))
     new = max(float(cfg["util_min"]), u * float(cfg["util_cut"]))
     prof["target_util"], prof["fast_cut_at"] = round(new, 3), iso(now())
-    return f"ci admission: live PR job wait p50 {p50} min over {limit:g}: target_util {u:.2f} -> {new:.2f} (fast cut)"
+    return f"ci admission: {what} {v} min over {limit:g}: target_util {u:.2f} -> {new:.2f} (fast cut)"
 
 
-def ci_admission(state: dict, backlog: dict) -> dict:
+def ci_admission(state: dict, backlog: dict, q: dict | None = None) -> dict:
     """What admission would allow now: room = target_util x pool x horizon minus the work in hand (backlog) minus what
     live Claude workers will push (one PR's cost each), in runner-minutes; admit = launches that fit at one PR each.
-    Crucible-repo work runs on its own repo's CI and is not priced here."""
+    Held (admit 0) while the queued runs' median wait (`q`, from ci_queue) is over hold_queue_wait_min, whatever the
+    room. Crucible-repo work runs on its own repo's CI and is not priced here."""
     cfg, pcfg = ci_admission_cfg(state), ci_profile_cfg(state)
     prof = state.get("ci_profile") or {}
     u = float(prof.get("target_util", cfg["util_init"]))
@@ -3752,8 +3762,12 @@ def ci_admission(state: dict, backlog: dict) -> dict:
     committed = len(live) * per_launch
     in_hand = float(backlog.get("queued_rm") or 0) + float(backlog.get("active_rm") or 0)
     room = u * int(backlog.get("pool") or pcfg["pool"]) * float(cfg["horizon_min"]) - in_hand - committed
-    return {"target_util": round(u, 3), "per_launch_rm": round(per_launch), "committed_rm": round(committed),
-            "room_rm": round(room), "admit": max(0, int(room // per_launch)) if per_launch > 0 else 0}
+    out = {"target_util": round(u, 3), "per_launch_rm": round(per_launch), "committed_rm": round(committed),
+           "room_rm": round(room), "admit": max(0, int(room // per_launch)) if per_launch > 0 else 0}
+    qw, hold = (q or {}).get("median_wait_min"), float(cfg["hold_queue_wait_min"])
+    if qw is not None and "error" not in (q or {}) and float(qw) > hold:
+        out.update(admit=0, held=f"queued runs' median wait {qw} min over {hold:g}")
+    return out
 
 
 def workflow_cost(prof: dict, wf: str, cfg: dict) -> dict:
@@ -5543,10 +5557,10 @@ def cmd_tick(a) -> int:
                 for note in retire_ci_pressure(st):
                     log(note)
                 st["ci_profile"] = state.get("ci_profile") or st.get("ci_profile")
-                if note := fast_cut(st, live_waits):
+                if note := fast_cut(st, live_waits, None if "error" in cq else cq.get("median_wait_min")):
                     log(note)
                 st["ci_backlog"] = {**ci_backlog(st, cq, inprog), "t": iso(now())}
-                st["ci_admission"] = {**ci_admission(st, st["ci_backlog"]), "t": iso(now())}  # #38: decides the mode
+                st["ci_admission"] = {**ci_admission(st, st["ci_backlog"], cq), "t": iso(now())}  # #38: decides the mode
                 mode, why = ci_mode(st, cq)
                 if mode != st.get("ci_mode", "calm"):
                     log(f"CI mode {st.get('ci_mode', 'calm')} -> {mode} ({why}); "
@@ -6178,7 +6192,8 @@ def cmd_status(a) -> int:
               f"{bl.get('job_wait_p50')} min (n={bl.get('job_wait_n')}); {len(wfs)} workflows profiled")
     if ad := state.get("ci_admission"):
         lw = sorted(x[2] for x in (state.get("ci_profile") or {}).get("live_waits", []))
-        print(f"CI admission: admits {ad.get('admit')} launch(es) now: room {ad.get('room_rm')} "
+        print(f"CI admission: admits {ad.get('admit')} launch(es) now" + (f" (HELD: {ad['held']})" if ad.get("held") else "")
+              + f": room {ad.get('room_rm')} "
               f"runner-min at target_util {ad.get('target_util')}, {ad.get('per_launch_rm')} per launch, "
               f"{ad.get('committed_rm')} committed by live workers; live PR job wait p50 "
               f"{lw[len(lw) // 2] if lw else '?'} min (n={len(lw)}); last fast cut "
