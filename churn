@@ -1560,6 +1560,19 @@ def checklist_note(issue: int) -> str:
               "ticks the box when the PR merges.\n")
 
 
+WORKFLOW_GRANT_HOURS = 24
+
+
+def owner_allows_workflows(state: dict, issue) -> bool:
+    """The owner allowed .github/workflows edits for this issue: a queue item says so, or one did in the last day.
+    The grant outlives the item: on 2026-10-23 the tick's `churn queue rm` ran after a failed launch, the relaunch
+    saw no grant, and the #4726 / #5501 PRs bounced off the precheck all night."""
+    if any(q.get("allow_workflows") for q in state.get("queue", []) if q.get("issue") == issue):
+        return True
+    t = parse_iso((state.get("workflow_grants") or {}).get(str(issue)))
+    return bool(t) and now() - t < dt.timedelta(hours=WORKFLOW_GRANT_HOURS)
+
+
 def cmd_worker(a) -> int:
     stamp = now().strftime("%Y%m%dT%H%MZ")
     resume_of = None
@@ -1613,9 +1626,11 @@ def cmd_worker(a) -> int:
         live = claude_slot_holders(state)
         plan = rate_plan(state)
         cap = worker_cap(state, plan, [r.get("model", "sonnet") for r in live] + [model])
-        allow_wf = ((resume_of or {}).get("allow_workflows") if resume_of else any(
-            q.get("allow_workflows") for q in state.get("queue", []) if q.get("issue") == issue)) or any(
+        allow_wf = ((resume_of or {}).get("allow_workflows") if resume_of else owner_allows_workflows(state, issue)) or any(
             isinstance(p, dict) and p.get("allow_workflows") and p.get("issue") == issue for p in state.get("prs", []))
+        if getattr(a, "allow_workflows", False) and not allow_wf:
+            raise SystemExit(f"--allow-workflows: the owner has not allowed workflow edits for #{issue} (no allow_workflows "
+                             "queue item, recent grant or `churn pr allow-workflows`); the flag only confirms a grant")
         backfill = (getattr(a, "lane", None) or next((q.get("lane") for q in state.get("queue", []) if q.get("issue") == issue
                                                      and not q.get("pr")), None)) == "backfill"
         credit = getattr(a, "lane", None) == "credit"
@@ -4877,6 +4892,8 @@ def model_tick(reasons: list[str], model: str, state: dict, b: dict) -> dict:
         f"Start by reading {TICK_STATUS}: when this headless tick started and why it runs, the box, spend and "
         "running workers.\n"
         "Launch workers ONLY with `churn worker` (never the Agent tool); send one back with `churn send-back`.\n"
+        "An allow_workflows item's grant carries to `churn worker` by itself (even after `churn queue rm`); "
+        "`--allow-workflows` only confirms it and refuses the launch when there is none.\n"
         + TICK_CLI
         + "Reply in 2-4 lines."
     )
@@ -6365,6 +6382,8 @@ def cmd_queue(a) -> int:
             if a.index is None or not 0 <= a.index < len(q):
                 raise SystemExit("queue rm needs --index N from `churn queue`")
             gone = q.pop(a.index)
+            if gone.get("allow_workflows"):  # the launch reads it after the rm (#4726, #5501 on 2026-10-23)
+                state.setdefault("workflow_grants", {})[str(gone["issue"])] = iso(now())
             log(f"unqueued #{gone['issue']}: {gone['task'][:80]}")
         elif a.action == "route":
             if a.index is None or not 0 <= a.index < len(q) or not a.backend:
@@ -6797,6 +6816,8 @@ def main() -> int:
     w.add_argument("--worktree", help="work in this existing worktree (a PR fix: a /srv worktree on the PR's branch)")
     w.add_argument("--branch", help="the branch of --worktree")
     w.add_argument("--repo", choices=sorted(CRUCIBLE_REPOS), help="work in a worktree of this crucible repo (backfill steps)")
+    w.add_argument("--allow-workflows", action="store_true",
+                   help="confirm the owner's workflow-edit grant for --issue (refused when there is none)")
     w.add_argument("--plan", action=argparse.BooleanOptionalAction, default=None,
                    help="plan-mode phase + impact check before implementing (default: state features.plan_first)")
     ag = sub.add_parser("agy", help="start one detached agy worker (own quota; a Sonnet checker follows)")
