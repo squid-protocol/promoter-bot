@@ -626,6 +626,66 @@ def internal_name_problems(diff: str, body: str, names: list[str]) -> tuple[list
     return out, [f"{w}: {name}" for w, name in hits + in_body]
 
 
+NO_CLASS_TABLE = "the PR body is missing or has no class table / Sibling gaps (gitgalaxy-pr-worker.md): write it"
+
+
+def body_has_class_section(body: str) -> bool:
+    return len(body.strip()) >= 150 and bool(re.search(r"(?i)\bclass\b|sibling", body))
+
+
+_SECTION_HEAD = re.compile(r"(?i)^\s*(?:\*\*|#+\s+)(?:the\s+)?(?:class|sibling gaps)\b")
+
+
+def report_class_sections(report: str) -> str:
+    """The worker's own **Class** / **Sibling gaps** paragraphs from its report.md, as written. A header with text
+    after it ("**Sibling gaps:** none beyond ...") is one paragraph; a bare header, or one ending in ":", heads the
+    list or paragraph that follows. Each block ends at the next blank line after its content."""
+    lines, out, i = report.splitlines(), [], 0
+    while i < len(lines):
+        if not _SECTION_HEAD.match(lines[i]):
+            i += 1
+            continue
+        head = lines[i]
+        tail = re.sub(r"^\s*(?:\*\*|#+\s+)[^*:.]*(?:\*\*)?[:.]?", "", head).strip().strip("*").strip()
+        block, i = [head], i + 1
+        if not tail or head.rstrip().endswith(":"):
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+            while i < len(lines) and lines[i].strip() and not _SECTION_HEAD.match(lines[i]):
+                block.append(lines[i])
+                i += 1
+        else:
+            while i < len(lines) and lines[i].strip() and not _SECTION_HEAD.match(lines[i]):
+                block.append(lines[i])
+                i += 1
+        out.append("\n".join(block))
+    return "\n\n".join(out)
+
+
+def body_with_report_sections(body: str, report: str) -> str | None:
+    """2026-10-23: 25 of a day's 41 precheck send-backs were only the PR body's missing class / Sibling gaps, which
+    the worker had already written in its report. The body with those paragraphs appended (labelled as copied), or
+    None when the report has none or the result still fails the check."""
+    sec = report_class_sections(report)
+    if not sec:
+        return None
+    new = (body.rstrip() + "\n\n" if body.strip() else "") + ("## Class / Sibling gaps\n\n_Copied from the worker's "
+                                                               "report by promoter-bot's precheck._\n\n" + sec + "\n")
+    return new if body_has_class_section(new) else None
+
+
+def fill_class_section(meta: dict, body: str, report: str, names: list[str] | None = None) -> bool:
+    """Write body_with_report_sections() to the PR; False (the send-back stands) when there is nothing to copy, the
+    copy names an internal-only project, or the edit fails."""
+    new = body_with_report_sections(body, report)
+    if not new or not meta.get("pr"):
+        return False
+    if internal_name_problems("", new, internal_names() if names is None else names)[0]:
+        return False
+    r = run(["gh", "api", "-X", "PATCH", f"repos/{REPO}/pulls/{meta['pr']}", "--input", "-"], input=json.dumps({"body": new}))
+    return r.returncode == 0
+
+
 def precheck_problems(meta: dict, body: str, gates=None) -> list[str]:
     """The mechanical problems a reviewer would otherwise send back (2026-10-16: about half of 22 send-backs were
     these): conflicts with main, a workflow edited without an allow_workflows item, a PR body without its class table,
@@ -642,8 +702,8 @@ def precheck_problems(meta: dict, body: str, gates=None) -> list[str]:
         if wf:
             out.append(f"edits {', '.join(wf)} but the queue item has no allow_workflows: drop the workflow change "
                        "(night-shift Never rule) or say in the report that it needs the owner")
-    if len(body.strip()) < 150 or not re.search(r"(?i)\bclass\b|sibling", body):
-        out.append("the PR body is missing or has no class table / Sibling gaps (gitgalaxy-pr-worker.md): write it")
+    if not body_has_class_section(body):
+        out.append(NO_CLASS_TABLE)
     if names := internal_names():
         diff = run(["git", "-C", wt, "diff", "-U0", "--no-color", "--no-ext-diff", "origin/main...HEAD"], timeout=300).stdout
         probs, detail = internal_name_problems(diff, body, names)
@@ -678,7 +738,18 @@ def cmd_precheck(a) -> int:
         problems, err = [], f"precheck could not run: {e}"[:300]
     else:
         err = ""
-    (rd / "precheck.json").write_text(json.dumps({"at": iso(now()), "problems": problems, "error": err}, indent=1))
+    filled = False
+    if NO_CLASS_TABLE in problems:  # the worker wrote it in its report: copy it over instead of a send-back run
+        try:
+            filled = fill_class_section(meta, body, (rd / "report.md").read_text(errors="replace"))
+        except OSError:
+            filled = False
+        if filled:
+            problems = [x for x in problems if x != NO_CLASS_TABLE]
+            log(f"precheck {a.run_id} (PR #{meta['pr']}): PR body's class / Sibling gaps copied from the worker's report")
+    (rd / "precheck.json").write_text(json.dumps({"at": iso(now()), "problems": problems, "error": err,
+                                                  **({"filled": "class / Sibling gaps from report.md"} if filled else {})},
+                                                 indent=1))
     retry = bool(problems) and not meta.get("precheck_of")  # one automatic send-back per run chain, never a loop
     with edit_state() as state:
         for e in state.get("reports_pending", []):

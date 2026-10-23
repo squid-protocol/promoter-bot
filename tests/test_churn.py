@@ -1302,6 +1302,75 @@ def test_a_failed_precheck_sends_the_run_back_once_then_goes_to_review(churn, mo
     assert len(sent) == 1 and e["precheck"] == "fail" and "FAIL  audits" in e["precheck_problems"] and nudged
 
 
+REPORT_LIST = """## Worker's final report
+
+**What changed:** one paragraph.
+
+**Sibling gaps:**
+- No burned crucible program needs a LENGERR scenario beyond slice 1.
+- GenApp `LGUCVS01`: LENGERR on READ UPDATE is still refused by name.
+
+The handoff note was not written.
+"""
+REPORT_INLINE = """**Remaining slices:** none.
+
+**Sibling gaps:** none beyond those two.
+
+**Class** (paragraph-dispatch shape)
+| Member | Status |
+|---|---|
+| A | fixed |
+
+I saved a handoff note.
+"""
+
+
+def test_report_class_sections_takes_the_workers_own_paragraphs(churn):
+    sec = churn.report_class_sections(REPORT_LIST)
+    assert sec.startswith("**Sibling gaps:**\n- No burned") and "LGUCVS01" in sec and "handoff" not in sec
+    sec = churn.report_class_sections(REPORT_INLINE)
+    assert sec == ("**Sibling gaps:** none beyond those two.\n\n**Class** (paragraph-dispatch shape)\n| Member | Status |"
+                   "\n|---|---|\n| A | fixed |")
+    assert churn.report_class_sections("**What changed:** x\n\nNo sections here.\n") == ""
+    assert churn.report_class_sections("**Classification:** y\n") == ""  # another word, not the class
+
+
+def test_the_precheck_fills_the_class_section_from_the_report_instead_of_a_send_back(churn, monkeypatch):
+    body = "Part of #7.\n\n## What\n" + "A real change description. " * 8
+    assert not churn.body_has_class_section(body)
+    new = churn.body_with_report_sections(body, REPORT_LIST)
+    assert new.startswith(body.rstrip()) and "## Class / Sibling gaps" in new and churn.body_has_class_section(new)
+    assert churn.body_with_report_sections(body, "no sections") is None
+    edits = []
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: edits.append((cmd, kw)) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    assert churn.fill_class_section({"pr": 7}, body, REPORT_LIST, names=[])
+    assert edits[0][0][:4] == ["gh", "api", "-X", "PATCH"] and edits[0][0][4].endswith("/pulls/7")
+    assert json.loads(edits[0][1]["input"])["body"] == new
+    assert not churn.fill_class_section({"pr": 7}, body, REPORT_LIST, names=["lgucvs01"])  # a copied internal name: no
+    assert len(edits) == 1
+    # end to end: the only problem was the class table, so no send-back run starts and the review gets it as a pass
+    sent = []
+    monkeypatch.setattr(churn, "gh_json", lambda path: {"body": body})
+    monkeypatch.setattr(churn, "precheck_problems", lambda meta, b: [churn.NO_CLASS_TABLE])
+    monkeypatch.setattr(churn, "internal_names", lambda: [])
+    monkeypatch.setattr(churn, "cmd_worker", lambda ns: sent.append(ns) or 0)
+    monkeypatch.setattr(churn, "nudge_tick", lambda: None)
+    (churn.RUNS / "r1").mkdir(parents=True)
+    (churn.RUNS / "r1" / "meta.json").write_text(json.dumps({"run_id": "r1", "pr": 7, "worktree": "/x"}))
+    (churn.RUNS / "r1" / "report.md").write_text(REPORT_LIST)
+    put(churn, reports_pending=[{"run_id": "r1", "issue": 7, "status": "done", "report": "x", "precheck": "pending"}])
+    churn.cmd_precheck(argparse.Namespace(run_id="r1"))
+    assert not sent and churn.load_state()["reports_pending"][0]["precheck"] == "pass"
+    assert json.loads((churn.RUNS / "r1" / "precheck.json").read_text())["filled"]
+    # no sections in the report: the send-back stands
+    (churn.RUNS / "r2").mkdir(parents=True)
+    (churn.RUNS / "r2" / "meta.json").write_text(json.dumps({"run_id": "r2", "pr": 8, "worktree": "/x"}))
+    (churn.RUNS / "r2" / "report.md").write_text("nothing")
+    put(churn, reports_pending=[{"run_id": "r2", "issue": 8, "status": "done", "report": "x", "precheck": "pending"}])
+    churn.cmd_precheck(argparse.Namespace(run_id="r2"))
+    assert len(sent) == 1 and churn.NO_CLASS_TABLE in sent[0].message
+
+
 def test_a_pending_precheck_holds_its_review_until_the_fuse(churn):
     e = {"run_id": "r1", "issue": 7, "status": "done", "report": "x", "precheck": "pending", "precheck_at": churn.iso(churn.now())}
     put(churn, reports_pending=[e], workers_paused=True)
