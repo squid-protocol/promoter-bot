@@ -1080,6 +1080,34 @@ class TestRatePace:
         else:
             assert churn.cmd_worker(ns) == 0
 
+    def _launch(self, churn, monkeypatch, tmp_path, **kw):
+        monkeypatch.setattr(churn, "make_worktree", lambda i, s: (tmp_path, "b"))
+        monkeypatch.setattr(churn, "crucible_repo_of", lambda i: None)
+        monkeypatch.setattr(churn, "spawn_detached", lambda *a, **k: 4242)
+        assert churn.cmd_worker(self.worker_ns(model="sonnet", **kw)) == 0
+        return json.loads(next(churn.RUNS.glob("5-*/meta.json")).read_text())
+
+    def test_the_workflow_grant_survives_the_queue_rm(self, churn, monkeypatch, tmp_path):  # 2026-10-23 #4726 / #5501
+        put(churn, queue=[item(5, allow_workflows=True)], max_workers=3)
+        churn.cmd_queue(argparse.Namespace(action="rm", index=0))
+        assert churn.load_state()["queue"] == []
+        assert self._launch(churn, monkeypatch, tmp_path, allow_workflows=True)["allow_workflows"] is True
+
+    def test_allow_workflows_on_the_worker_never_grants(self, churn, monkeypatch, tmp_path):
+        monkeypatch.setattr(churn, "make_worktree", lambda i, s: (tmp_path, "b"))
+        monkeypatch.setattr(churn, "crucible_repo_of", lambda i: None)
+        put(churn, queue=[item(5)], max_workers=3)
+        with pytest.raises(SystemExit, match="has not allowed workflow edits for #5"):
+            churn.cmd_worker(self.worker_ns(model="sonnet", allow_workflows=True))
+        assert self._launch(churn, monkeypatch, tmp_path)["allow_workflows"] is False
+
+    def test_a_workflow_grant_lapses_after_a_day(self, churn, monkeypatch):
+        put(churn, workflow_grants={"5": "2026-10-16T12:15Z"})
+        monkeypatch.setattr(churn, "now", lambda: T0 + dt.timedelta(hours=23))
+        assert churn.owner_allows_workflows(churn.load_state(), 5)
+        monkeypatch.setattr(churn, "now", lambda: T0 + dt.timedelta(hours=25))
+        assert not churn.owner_allows_workflows(churn.load_state(), 5)
+
 
 class TestConfig:
     def ns(self, key=None, value=None):
