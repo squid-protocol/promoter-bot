@@ -3185,6 +3185,72 @@ def gate_alerts(state: dict, b: dict, snap: dict) -> None:
         NOTIFY.write_text(json.dumps(cfg, indent=1))
 
 
+# Owner 2026-10-23: a #6072 fault probe looped forever under -ftraceall and its trace.txt filled the root disk from
+# /tmp/gitgalaxy-scratch at ~75 MB/s (~100 GB); every Claude session then failed with ENOSPC and ticks did nothing for
+# 2.5 h. disk-red pages only when the disk is almost full, far too late for a 75 MB/s writer, so this watches the scratch
+# tree itself: over max_gb the owner is paged and GnuCOBOL containers older than any honest step are removed (`docker rm
+# -f` needs only the docker group, though the looping process inside runs as root; the worker's pkill was refused).
+SCRATCH_DEFAULT = {"path": "/tmp/gitgalaxy-scratch", "max_gb": 50, "reap": True, "reap_after_min": 30,
+                   "image": "gitgalaxy-gnucobol"}
+
+
+def scratch_cfg(state: dict) -> dict:
+    return {**SCRATCH_DEFAULT, **{k: v for k, v in (state.get("scratch_watch") or {}).items() if k in SCRATCH_DEFAULT}}
+
+
+def scratch_usage(path: str) -> tuple[float, list[tuple[float, str]]] | None:
+    """(total GB, the biggest dirs three levels down as (GB, path)); None when it can't be measured."""
+    try:
+        r = run(["ionice", "-c3", "nice", "du", "-xk", "-d3", path], timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    sizes = []
+    for line in r.stdout.splitlines():
+        kb, _, p = line.partition("\t")
+        if kb.isdigit():
+            sizes.append((int(kb) / 1024**2, p))
+    total = next((gb for gb, p in sizes if p.rstrip("/") == path.rstrip("/")), None)
+    if total is None:
+        return None
+    depth = path.rstrip("/").count("/") + 3
+    return total, sorted((s for s in sizes if s[1].count("/") == depth), reverse=True)[:3]
+
+
+def proof_containers(image: str) -> list[tuple[str, str, float]]:
+    """(id, name, minutes running) of each running container from `image`."""
+    r = run(["docker", "ps", "--format", "{{.ID}}\t{{.Image}}\t{{.Names}}\t{{.CreatedAt}}"], timeout=30)
+    out = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4 or not parts[1].startswith(image):
+            continue
+        with contextlib.suppress(ValueError):  # CreatedAt: "2026-10-23 21:25:00 -0400 EDT"
+            born = dt.datetime.strptime(parts[3][:25], "%Y-%m-%d %H:%M:%S %z")
+            out.append((parts[0], parts[2], (now() - born).total_seconds() / 60))
+    return out
+
+
+def scratch_watch(state: dict) -> list[str]:
+    """Log lines when the scratch tree is over its limit (after reaping stale proof containers and paging); else []."""
+    cfg = scratch_cfg(state)
+    usage = scratch_usage(cfg["path"])
+    if usage is None or usage[0] < cfg["max_gb"]:
+        return []
+    total, top = usage
+    reaped = []
+    if cfg["reap"]:
+        for cid, name, mins in proof_containers(cfg["image"]):
+            if mins >= cfg["reap_after_min"] and run(["docker", "rm", "-f", cid], timeout=60).returncode == 0:
+                reaped.append(f"{name} ({mins:.0f} min)")
+    line = (f"scratch watch: {cfg['path']} is {total:.0f} GB (limit {cfg['max_gb']}); biggest: "
+            + ", ".join(f"{p} {gb:.0f} GB" for gb, p in top)
+            + (f"; removed proof containers: {', '.join(reaped)}" if reaped else "; no stale proof container to remove"))
+    notify("scratch-big", f"churn: scratch at {total:.0f} GB", line.removeprefix("scratch watch: ")
+           + "\nA runaway writer fills the disk and stops every Claude session; check it now.",
+           priority="urgent", cooldown_h=1, tags="floppy_disk")
+    return [line]
+
+
 def guarded_tick(fn) -> int:
     """Heartbeat for the watchdog; two failed ticks in a row page the owner (one failure can be a blip)."""
     try:
@@ -5581,6 +5647,9 @@ def cmd_tick(a) -> int:
             log(f"reaped {e['run_id']} (#{e['issue']} {e['model']}): {e['status']}")
         state = load_state()
         if not a.dry_run:
+            with contextlib.suppress(Exception):  # first: a runaway writer waits out neither a limit nor an outage
+                for line in scratch_watch(state):
+                    log(line)
             if down := unreachable():
                 offline_tick(state, down)
                 return 0
