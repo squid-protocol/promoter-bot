@@ -3823,3 +3823,145 @@ def test_standing_workflow_grant_allows_workflow_edits_but_not_the_shepherds(chu
     assert churn.standing_workflows(churn.load_state())
     churn.cmd_policy(argparse.Namespace(name="workflows", value="off"))
     assert not churn.standing_workflows(churn.load_state())
+
+
+def _exp_ns(action, *args, **kw):
+    return argparse.Namespace(action=action, args=list(args), question=kw.get("question"), change=kw.get("change"),
+                              issue=kw.get("issue"), note=kw.get("note"))
+
+
+@pytest.fixture
+def exp_world(churn, monkeypatch):
+    """Fake launches (each run finishes at once, cost $1), GitHub writes, worktrees and capacity."""
+    calls, gh = [], []
+
+    def launch(e, step, model, budget, brief, issue, **kw):
+        rid = f"r{len(calls)}"
+        (churn.RUNS / rid).mkdir(parents=True)
+        t = churn.iso(churn.now())
+        (churn.RUNS / rid / "meta.json").write_text(json.dumps(
+            {"task": f"experiment {e['id']} {step}", "status": "done", "started": t, "finished": t, "cost_usd": 1.0,
+             "branch": f"br-{rid}", "worktree": f"/wt/{rid}"}))
+        calls.append({"step": step, "model": model, "budget": budget, "brief": brief, "issue": issue, **kw})
+        return rid
+
+    monkeypatch.setattr(churn, "exp_launch", launch)
+    monkeypatch.setattr(churn, "exp_capacity", lambda state, b, need: True)
+    monkeypatch.setattr(churn, "exp_tracking_issue", lambda e: 900)
+    monkeypatch.setattr(churn, "exp_tc_pr", lambda rid: 44)
+    monkeypatch.setattr(churn, "tc_clone", lambda: churn.H / "tc")
+    monkeypatch.setattr(churn, "notify", lambda *a, **kw: True)
+    monkeypatch.setattr(churn, "exp_arm_worktree", lambda e, arm, base: (churn.H / f"wt-{arm['blind']}", f"exp/{arm['blind']}"))
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: gh.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    return calls, gh
+
+
+GOOD_DESIGN = {"mode": "replay", "arms": {"db": "query the self-scan DB first", "grep": "grep and Read only"},
+               "tasks": [{"issue": 77, "base": "aaa", "reference": "bbb", "brief": "Scans include untracked files"}],
+               "replicates": 2, "per_run_usd": 3.0, "rubric": ["R1 reference tests pass", "R2 gates green"]}
+
+
+def test_experiment_walks_every_stage_blind_logged_and_cleaned(churn, exp_world, capsys):
+    """Owner 2026-10-24: experiments in a framework -- Opus design, owner OK, registered in temporal-crucible before any
+    arm runs, blind scoring, the result logged there, and the arms cleaned up by churn (the #4479 arms were not)."""
+    calls, gh = exp_world
+    green = {"verdict": "GREEN"}
+    churn.cmd_experiment(_exp_ns("propose", question="Does the self-scan DB improve fixes?", change="worker brief"))
+    with pytest.raises(SystemExit, match="E1 is active"):  # one at a time
+        churn.cmd_experiment(_exp_ns("propose", question="q2", change="c2"))
+    assert churn.experiment_lane(green, {}) == ["experiment E1 design (opus)"]
+    assert calls[0]["model"] == "opus" and "_agent_experiment_template.md" in calls[0]["brief"]
+    d = churn.H / "experiments" / "E1"
+    (d / "design.json").write_text(json.dumps(GOOD_DESIGN))
+    assert "designed" in churn.experiment_lane(green, {})[0]
+    assert (churn.H / "owner-questions" / "experiment-E1.md").read_text().startswith("## Owner question\nItem: experiment E1")
+    assert any(i.startswith("experiment E1 designed") for i in churn.owner_items(churn.load_state(), {}))
+    assert churn.experiment_lane(green, {}) == []  # waits for the owner
+    churn.cmd_experiment(_exp_ns("approve", "E1"))
+    assert churn.experiment_lane(green, {}) == ["experiment E1 registration"]
+    assert calls[-1]["repo"] == "temporal-crucible"
+    assert "4 arm runs" in churn.experiment_lane(green, {})[0]
+    labels = json.loads((d / ".labels.json").read_text())
+    assert sorted(labels.values()) == ["db", "db", "grep", "grep"]
+    for _ in range(4):  # replay: one run a tick, each in a worktree at the task's base
+        assert churn.experiment_lane(green, {})[0].startswith("experiment E1 run ")
+    arm_briefs = [c["brief"] for c in calls if c["step"].startswith("run ")]
+    assert all("open NO PR" in x and "[c:-]" in x and "pr_gates.py` (not --fast)" in x for x in arm_briefs)
+    assert not any(label in c["step"] for c in calls for label in ("db", "grep"))  # labels never in a run's name
+    assert "scoring next" in churn.experiment_lane(green, {})[0]
+    assert churn.experiment_lane(green, {}) == ["experiment E1 blind scoring"]
+    score_brief = calls[-1]["brief"]
+    assert ".labels.json" in score_brief and not any(f"{b}: " in score_brief and lab in score_brief.split(b)[1][:40]
+                                                      for b, lab in labels.items())
+    (d / "scores.json").write_text(json.dumps({b: {"R1": 1, "R2": 1} for b in labels}))
+    assert churn.experiment_lane(green, {}) == ["experiment E1 scored and unblinded"]
+    results = json.loads((d / "results.json").read_text())
+    assert {r["condition"] for r in results.values()} == {"db", "grep"} and all(r["cost_usd"] == 1.0 for r in results.values())
+    assert churn.experiment_lane(green, {}) == ["experiment E1 result write-up"]
+    assert "logged (tc PR #44)" in churn.experiment_lane(green, {})[0]
+    e = churn.load_state()["experiments"][0]
+    assert e["stage"] == "closed" and e["result_pr"] == 44 and e["winner"] is None  # replay keeps no arm
+    removed = [c for c in gh if c[:4] == ["git", "-C", str(churn.V6), "worktree"]]
+    assert len(removed) == 4  # every arm worktree removed
+    assert any("repos/" in " ".join(c) and "issues/900" in " ".join(c) and "state=closed" in c for c in gh)
+    churn.cmd_experiment(_exp_ns("status"))
+    assert '"room": "1 in the last 30 days (per_30d 1)"' in capsys.readouterr().out
+
+
+def test_experiment_design_checks_refuse_then_drop(churn, exp_world):
+    calls, _ = exp_world
+    assert churn.exp_design_problems({**GOOD_DESIGN, "replicates": 1}, 40)[0].startswith("replicates must be at least 2")
+    assert any("over the $10 left" in p for p in churn.exp_design_problems({**GOOD_DESIGN, "per_run_usd": 5}, 10))
+    assert any("base and reference" in p for p in churn.exp_design_problems(
+        {**GOOD_DESIGN, "tasks": [{"issue": 1, "brief": "x"}]}, 40))
+    assert churn.exp_design_problems({**GOOD_DESIGN, "mode": "live", "tasks": [{"issue": 1, "brief": "x"}]}, 40) == []
+    churn.cmd_experiment(_exp_ns("propose", question="q", change="c"))
+    green = {"verdict": "GREEN"}
+    churn.experiment_lane(green, {})
+    d = churn.H / "experiments" / "E1"
+    (d / "design.json").write_text(json.dumps({**GOOD_DESIGN, "replicates": 1}))
+    assert "back to proposed" in churn.experiment_lane(green, {})[0]
+    churn.experiment_lane(green, {})  # redesign
+    assert "dropped" in churn.experiment_lane(green, {})[0]  # second bad design: max_attempts 2
+    assert churn.active_experiment(churn.load_state()) is None
+
+
+def test_experiment_live_mode_keeps_the_best_arm_and_closes_the_rest(churn, exp_world, monkeypatch):
+    _, gh = exp_world
+    e = {"id": "E3", "mode": "live", "issue": 5, "result_pr": 9, "arms": [
+        {"blind": "aa", "pr": 101, "task": 1, "title": "[exp E3 aa] fix x", "branch": "b1"},
+        {"blind": "bb", "pr": 102, "task": 1, "title": "[exp E3 bb] fix x", "branch": "b2"}]}
+    results = {"aa": {"blind": "aa", "scores": {"R1": 1, "R2": 0}, "cost_usd": 2},
+               "bb": {"blind": "bb", "scores": {"R1": 1, "R2": 1}, "cost_usd": 5}}
+    assert churn.exp_winner(e, results) == "bb"
+    assert churn.exp_winner({**e, "mode": "replay"}, results) is None
+    notes = churn.exp_cleanup(e, "bb")
+    assert notes == ["#101 closed", "#102 kept (ready, watched)"]
+    assert ["gh", "pr", "ready", "102", "-R", churn.REPO] in gh
+    assert any("title=fix x" in c for c in gh if "pulls/102" in " ".join(c))
+    assert any(churn.pr_num(p) == 102 for p in churn.load_state().get("prs", []))
+
+
+def test_experiment_orphan_sweep_closes_stale_arm_prs_of_finished_experiments(churn, monkeypatch):
+    put(churn, experiments=[{"id": "E1", "stage": "running", "arms": []}, {"id": "E2", "stage": "closed", "arms": []}])
+    old = churn.iso(churn.now() - dt.timedelta(days=2))
+    rows = f"11\t[exp E1 aa] live one\t{old}\n12\t[exp E2 bb] done one\t{old}\n13\t[exp E2 cc] fresh\t{churn.iso(churn.now())}\n"
+    cmds = []
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: cmds.append(cmd) or subprocess.CompletedProcess(
+        cmd, 0, rows if "labels=experiment" in " ".join(cmd) else "", ""))
+    assert churn.experiment_orphans(churn.load_state()) == ["closed orphan experiment PR #12"]
+
+
+def test_experiment_runs_never_wake_the_tick(churn):
+    """The lane reads its own runs: a finished experiment run must not land in reports_pending or be requeued."""
+    src = churn.SCRIPT.read_text() if hasattr(churn, "SCRIPT") else Path(churn.__file__).read_text()
+    assert 'elif status != "preempted" and r.get("lane") != "experiment":' in src
+    assert 'elif status == "offline" and r.get("lane") != "experiment":' in src
+
+
+def test_experiment_proposals_file_feeds_the_lane_one_at_a_time(churn, exp_world):
+    churn.EXP_PROPOSALS.write_text("# proposals\n- [ ] Does X help? | the brief\n- [ ] Does Y help? | a rule\n")
+    green = {"verdict": "GREEN"}
+    assert churn.experiment_lane(green, {}) == ["experiment E1 proposed (retro)"]
+    assert "- [x] Does X help? | the brief -> E1" in churn.EXP_PROPOSALS.read_text()
+    assert churn.load_state()["experiments"][0]["source"] == "retro"

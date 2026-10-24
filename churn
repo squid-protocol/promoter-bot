@@ -155,6 +155,10 @@ Open ONE draft PR titled "Weekly agent retro {day} (Part of #{issue})" that does
 4. Numbers: in the PR body, a small table of this week's vs. the previous week's daily scorecard figures ($ per merged
    churn PR, fix loops per merged PR, idle ticks or hours) from the data file, with one line on what moved and which
    earlier change it may come from.
+5. Experiments: if this week's data raises a question about how agents work here whose answer would change a brief, a
+   rule or a policy (not a CI knob: those are tuned, not tested), append at most ONE line to {proposals}:
+   `- [ ] <the question> | <what the answer would change>`. churn's experiment lane designs, registers and runs it;
+   never run an experiment yourself.
 {deep}
 Rules for this PR (they override the file limit in the template below): change only `CLAUDE.md`, `AGENTS.md` and
 files under `.claude/`; at most 8 files. Never change the owner-policy rules (`.claude/rules/mainframe-evidence-policy.md`,
@@ -164,7 +168,7 @@ short: the table, then one bullet per change (what, why, which data).
 
 {template}
 """
-RETRO_DEEP = ("5. Deep audit (every {n}th retro): read CLAUDE.md, every .claude/rules file, the skills and the agent briefs end\n"
+RETRO_DEEP = ("6. Deep audit (every {n}th retro): read CLAUDE.md, every .claude/rules file, the skills and the agent briefs end\n"
               "   to end. Fix instructions that point at code, paths or flags that no longer exist (check each one),\n"
               "   contradictions between files, and text written for older models (shouting, stacked MUSTs, steps the model\n"
               "   would take anyway). List what you checked in the PR body.\n")
@@ -1611,7 +1615,13 @@ def cmd_worker(a) -> int:
                 if pr:
                     head = gh_json(f"repos/{REPO}/pulls/{pr}")["head"]["ref"]
                     prompt = existing_pr_note(pr, head) + prompt
-        elif repo := (getattr(a, "repo", None) or crucible_repo_of(issue)):
+        elif (repo := (getattr(a, "repo", None) or crucible_repo_of(issue))) == TC_REPO:
+            wt, branch = make_crucible_worktree(repo, issue, stamp)
+            prompt = (f"Your working directory {wt} is a git worktree of {ORG}/{TC_REPO} (NOT gitgalaxy), on branch "
+                      f"{branch} off origin/main. Read its CONTRIBUTING.md first and follow it: hypothesis first, "
+                      f"registration and verdict never in one PR, open the PR as a DRAFT, docs only (no tool or schema "
+                      f"change). Run `python -m py_compile tools/*.py` before pushing. Handoff notes go in {H}.\n\n{prompt}")
+        elif repo:
             wt, branch = make_crucible_worktree(repo, issue, stamp)
             prompt = (f"Your working directory {wt} is a git worktree of {ORG}/{repo} (NOT gitgalaxy), on branch "
                       f"{branch} off origin/main. Read its AGENTS.md first and follow it (generated dirs, citations, "
@@ -2124,7 +2134,7 @@ def retro_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
     data.parent.mkdir(parents=True, exist_ok=True)
     data.write_text(json.dumps(retro_data(state, now() - dt.timedelta(days=float(cfg["every_days"]))), indent=1))
     brief = RETRO_BRIEF.format(day=day, issue=cfg["issue"], deep_tag=", deep audit" if deep else "", data=data,
-                               inbox=H / "lessons-inbox.md",
+                               inbox=H / "lessons-inbox.md", proposals=EXP_PROPOSALS,
                                sizes=", ".join(f"{k}: {v}" for k, v in cfg["size_budget_kb"].items()) or "none set",
                                deep=RETRO_DEEP.format(n=cfg["deep_every"]) if deep else "",
                                template=worker_brief_template() or "")
@@ -2140,6 +2150,540 @@ def retro_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
     with edit_state() as st:
         st.setdefault("retro", {}).update(last=iso(now()), count=n)
     return did
+
+
+# ---------------------------------------------------------------- experiments
+# Owner 2026-10-24: the system should run an experiment from time to time, inside a framework. The #4479 self-scan A/B
+# ran as ordinary work: no designer, a quality rubric nobody specified, unblinded arms, gates skipped, nothing logged in
+# temporal-crucible, and its arm PRs sat open after the verdict. An experiment now moves through fixed stages; the gate
+# launches each step's worker, checks the step's file with no model, and does the cleanup itself.
+#   proposed -> designing (Opus) -> designed (owner question) -> approved -> registering (temporal-crucible draft PR)
+#   -> running (arms) -> scoring (blind) -> logging (temporal-crucible result PR) -> closed (cleanup done) | dropped
+# Owner defaults 2026-10-24: Opus designs every experiment, one owner OK per design, $40 an experiment, one a month,
+# spare capacity only. Tuning (CI knobs, caps) is not an experiment: dashboard markers, no lifecycle.
+EXP_DEFAULT = {"enabled": True, "budget_usd": 40.0, "per_30d": 1, "design_model": "opus", "design_usd": 8.0,
+               "arm_model": "sonnet", "score_model": "sonnet", "score_usd": 5.0, "log_model": "sonnet", "log_usd": 3.0,
+               "max_attempts": 2}
+EXP_ACTIVE = ("proposed", "designing", "designed", "approved", "registering", "running", "scoring", "logging")
+TC_REPO = "temporal-crucible"
+EXP_LABEL = "experiment"
+EXP_PROPOSALS = H / "experiment-proposals.md"  # `- [ ] <question> | <what the answer would change>`; the retro writes here
+EXP_PROPOSAL_RE = re.compile(r"^- \[ \] (?P<q>[^|]+?)\s*\|\s*(?P<c>.+)$")
+EXP_DESIGN_BRIEF = """# Design experiment {id} (Part of #{issue})
+
+You design one experiment; you do not run it. Question: {question}
+What the answer would change: {change}
+
+Read temporal-crucible's agent-experiment template first: {template} (and `docs/agent_selfscan_ab_explore.md` beside it:
+it is what the last experiment got wrong). Then write two files and nothing else (no PR, no code change):
+
+1. {dir}/design.md: the filled template. Name the rubric, the stop rule and the claims (AG-H<n> ids) exactly as they
+   will be registered.
+2. {dir}/design.json, which churn reads:
+   {{"mode": "replay" | "live",
+    "arms": {{"<label>": "<what this arm does differently, as an instruction to the arm's worker>", ...}},   (2-4 arms)
+    "tasks": [{{"issue": <n>, "base": "<sha the arm starts from; replay: the reference fix's first parent>",
+               "reference": "<replay: the merged fix's sha>", "brief": "<the task as the arm sees it>"}}, ...],
+    "replicates": <runs per arm per task, at least 2>,
+    "per_run_usd": <cap for one arm run>,
+    "rubric": ["R1 ...", "R2 ..."]}}
+
+Rules: replay is the default (a merged fix is the ground truth; arms start at its parent and open no PR). Use live only
+when the question needs open work, and say why in design.md. The task brief must not leak the fix (no PR numbers,
+commit messages or file names the issue itself does not name). Total cost (arms x tasks x replicates x per_run_usd)
+must fit {room} USD; churn refuses a design that does not fit. Report the two paths when done.
+"""
+EXP_REGISTER_BRIEF = """# Register experiment {id} (Part of gitgalaxy#{issue})
+
+Register the experiment designed in {dir}/design.md (read it, and {dir}/design.json) before any arm runs. Follow
+CONTRIBUTING.md: hypothesis first, registration and verdict never in one PR.
+1. Open a temporal-crucible issue "[experiment {id}] <short question>" with `gh api repos/{org}/{tc}/issues -f title=... -f body=...`
+   (the design summary, the claims verbatim, a `Register:` line naming the AG-H ids).
+2. Add docs/agents/{slug}.md: the design with a "Registered: <date>, tc#<n>" header and the claims quoted verbatim,
+   plus a row in docs/EXPERIMENTS.md (section 2 crosswalk, verdict ○ registered).
+3. Open ONE DRAFT PR "register: experiment {id} (<short question>)" and report its URL. No result, no verdict.
+"""
+EXP_ARM_BRIEF = """# Experiment {id}, run {blind} (Part of #{issue})
+
+You are one run of a registered experiment. Do the task below the way your condition says, as you would for real.
+Checklist keys: none for this run [c:-]
+
+Condition: {condition}
+
+Task: {brief}
+
+{mode_rules}
+Then run the full gates: `tests/tools/box/heavy-run.sh python tests/tools/pr_gates.py` (not --fast) and the golden check
+the gates name, and write their final lines to {out}/gates.txt. Write {out}/notes.md: what you changed and why, and
+anything else you found that the task did not ask for. Never mention this run's condition or label in commits or notes.
+"""
+EXP_REPLAY_RULES = ("Your worktree is checked out at the task's base commit. Commit your fix on its branch; open NO PR "
+                    "and never push. Do not read git history after the base, or the issue's PRs or comments on GitHub: "
+                    "the brief above is all you get.")
+EXP_LIVE_RULES = ("Open ONE DRAFT PR titled \"[exp {id} {blind}] <what it does>\" with the label `experiment`, and never "
+                  "label it shepherd:merge. Report its URL.")
+EXP_SCORE_BRIEF = """# Score experiment {id} blind (Part of #{issue})
+
+Score each run against the registered rubric in {dir}/design.md, without knowing its condition. Never open
+{dir}/.labels.json, churn's state file or the runs' prompts. Runs (blind id: worktree, its notes and gate lines in
+{dir}/arms/<id>/):
+{runs}
+{reference}
+For each run, score every rubric item exactly as the design defines it (apply the reference fix's tests to the run's
+code where the rubric asks; record the commands). Write {dir}/scores.json:
+{{"<blind id>": {{"R1": <score>, "R2": <score>, ..., "notes": "<one line>"}}, ...}} for every run above, then report.
+"""
+EXP_LOG_BRIEF = """# Log experiment {id}'s result (Part of gitgalaxy#{issue})
+
+The registration is temporal-crucible PR #{reg_pr}. The unblinded results are in {dir}/results.json (condition, scores,
+cost and time per run), the design in {dir}/design.md. Follow CONTRIBUTING.md and docs/_experiment_template.md:
+evaluate every registered claim verbatim, verdict either way, nulls with their CI, and what it does NOT establish.
+Add docs/agents/{slug}-result.md, update the docs/EXPERIMENTS.md rows, and open ONE DRAFT PR
+"result: experiment {id} (<short question>)". Report its URL and a one-line verdict.
+"""
+
+
+def exp_cfg(state: dict) -> dict:
+    return {**EXP_DEFAULT, **{k: v for k, v in (state.get("experiment_cfg") or {}).items() if k in EXP_DEFAULT}}
+
+
+def exp_dir(e: dict) -> Path:
+    return H / "experiments" / e["id"]
+
+
+def active_experiment(state: dict) -> dict | None:
+    return next((e for e in state.get("experiments", []) if e.get("stage") in EXP_ACTIVE), None)
+
+
+def exp_room(state: dict) -> tuple[bool, str]:
+    """Whether a new experiment may be proposed: lane on, none active, under the 30-day quota."""
+    cfg = exp_cfg(state)
+    if not cfg["enabled"]:
+        return False, "off (`churn experiment set enabled true`)"
+    if e := active_experiment(state):
+        return False, f"{e['id']} is active ({e['stage']})"
+    recent = [e for e in state.get("experiments", []) if e.get("stage") != "dropped"
+              and (t := parse_iso(e.get("created"))) and now() - t < dt.timedelta(days=30)]
+    if len(recent) >= int(cfg["per_30d"]):
+        return False, f"{len(recent)} in the last 30 days (per_30d {cfg['per_30d']})"
+    return True, "room"
+
+
+def exp_add(state: dict, question: str, change: str, issue: int | None = None, source: str = "owner") -> dict:
+    n = 1 + max((int(e["id"][1:]) for e in state.get("experiments", []) if re.fullmatch(r"E\d+", str(e.get("id")))),
+                default=0)
+    e = {"id": f"E{n}", "question": question.strip(), "change": change.strip(), "issue": issue, "stage": "proposed",
+         "created": iso(now()), "source": source, "runs": [], "attempts": 0, "arms": []}
+    state.setdefault("experiments", []).append(e)
+    return e
+
+
+def exp_slug(e: dict) -> str:
+    return f"{e['id'].lower()}-" + "-".join(re.findall(r"[a-z0-9]+", e["question"].lower())[:6])
+
+
+def exp_spent(e: dict) -> float:
+    total = 0.0
+    for rid in e.get("runs", []):
+        with contextlib.suppress(OSError, ValueError):
+            total += float(json.loads((RUNS / rid / "meta.json").read_text()).get("cost_usd") or 0)
+    return round(total, 2)
+
+
+def exp_run_state(rid: str | None) -> str:
+    """'none' (never launched), 'live', or the finished run's status."""
+    if not rid:
+        return "none"
+    try:
+        meta = json.loads((RUNS / rid / "meta.json").read_text())
+    except (OSError, ValueError):
+        return "none"
+    return str(meta.get("status")) if meta.get("finished") else "live"
+
+
+def exp_design_problems(d: dict, room: float) -> list[str]:
+    """What makes design.json unrunnable (churn refuses it with no model)."""
+    out = []
+    if d.get("mode") not in ("replay", "live"):
+        out.append("mode must be replay or live")
+    arms, tasks = d.get("arms") or {}, d.get("tasks") or []
+    if not isinstance(arms, dict) or not 2 <= len(arms) <= 4:
+        out.append("2-4 arms")
+    if not tasks or not all(isinstance(t, dict) and isinstance(t.get("issue"), int) and t.get("brief") for t in tasks):
+        out.append("tasks need an issue number and a brief")
+    if d.get("mode") == "replay" and not all(t.get("base") and t.get("reference") for t in tasks if isinstance(t, dict)):
+        out.append("replay tasks need base and reference shas")
+    reps = d.get("replicates")
+    if not isinstance(reps, int) or reps < 2:
+        out.append("replicates must be at least 2 (one run per arm is an anecdote)")
+    try:
+        cost = len(arms) * len(tasks) * int(reps or 0) * float(d.get("per_run_usd") or 0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    if not cost:
+        out.append("per_run_usd missing")
+    elif cost > room:
+        out.append(f"arms x tasks x replicates x per_run_usd = ${cost:.0f} is over the ${room:.0f} left")
+    if not d.get("rubric"):
+        out.append("rubric missing")
+    return out
+
+
+def exp_owner_question(e: dict, d: dict) -> Path:
+    q = H / "owner-questions" / f"experiment-{e['id']}.md"
+    q.parent.mkdir(parents=True, exist_ok=True)
+    runs = len(d["arms"]) * len(d["tasks"]) * int(d["replicates"])
+    q.write_text(f"## Owner question\nItem: experiment {e['id']}\nQuestion: Run experiment {e['id']} as designed?\n"
+                 f"Context: {e['question']} (would change: {e['change']}). Design: {exp_dir(e) / 'design.md'}. "
+                 f"{d['mode']} mode, {len(d['arms'])} arms ({', '.join(d['arms'])}), {len(d['tasks'])} tasks x "
+                 f"{d['replicates']} replicates = {runs} runs, est ${runs * float(d['per_run_usd']):.0f} plus scoring.\n"
+                 f"Facts checked: design.json passed churn's checks (arms, replicates, budget, rubric).\n"
+                 f"yes: Run it -- I register it in temporal-crucible, then run the arms on spare capacity.\n"
+                 f"no: Drop it -- I close the experiment and its issue.\n"
+                 f"hold: Wait -- it stays designed.\n")
+    return q
+
+
+def exp_launch(e: dict, step: str, model: str, budget: float, brief: str, issue: int, **kw) -> str | None:
+    """Launch one experiment worker; its run id, or None (refused: logged)."""
+    task = f"experiment {e['id']} {step}"
+    try:
+        with contextlib.redirect_stdout(open(os.devnull, "w")):
+            cmd_worker(argparse.Namespace(**{"resume_run": None, "issue": issue, "model": model, "task": task,
+                                             "brief": brief, "brief_file": None, "force": False, "plan": False,
+                                             "worktree": None, "branch": None, "check_of": None, "repo": None,
+                                             "lane": "experiment", "budget_usd": float(budget), **kw}))
+    except (SystemExit, OSError, RuntimeError) as e2:
+        log(f"experiment {e['id']} {step}: launch refused: {str(e2)[:200]}")
+        return None
+    metas = [m for m in RUNS.glob("*/meta.json") if m.stat().st_mtime > time.time() - 600]
+    for m in sorted(metas, key=lambda p: p.stat().st_mtime, reverse=True):
+        with contextlib.suppress(OSError, ValueError):
+            if json.loads(m.read_text()).get("task") == task:
+                return m.parent.name
+    return None
+
+
+def tc_clone() -> Path:
+    """churn's shared temporal-crucible clone (the one make_crucible_worktree uses), fetched and at origin/main."""
+    base = WT / f"_clone-{TC_REPO}"
+    if not (base / ".git").exists():
+        run(["git", "clone", "-q", f"https://github.com/{ORG}/{TC_REPO}.git", str(base)], timeout=300)
+    run(["git", "-C", str(base), "fetch", "-q", "origin"], timeout=120)
+    run(["git", "-C", str(base), "checkout", "-q", "--detach", "origin/main"])
+    return base
+
+
+def exp_tracking_issue(e: dict) -> int | None:
+    r = run(["gh", "api", f"repos/{REPO}/issues", "-f", f"title=Experiment {e['id']}: {e['question'][:90]}",
+             "-f", f"body=Experiment {e['id']}, run by churn's experiment lane ({e['source']}).\n\nQuestion: "
+             f"{e['question']}\n\nWhat the answer would change: {e['change']}\n\nThe design, registration and result are "
+             f"logged in {ORG}/{TC_REPO}; churn closes this issue when the experiment is cleaned up.",
+             "-f", f"labels[]={EXP_LABEL}", "--jq", ".number"])
+    return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else None
+
+
+def exp_tc_pr(rid: str | None) -> int | None:
+    """The temporal-crucible PR a run's branch opened."""
+    try:
+        branch = json.loads((RUNS / str(rid) / "meta.json").read_text()).get("branch")
+    except (OSError, ValueError):
+        return None
+    r = run(["gh", "api", f"repos/{ORG}/{TC_REPO}/pulls?state=all&head={ORG}:{branch}", "--jq", ".[0].number"])
+    return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else None
+
+
+def exp_arm_worktree(e: dict, arm: dict, base: str) -> tuple[Path, str]:
+    wt, branch = WT / f"exp-{e['id']}-{arm['blind']}", f"exp/{e['id']}-{arm['blind']}"
+    run(["git", "-C", str(V6), "fetch", "-q", "origin"], timeout=300)
+    r = run(["git", "-C", str(V6), "worktree", "add", "-q", "-b", branch, str(wt), base])
+    if r.returncode != 0:
+        raise SystemExit(f"worktree add failed: {r.stderr.strip()[:200]}")
+    return wt, branch
+
+
+def exp_cleanup(e: dict, winner: str | None) -> list[str]:
+    """Close every arm PR but the winner's, ready the winner, remove arm worktrees and branches, close the issue."""
+    notes = []
+    for arm in e.get("arms", []):
+        if pr := arm.get("pr"):
+            if arm["blind"] == winner:
+                title = re.sub(r"^\[exp [^\]]*\]\s*", "", str(arm.get("title") or ""))
+                run(["gh", "api", "-X", "PATCH", f"repos/{REPO}/pulls/{pr}", "-f", f"title={title or 'experiment winner'}"])
+                run(["gh", "pr", "ready", str(pr), "-R", REPO])
+                with edit_state() as st:
+                    prs = st.setdefault("prs", [])
+                    if not any(pr_num(p) == pr for p in prs):
+                        prs.append({"number": pr, "issue": arm["task"]})
+                notes.append(f"#{pr} kept (ready, watched)")
+            else:
+                run(["gh", "api", "-X", "POST", f"repos/{REPO}/issues/{pr}/comments", "-f",
+                     f"body=Closing: an arm of experiment {e['id']}; the result is logged in {ORG}/{TC_REPO}."])
+                run(["gh", "api", "-X", "PATCH", f"repos/{REPO}/pulls/{pr}", "-f", "state=closed"])
+                notes.append(f"#{pr} closed")
+        if wt := arm.get("worktree"):
+            run(["git", "-C", str(V6), "worktree", "remove", "--force", wt])
+        if (b := arm.get("branch")) and arm["blind"] != winner:
+            run(["git", "-C", str(V6), "branch", "-D", b])
+            if arm.get("pr"):
+                run(["gh", "api", "-X", "DELETE", f"repos/{REPO}/git/refs/heads/{b}"])
+    if e.get("issue"):
+        run(["gh", "api", "-X", "POST", f"repos/{REPO}/issues/{e['issue']}/comments", "-f",
+             f"body=Experiment {e['id']} is done: result in {ORG}/{TC_REPO}#{e.get('result_pr')}. Arms cleaned up."])
+        run(["gh", "api", "-X", "PATCH", f"repos/{REPO}/issues/{e['issue']}", "-f", "state=closed"])
+    return notes
+
+
+def exp_winner(e: dict, results: dict) -> str | None:
+    """Live mode: the arm run with the highest rubric total, ties to the cheaper run. Replay keeps nothing."""
+    if e.get("mode") != "live":
+        return None
+    def total(r: dict) -> float:
+        return sum(float(v) for k, v in (r.get("scores") or {}).items() if k.startswith("R") and isinstance(v, (int, float)))
+    ranked = sorted(results.values(), key=lambda r: (-total(r), float(r.get("cost_usd") or 0)))
+    return ranked[0]["blind"] if ranked else None
+
+
+def exp_capacity(state: dict, b: dict, need: int) -> bool:
+    """Spare capacity only: GREEN, CI calm, workers on, and a slot left for the bug lane when the queue has work."""
+    if state.get("workers_paused") or b.get("verdict") != "GREEN" or state.get("ci_mode") == "busy":
+        return False
+    free = worker_slots(b, len(claude_slot_holders(state)), slot_ceiling(state, rate_plan(state)))
+    reserve = 1 if any(not q.get("needs_owner") for q in state.get("queue", [])) else 0
+    return free >= need + reserve
+
+
+def experiment_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
+    """Advance the active experiment by at most one step a tick (see the stage list above)."""
+    state = load_state()
+    if not exp_cfg(state)["enabled"]:
+        return []
+    cfg = exp_cfg(state)
+    e = active_experiment(state)
+    if e is None:  # take one proposal from the retro's file when there is room
+        ok, _ = exp_room(state)
+        lines = EXP_PROPOSALS.read_text().splitlines() if EXP_PROPOSALS.exists() else []
+        hit = next(((i, m) for i, x in enumerate(lines) if (m := EXP_PROPOSAL_RE.match(x))), None)
+        if not ok or not hit:
+            return []
+        if dry_run:
+            return [f"experiment proposal: {hit[1]['q'][:80]}"]
+        with edit_state() as st:
+            e = exp_add(st, hit[1]["q"], hit[1]["c"], source="retro")
+        lines[hit[0]] = lines[hit[0]].replace("- [ ]", "- [x]", 1) + f" -> {e['id']}"
+        EXP_PROPOSALS.write_text("\n".join(lines) + "\n")
+        return [f"experiment {e['id']} proposed (retro)"]
+    d = exp_dir(e)
+    stage, did = e["stage"], []
+
+    def save(**kw) -> None:
+        with edit_state() as st:
+            x = next(y for y in st["experiments"] if y["id"] == e["id"])
+            for k, v in kw.items():
+                if k == "add_run":
+                    x.setdefault("runs", []).append(v)
+                else:
+                    x[k] = v
+
+    def retry_or_drop(back: str, why: str) -> list[str]:
+        n = int(e.get("attempts", 0)) + 1
+        if n >= int(cfg["max_attempts"]):
+            save(stage="dropped", attempts=n, note=why)
+            notify(f"exp-{e['id']}", f"churn: experiment {e['id']} dropped", why, priority="high", cooldown_h=24 * 365)
+            return [f"experiment {e['id']} dropped: {why}"]
+        save(stage=back, attempts=n, note=why)
+        return [f"experiment {e['id']} back to {back}: {why}"]
+
+    if dry_run:
+        return [f"experiment {e['id']}: {stage}"]
+    if stage == "proposed":
+        if not exp_capacity(state, b, 1):
+            return []
+        issue = e.get("issue") or exp_tracking_issue(e)
+        if not issue:
+            return [f"experiment {e['id']}: could not open its tracking issue"]
+        d.mkdir(parents=True, exist_ok=True)
+        tpl = tc_clone() / "docs" / "_agent_experiment_template.md"
+        brief = EXP_DESIGN_BRIEF.format(id=e["id"], issue=issue, question=e["question"], change=e["change"], dir=d,
+                                        template=tpl, room=cfg["budget_usd"] - cfg["design_usd"] - cfg["score_usd"]
+                                        - 2 * cfg["log_usd"] - exp_spent(e))
+        if rid := exp_launch(e, "design", cfg["design_model"], cfg["design_usd"], brief, issue):
+            save(stage="designing", issue=issue, design_run=rid, add_run=rid)
+            did.append(f"experiment {e['id']} design ({cfg['design_model']})")
+    elif stage == "designing":
+        rs = exp_run_state(e.get("design_run"))
+        if rs == "live":
+            return []
+        try:
+            design = json.loads((d / "design.json").read_text())
+        except (OSError, ValueError):
+            return retry_or_drop("proposed", f"design run {rs}: no readable design.json")
+        room = cfg["budget_usd"] - exp_spent(e) - cfg["score_usd"] - 2 * cfg["log_usd"]
+        if probs := exp_design_problems(design, room):
+            return retry_or_drop("proposed", "design refused: " + "; ".join(probs))
+        q = exp_owner_question(e, design)
+        save(stage="designed", mode=design["mode"], question_file=str(q))
+        did.append(f"experiment {e['id']} designed: owner question {q.name}")
+    elif stage == "approved":
+        if not exp_capacity(state, b, 1):
+            return []
+        brief = EXP_REGISTER_BRIEF.format(id=e["id"], issue=e["issue"], dir=d, org=ORG, tc=TC_REPO, slug=exp_slug(e))
+        if rid := exp_launch(e, "register", cfg["log_model"], cfg["log_usd"], brief, e["issue"], repo=TC_REPO):
+            save(stage="registering", register_run=rid, add_run=rid)
+            did.append(f"experiment {e['id']} registration")
+    elif stage == "registering":
+        rs = exp_run_state(e.get("register_run"))
+        if rs == "live":
+            return []
+        if not (pr := exp_tc_pr(e.get("register_run"))):
+            return retry_or_drop("approved", f"registration run {rs}: no temporal-crucible PR")
+        design = json.loads((d / "design.json").read_text())
+        arms = [{"blind": os.urandom(3).hex(), "label": label, "task": t["issue"], "task_index": i, "rep": r}
+                for i, t in enumerate(design["tasks"]) for r in range(int(design["replicates"])) for label in design["arms"]]
+        (d / ".labels.json").write_text(json.dumps({a["blind"]: a["label"] for a in arms}, indent=1))
+        save(stage="running", register_pr=pr, registered=iso(now()),
+             arms=[{k: v for k, v in a.items() if k != "label"} for a in arms])
+        did.append(f"experiment {e['id']} registered (tc PR #{pr}): {len(arms)} arm runs")
+    elif stage == "running":
+        design = json.loads((d / "design.json").read_text())
+        labels = json.loads((d / ".labels.json").read_text())
+        arms = e.get("arms", [])
+        if (spent := exp_spent(e)) + float(design["per_run_usd"]) + cfg["score_usd"] + cfg["log_usd"] > cfg["budget_usd"]:
+            todo = [a for a in arms if not a.get("run")]
+            if todo:  # out of budget: score what ran
+                for a in todo:
+                    a["status"] = "skipped-budget"
+                save(arms=arms)
+                did.append(f"experiment {e['id']}: budget reached at ${spent}, {len(todo)} runs skipped")
+        pending = [a for a in arms if not a.get("run") and not a.get("status")]
+        live = [a for a in arms if a.get("run") and exp_run_state(a["run"]) == "live"]
+        if pending and not live or (pending and design["mode"] == "replay"):
+            # live mode launches one task-replicate's arms together on the same main; replay runs them one at a time
+            group = ([a for a in pending if (a["task_index"], a["rep"]) == (pending[0]["task_index"], pending[0]["rep"])]
+                     if design["mode"] == "live" else pending[:1])
+            if exp_capacity(state, b, len(group)):
+                for a in group:
+                    t = design["tasks"][a["task_index"]]
+                    out = d / "arms" / a["blind"]
+                    out.mkdir(parents=True, exist_ok=True)
+                    brief = EXP_ARM_BRIEF.format(
+                        id=e["id"], blind=a["blind"], issue=a["task"], condition=design["arms"][labels[a["blind"]]],
+                        brief=t["brief"], out=out,
+                        mode_rules=EXP_REPLAY_RULES if design["mode"] == "replay" else
+                        EXP_LIVE_RULES.format(id=e["id"], blind=a["blind"]))
+                    kw = {}
+                    if design["mode"] == "replay":
+                        try:
+                            wt, branch = exp_arm_worktree(e, a, t["base"])
+                        except SystemExit as err:
+                            a["status"] = "worktree-failed"
+                            log(f"experiment {e['id']} run {a['blind']}: {err}")
+                            continue
+                        a.update(worktree=str(wt), branch=branch)
+                        kw = {"worktree": str(wt), "branch": branch}
+                    if rid := exp_launch(e, f"run {a['blind']}", design.get("arm_model") or cfg["arm_model"],
+                                         float(design["per_run_usd"]), brief, a["task"], **kw):
+                        a["run"] = rid
+                        save(add_run=rid)
+                        did.append(f"experiment {e['id']} run {a['blind']}")
+                save(arms=arms)
+        elif not pending and not live:
+            for a in arms:
+                if a.get("run"):
+                    a["status"] = exp_run_state(a["run"])
+                    with contextlib.suppress(OSError, ValueError):
+                        meta = json.loads((RUNS / a["run"] / "meta.json").read_text())
+                        a.setdefault("worktree", meta.get("worktree"))
+                        a.setdefault("branch", meta.get("branch"))
+                        if meta.get("pr"):
+                            a["pr"] = meta["pr"]
+                            a["title"] = str(gh_json(f"repos/{REPO}/pulls/{meta['pr']}").get("title") or "")
+            save(stage="scoring", arms=arms)
+            did.append(f"experiment {e['id']}: all runs finished, scoring next")
+    elif stage == "scoring":
+        if not e.get("score_run"):
+            if not exp_capacity(state, b, 1):
+                return []
+            design = json.loads((d / "design.json").read_text())
+            runs = "\n".join(f"- {a['blind']}: {a.get('worktree')} ({a.get('status')})" for a in e["arms"] if a.get("run"))
+            ref = ("Reference fixes (the ground truth, by task issue): " + ", ".join(
+                f"#{t['issue']} {t['reference']} (base {t['base']})" for t in design["tasks"])) if design["mode"] == "replay" else ""
+            brief = EXP_SCORE_BRIEF.format(id=e["id"], issue=e["issue"], dir=d, runs=runs, reference=ref)
+            if rid := exp_launch(e, "score", cfg["score_model"], cfg["score_usd"], brief, e["issue"]):
+                save(score_run=rid, add_run=rid)
+                did.append(f"experiment {e['id']} blind scoring")
+            return did
+        rs = exp_run_state(e["score_run"])
+        if rs == "live":
+            return []
+        try:
+            scores = json.loads((d / "scores.json").read_text())
+        except (OSError, ValueError):
+            scores = {}
+        ran = [a for a in e["arms"] if a.get("run")]
+        if missing := [a["blind"] for a in ran if a["blind"] not in scores]:
+            save(score_run=None)
+            return retry_or_drop("scoring", f"scoring run {rs}: no score for {', '.join(missing[:5])}")
+        labels = json.loads((d / ".labels.json").read_text())
+        results = {}
+        for a in ran:
+            meta = json.loads((RUNS / a["run"] / "meta.json").read_text())
+            mins = None
+            if (t0 := parse_iso(meta.get("started"))) and (t1 := parse_iso(meta.get("finished"))):
+                mins = round((t1 - t0).total_seconds() / 60, 1)
+            results[a["blind"]] = {"blind": a["blind"], "condition": labels[a["blind"]], "task": a["task"], "rep": a["rep"],
+                                   "status": a.get("status"), "cost_usd": meta.get("cost_usd"), "minutes": mins,
+                                   "pr": a.get("pr"), "scores": scores[a["blind"]]}
+        (d / "results.json").write_text(json.dumps(results, indent=1))
+        save(stage="logging", winner=exp_winner(e, results), scored=iso(now()))
+        did.append(f"experiment {e['id']} scored and unblinded")
+    elif stage == "logging":
+        if not e.get("log_run"):
+            if not exp_capacity(state, b, 1):
+                return []
+            brief = EXP_LOG_BRIEF.format(id=e["id"], issue=e["issue"], reg_pr=e.get("register_pr"), dir=d, slug=exp_slug(e))
+            if rid := exp_launch(e, "log", cfg["log_model"], cfg["log_usd"], brief, e["issue"], repo=TC_REPO):
+                save(log_run=rid, add_run=rid)
+                did.append(f"experiment {e['id']} result write-up")
+            return did
+        rs = exp_run_state(e["log_run"])
+        if rs == "live":
+            return []
+        if not (pr := exp_tc_pr(e["log_run"])):
+            save(log_run=None)
+            return retry_or_drop("logging", f"result run {rs}: no temporal-crucible PR")
+        e["result_pr"] = pr
+        notes = exp_cleanup(e, e.get("winner"))
+        save(stage="closed", result_pr=pr, closed=iso(now()), cleanup=notes)
+        notify(f"exp-{e['id']}-done", f"churn: experiment {e['id']} logged",
+               f"{e['question']}\nResult: {ORG}/{TC_REPO}#{pr} (draft, needs your review). Cleanup: "
+               + ("; ".join(notes) or "worktrees removed"), cooldown_h=24 * 365, tags="test_tube")
+        did.append(f"experiment {e['id']} logged (tc PR #{pr}) and cleaned up")
+    return did
+
+
+def experiment_orphans(state: dict) -> list[str]:
+    """An open `experiment` PR whose experiment is over (closed, dropped or unknown) for a day: closed (the #4479
+    arms sat open after the verdict). Run from the gate with no model."""
+    r = run(["gh", "api", f"repos/{REPO}/issues?labels={EXP_LABEL}&state=open&per_page=100", "--jq",
+             '.[] | select(.pull_request) | [.number, .title, .updated_at] | @tsv'])
+    if r.returncode:
+        return []
+    live = {e["id"] for e in state.get("experiments", []) if e.get("stage") in EXP_ACTIVE}
+    keep = {a.get("pr") for e in state.get("experiments", []) for a in e.get("arms", []) if a["blind"] == e.get("winner")}
+    out = []
+    for line in r.stdout.splitlines():
+        n, title, updated = (line.split("\t") + ["", "", ""])[:3]
+        m = re.match(r"\[exp (E\d+)", title)
+        if not n.isdigit() or int(n) in keep or (m and m.group(1) in live):
+            continue
+        if (t := parse_iso(updated)) and now() - t < dt.timedelta(hours=24):
+            continue
+        run(["gh", "api", "-X", "POST", f"repos/{REPO}/issues/{n}/comments", "-f",
+             "body=Closing: an experiment arm whose experiment is over (churn's orphan sweep)."])
+        run(["gh", "api", "-X", "PATCH", f"repos/{REPO}/pulls/{n}", "-f", "state=closed"])
+        out.append(f"closed orphan experiment PR #{n}")
+    return out
 
 
 # ---------------------------------------------------------------- agy lane
@@ -2439,7 +2983,7 @@ def reap(state: dict) -> list[dict]:
             if pr:
                 orig["pr"] = pr
             state.setdefault("queue", []).insert(0, orig)
-        elif status == "offline":  # nothing to review: the same work goes back to the front of the queue
+        elif status == "offline" and r.get("lane") != "experiment":  # nothing to review: requeue the same work
             item = {"issue": r["issue"], "model": r.get("model", "sonnet"), "needs_owner": False,
                     "task": (f"RESUME run {rid} (lost the network {iso(now())}): same worktree {meta['worktree']} / "
                              f"branch {meta['branch']}; read its handoff note, keep uncommitted edits, continue. "
@@ -2448,8 +2992,8 @@ def reap(state: dict) -> list[dict]:
                     **({"repo": meta["repo"]} if meta.get("repo") else {})}
             state.setdefault("queue", []).insert(0, item)
             state.setdefault("offline", {})["requeued"] = int(state.get("offline", {}).get("requeued", 0)) + 1
-        elif status != "preempted":  # a preempted backfill run resumes from its queue item; nothing to review
-            state.setdefault("reports_pending", []).append(entry)
+        elif status != "preempted" and r.get("lane") != "experiment":  # preempted: resumes from its queue item;
+            state.setdefault("reports_pending", []).append(entry)  # an experiment run is read by experiment_lane
         if held and not meta.get("repo"):  # its plan's files gate the requeued item with no new plan run
             with contextlib.suppress(OSError):
                 state.setdefault("held_plans", {})[rid] = {"issue": r["issue"], "t": iso(now()), "task": meta.get("task"),
@@ -2711,6 +3255,8 @@ def owner_items(state: dict, snap: dict) -> list[str]:
     out += [f"queue #{q['issue']}" + (f" (PR #{q['pr']})" if q.get("pr") else "") + f": {str(q.get('task', ''))[:140]}"
             for q in state.get("queue", []) if q.get("needs_owner")]
     out += [f"stalled: {k}" for k in state.get("stalled", [])]
+    out += [f"experiment {e['id']} designed: owner OK needed ({e.get('question_file')})"
+            for e in state.get("experiments", []) if e.get("stage") == "designed"]
     return out
 
 
@@ -5872,6 +6418,15 @@ def cmd_tick(a) -> int:
             did += [f"direct launch {d}" for d in direct]
         did += credit_lane(b, snap, False, a.dry_run)  # when=always, or credit about to expire
         did += retro_lane(b, snap, a.dry_run)
+        if host_role("retro"):  # the experiment lane runs where the retro does (one host)
+            did += experiment_lane(b, snap, a.dry_run)
+            last_sweep = parse_iso(state.get("experiment_sweep"))
+            if not a.dry_run and (last_sweep is None or now() - last_sweep > dt.timedelta(hours=1)):
+                with contextlib.suppress(Exception):
+                    for line in experiment_orphans(state):
+                        log(line)
+                with edit_state() as st:
+                    st["experiment_sweep"] = iso(now())
         if did:
             if not a.dry_run:
                 log("lanes: " + ", ".join(did))
@@ -6457,6 +7012,9 @@ def cmd_status(a) -> int:
     if (state.get("credit") or {}).get("grants"):
         print(f"credit lane: ${credit_balance(state)['balance']:.2f} left; {'launches next tick' if ok else why}")
     print(f"weekly retro: {retro_due(state)[1]}")
+    ex = active_experiment(state)
+    print("experiments: " + (f"{ex['id']} {ex['stage']} (${exp_spent(ex)} of ${exp_cfg(state)['budget_usd']}): "
+                             f"{ex['question'][:90]}" if ex else f"none active; {exp_room(state)[1]}"))
     usage = state.get("usage", {})
     cq = state.get("ci_queue", {})
     print(f"CI mode: {state.get('ci_mode', 'calm')} from admission ({cq.get('queued', '?')} runs queued, median wait "
@@ -6722,6 +7280,55 @@ def requeue_next_slice(state: dict, f: dict, nxt: str | None) -> str | None:
     item["auto"] = "followup-next"
     state.setdefault("queue", []).insert(0, item)
     return f"queued the next slice of #{issue}" + ("" if nxt else " (generic: no --next)")
+
+
+def cmd_experiment(a) -> int:
+    """Tick- and owner-facing: the gate's experiment_lane does every step; this records decisions."""
+    if a.action == "propose":
+        if not a.question or not a.change:
+            raise SystemExit("propose needs --question and --change (what the answer would change)")
+        with edit_state() as st:
+            ok, why = exp_room(st)
+            if not ok:
+                raise SystemExit(f"no room for an experiment: {why}")
+            e = exp_add(st, a.question, a.change, a.issue, source=a.note or "cli")
+        log(f"experiment {e['id']} proposed: {a.question[:120]}")
+        print(e["id"])
+        return 0
+    if a.action in ("approve", "drop"):
+        if not a.args:
+            raise SystemExit(f"{a.action} needs the experiment id")
+        with edit_state() as st:
+            e = next((x for x in st.get("experiments", []) if x["id"] == a.args[0]), None)
+            if e is None:
+                raise SystemExit(f"no experiment {a.args[0]}")
+            if a.action == "approve":
+                if e["stage"] != "designed":
+                    raise SystemExit(f"{e['id']} is {e['stage']}, not designed")
+                e.update(stage="approved", approved=iso(now()), **({"approve_note": a.note} if a.note else {}))
+            else:
+                if e["stage"] in ("closed", "dropped"):
+                    raise SystemExit(f"{e['id']} is already {e['stage']}")
+                e.update(stage="dropped", note=a.note or "dropped by the owner")
+        if a.action == "drop":
+            notes = exp_cleanup(e, None)
+            log(f"experiment {a.args[0]} dropped; cleanup: {'; '.join(notes) or 'nothing open'}")
+        else:
+            log(f"experiment {a.args[0]} approved")
+        return 0
+    if a.action == "set":
+        if len(a.args) != 2 or a.args[0] not in EXP_DEFAULT:
+            raise SystemExit(f"set KEY VALUE, KEY one of {sorted(EXP_DEFAULT)}")
+        k, v = a.args
+        val = (v.lower() in ("1", "true", "on", "yes")) if isinstance(EXP_DEFAULT[k], bool) else type(EXP_DEFAULT[k])(v)
+        with edit_state() as st:
+            st.setdefault("experiment_cfg", {})[k] = val
+        log(f"experiment config: {k} = {val}")
+    state = load_state()
+    print(json.dumps({"config": exp_cfg(state), "room": exp_room(state)[1],
+                      "experiments": [{k: v for k, v in e.items() if k != "arms"} | {"arms": len(e.get("arms", []))}
+                                      for e in state.get("experiments", [])[-5:]]}, indent=1))
+    return 0
 
 
 def cmd_policy(a) -> int:
@@ -7046,6 +7653,13 @@ def main() -> int:
     pp.add_argument("--head")
     pp.add_argument("--verdict", choices=["merge", "send-back", "hold"])
     pp.add_argument("--note")
+    ex = sub.add_parser("experiment", help="experiments: status (default) / propose / approve / drop / set KEY V")
+    ex.add_argument("action", nargs="?", default="status", choices=["status", "propose", "approve", "drop", "set"])
+    ex.add_argument("args", nargs="*", help="approve/drop: the id (E<n>); set: KEY VALUE")
+    ex.add_argument("--question")
+    ex.add_argument("--change", help="what the answer would change (a brief, a rule, a policy, a product claim)")
+    ex.add_argument("--issue", type=int, help="an existing tracking issue (else churn opens one)")
+    ex.add_argument("--note")
     po = sub.add_parser("policy", help="the owner's standing grants (show, or set: `policy workflows on|off`)")
     po.add_argument("name", nargs="?", choices=["workflows"])
     po.add_argument("value", nargs="?", choices=["on", "off"])
@@ -7168,6 +7782,8 @@ def main() -> int:
         return cmd_followup(a)
     if a.cmd == "policy":
         return cmd_policy(a)
+    if a.cmd == "experiment":
+        return cmd_experiment(a)
     if a.cmd == "review":
         return cmd_review(a)
     if a.cmd == "agy-result":
