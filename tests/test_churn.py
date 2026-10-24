@@ -3721,3 +3721,42 @@ def test_goal_command_sets_stage_and_issues(churn, capsys):
         churn.cmd_goal(ns("stage", "nope"))
     churn.cmd_goal(ns("status"))
     assert "goal stage: l5" in capsys.readouterr().out
+
+
+def test_scratch_watch_reaps_stale_proof_containers_and_pages_over_the_limit(churn, monkeypatch):
+    """2026-10-23: a looping traced probe filled the root disk from /tmp/gitgalaxy-scratch; disk-red came too late."""
+    pages, removed = [], []
+    monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: pages.append((key, kw.get("priority"))) or True)
+    born = lambda mins: (churn.now() - churn.dt.timedelta(minutes=mins)).strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
+    du = {"out": "20971520\t/s/claude/a/b\n1048576\t/s/ci-digest/x/y\n1024\t/s/claude\n99614720\t/s\n"}
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "ionice":
+            return subprocess.CompletedProcess(cmd, 0, du["out"], "")
+        if cmd[:2] == ["docker", "ps"]:
+            rows = [f"old1\tgitgalaxy-gnucobol:3\tgg-eq-1\t{born(240)}", f"new1\tgitgalaxy-gnucobol:3\tgg-eq-2\t{born(2)}",
+                    f"db2\ticr.io/db2_community/db2\tgitgalaxy-db2\t{born(9000)}"]
+            return subprocess.CompletedProcess(cmd, 0, "\n".join(rows) + "\n", "")
+        if cmd[:3] == ["docker", "rm", "-f"]:
+            removed.append(cmd[3])
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(churn, "run", fake_run)
+    st = {"scratch_watch": {"path": "/s"}}
+    lines = churn.scratch_watch(st)
+    assert removed == ["old1"]  # only the GnuCOBOL container past reap_after_min; never Db2, never a fresh step
+    assert pages == [("scratch-big", "urgent")]
+    assert "95 GB" in lines[0] and "/s/claude/a/b 20 GB" in lines[0] and "gg-eq-1 (240 min)" in lines[0]
+    du["out"] = "1048576\t/s\n"  # under the limit: silent, nothing removed
+    pages.clear(), removed.clear()
+    assert churn.scratch_watch(st) == [] and pages == [] and removed == []
+    du["out"] = "99614720\t/s\n"
+    assert "no stale proof container" in churn.scratch_watch({"scratch_watch": {"path": "/s", "reap": False}})[0]
+    assert removed == []  # reap off: page only
+
+
+def test_scratch_watch_is_silent_when_the_tree_cannot_be_measured(churn, monkeypatch):
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "du: cannot access"))
+    monkeypatch.setattr(churn, "notify", lambda *a, **kw: pytest.fail("paged"))
+    assert churn.scratch_watch({}) == []
