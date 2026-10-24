@@ -486,7 +486,22 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
+PR_FILES_CACHE = H / "pr-files-cache.json"  # #64: watched PRs' changed files, keyed by head
+GH_CALLS = H / "gh-calls.log"  # #64: one line per gh call churn makes (time, caller, endpoint), for the API budget
+
+
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    if cmd and cmd[0] == "gh":  # #64: attribute the shared 5,000/h quota (owner 2026-10-24: it was halting work)
+        with contextlib.suppress(Exception):
+            frame, callers = sys._getframe(1), []
+            while frame and len(callers) < 3:
+                if frame.f_code.co_name not in ("run", "gh_json", "gh_label", "<lambda>"):
+                    callers.append(frame.f_code.co_name)
+                frame = frame.f_back
+            kind = "graphql" if "graphql" in cmd[:3] else cmd[1] if len(cmd) > 1 else "?"
+            ep = next((c for c in cmd[2:] if c.startswith(("repos/", "orgs/", "search/", "/"))), "")
+            with open(GH_CALLS, "a") as fh:
+                fh.write(f"{iso(now())}\t{'>'.join(callers)}\t{kind}\t{re.sub(r'[0-9]+', 'N', ep.split('?')[0])[:70]}\n")
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
@@ -1757,11 +1772,29 @@ def inflight_files(me: str) -> dict[str, set[str]]:
                 files |= set(json.loads((RUNS / rid / "plan.json").read_text()).get("files", []))
             res[f"worker {rid}"] = files
     snap = json.loads(SNAP.read_text()) if SNAP.exists() else {}
+    # #64 (2026-10-24): one files call per watched PR, every tick and every plan check, was the biggest single churn
+    # consumer of the API quota; a PR's files only change with its head, so they are kept per (PR, head)
+    try:
+        cache = json.loads(PR_FILES_CACHE.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    keep = {}
     for n in map(pr_num, state.get("prs", [])):
-        if snap.get(str(n), {}).get("state") != "open":
+        v = snap.get(str(n), {})
+        if v.get("state") != "open":
             continue
-        with contextlib.suppress(RuntimeError):
-            res[f"PR #{n}"] = {f["filename"] for f in gh_json(f"repos/{REPO}/pulls/{n}/files?per_page=100")}
+        hit = cache.get(str(n)) or {}
+        if v.get("head") and hit.get("head") == v["head"]:
+            files = set(hit.get("files") or [])
+        else:
+            try:
+                files = {f["filename"] for f in gh_json(f"repos/{REPO}/pulls/{n}/files?per_page=100")}
+            except RuntimeError:
+                continue
+        res[f"PR #{n}"] = files
+        keep[str(n)] = {"head": v.get("head"), "files": sorted(files)}
+    with contextlib.suppress(OSError):
+        PR_FILES_CACHE.write_text(json.dumps(keep))
     return res
 
 
@@ -3004,11 +3037,44 @@ def reap(state: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------- PR snapshot
+PR_FIELDS_GQL = ("number state merged headRefOid headRefName mergeStateStatus body "
+                 "labels(first: 40) { nodes { name } }")
+
+
+def prs_graphql(nums: list[int], batch: int = 40) -> dict[int, dict]:
+    """#64: the watched PRs in one GraphQL query per `batch` (the separate GraphQL quota), shaped like the REST pull
+    object pr_snapshot reads. 2026-10-24: one REST call per watched PR per gate run was ~33 of a gate's ~60 calls, at
+    16-24 gate runs an hour. Missing PRs are left out (the caller falls back to REST for them)."""
+    owner, name = REPO.split("/")
+    out: dict[int, dict] = {}
+    for i in range(0, len(nums), batch):
+        part = nums[i: i + batch]
+        q = "query { repository(owner: %s, name: %s) { %s } }" % (
+            json.dumps(owner), json.dumps(name), " ".join(f"p{n}: pullRequest(number: {n}) {{ {PR_FIELDS_GQL} }}" for n in part))
+        r = run(["gh", "api", "graphql", "-f", f"query={q}"], timeout=60)
+        if r.returncode:
+            continue
+        repo = (json.loads(r.stdout).get("data") or {}).get("repository") or {}
+        for n in part:
+            g = repo.get(f"p{n}")
+            if g:
+                out[n] = {"state": "open" if g["state"] == "OPEN" else "closed", "merged": g["state"] == "MERGED",
+                          "head": {"sha": g["headRefOid"], "ref": g["headRefName"]},
+                          "mergeable_state": str(g.get("mergeStateStatus") or "unknown").lower(), "body": g.get("body"),
+                          "labels": [{"name": x["name"]} for x in (g.get("labels") or {}).get("nodes") or []]}
+    return out
+
+
 def pr_snapshot(prs: list[int], old: dict) -> dict:
     snap = {}
-    for n in map(pr_num, prs):
+    nums = [pr_num(p) for p in prs]
+    try:
+        bulk = prs_graphql(nums)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        bulk = {}
+    for n in nums:
         try:
-            p = gh_json(f"repos/{REPO}/pulls/{n}")
+            p = bulk.get(n) or gh_json(f"repos/{REPO}/pulls/{n}")
         except RuntimeError as e:
             snap[str(n)] = old.get(str(n), {"error": str(e)[:80]})
             continue
@@ -5303,6 +5369,30 @@ def verdict_at_head(state: dict, n: str, v: dict) -> str | None:
     return None
 
 
+HOLD_WORKFLOW_RE = re.compile(r"workflow|\.github/|allow_workflows", re.I)
+
+
+def release_workflow_holds(state: dict, snap: dict) -> list[str]:
+    """2026-10-24: the owner's standing workflow grant re-queued the held ITEMS but left four PRs (#6155 #6333 #6404
+    #6426) on a `hold` verdict at their head, and a hold makes no need, so nothing ever re-reviewed them. Under the
+    standing grant, a hold whose note is about a workflow edit (not the shepherd's own) is cleared: the head is
+    unreviewed again and the next tick reviews it like any other. Returns log lines."""
+    if not standing_workflows(state):
+        return []
+    out = []
+    for n, v in snap.items():
+        if v.get("state") != "open" or verdict_at_head(state, n, v) != "hold":
+            continue
+        p = next((p for p in state.get("prs", []) if isinstance(p, dict) and pr_num(p) == int(n)), None)
+        note = str((p or {}).get("note") or "")
+        if p is not None and HOLD_WORKFLOW_RE.search(note) and not re.search(r"shepherd", note, re.I):
+            p.pop("verdict", None)
+            p.pop("reviewed_head", None)
+            p["allow_workflows"] = True
+            out.append(f"PR #{n}: workflow hold released under the standing grant; review it again ({note[:80]})")
+    return out
+
+
 def owner_holds(state: dict, snap: dict) -> list[str]:
     """Open PRs the tick put on hold at their current head: they wait on the owner, not on churn."""
     return [n for n, v in snap.items() if v.get("state") == "open" and verdict_at_head(state, n, v) == "hold"]
@@ -6412,7 +6502,13 @@ def cmd_tick(a) -> int:
             cq, inprog_all = ci_queue(ignore=ign), ci_in_progress()
             inprog = None if inprog_all is None else [r for r in inprog_all
                                                       if os.path.basename(str(r.get("path", ""))) not in set(ign)]
-            occ = ci_occupancy(state, inprog_all) if inprog_all is not None else {}
+            prev_occ = state.get("ci_occupancy") or {}
+            if (t_occ := parse_iso(prev_occ.get("t"))) and now() - t_occ < dt.timedelta(minutes=9):
+                occ = {k: v for k, v in prev_occ.items() if k != "t"}  # #64: poll-nudged gates reuse it (~12 calls each)
+                occ_fresh = False
+            else:
+                occ = ci_occupancy(state, inprog_all) if inprog_all is not None else {}
+                occ_fresh = True
             want = [*collections.Counter(cq.get("by_workflow") or {}).elements(),
                     *(os.path.basename(str(r.get("path", ""))) for r in inprog or [])]
             for note in ci_profile_sample(state, ignore=ign, want=want):  # GitHub calls outside the state lock
@@ -6423,7 +6519,8 @@ def cmd_tick(a) -> int:
                     log(note)
                 st["ci_profile"] = state.get("ci_profile") or st.get("ci_profile")
                 qw = None if "error" in cq else cq.get("median_wait_min")
-                st["ci_occupancy"] = {**{k: v for k, v in occ.items() if k != "jobs"}, "t": iso(now())} if occ else {}
+                if occ_fresh:
+                    st["ci_occupancy"] = {**{k: v for k, v in occ.items() if k != "jobs"}, "t": iso(now())} if occ else {}
                 qa = occ.get("queued_job_age_p50")
                 if note := fast_cut(st, live_waits, qw, qa) or fast_climb(st, qw, qa):
                     log(note)
@@ -6475,6 +6572,11 @@ def cmd_tick(a) -> int:
         if did:
             if not a.dry_run:
                 log("lanes: " + ", ".join(did))
+            state = load_state()
+        if not a.dry_run:
+            with contextlib.suppress(Exception), edit_state() as st:
+                for line in release_workflow_holds(st, snap):
+                    log(line)
             state = load_state()
         live = [r for r in state.get("running", []) if pid_alive(r.get("pid"))]
         wants = {f"review #{n}@{w.split()[0]}": f"PR needs review: #{n} {w} -> review it, then `churn pr reviewed {n} "
