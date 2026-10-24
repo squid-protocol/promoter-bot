@@ -3467,6 +3467,7 @@ def test_poll_nudges_the_gate_once_per_change(churn, monkeypatch):
     monkeypatch.setattr(churn, "nudge_tick", lambda: nudged.append(1))
     gh = {"prs": [_gh_pr(7, "aaaa11112222")]}
     monkeypatch.setattr(churn, "gh_json", lambda path: gh["prs"])
+    monkeypatch.setattr(churn, "gh_json_etag", lambda path: gh["prs"])  # the poll's conditional read (#64)
     assert churn.cmd_poll(None) == 0 and nudged == [] and not churn.DIRTY.exists()
     gh["prs"] = [_gh_pr(7, "aaaa11112222", "shepherd:needs-fix")]
     churn.cmd_poll(None)
@@ -3842,7 +3843,8 @@ def test_experiment_walks_every_stage_blind_logged_and_cleaned(churn, exp_world,
         assert churn.experiment_lane(green, {})[0].startswith("experiment E1 run ")
     arm_briefs = [c["brief"] for c in calls if c["step"].startswith("run ")]
     assert all("open NO PR" in x and "[c:-]" in x and "pr_gates.py` (not --fast)" in x for x in arm_briefs)
-    assert not any(label in c["step"] for c in calls for label in ("db", "grep"))  # labels never in a run's name
+    # labels never in a run's name (whole words: a random hex id like 3db91f may contain "db")
+    assert not any(label in c["step"].split() for c in calls for label in ("db", "grep"))
     assert "scoring next" in churn.experiment_lane(green, {})[0]
     assert churn.experiment_lane(green, {}) == ["experiment E1 blind scoring"]
     score_brief = calls[-1]["brief"]
@@ -4020,3 +4022,43 @@ def test_inflight_files_reads_a_prs_files_once_per_head(churn, monkeypatch):
     churn.SNAP.write_text(json.dumps({"7": {"state": "open", "head": "ccc"}}))
     churn.inflight_files("me")
     assert len(calls) == 2  # a new head: read again
+
+
+def test_quota_modes_hold_launches_low_and_skip_optional_reads_when_lean(churn):
+    """#64 (owner 2026-10-24): the shared quota ran out and the shepherd (merge bot) could not merge."""
+    cfg = churn.QUOTA_DEFAULT
+    t = 1_000_000.0
+    q = lambda rem, reset_in=1800: {"remaining": rem, "limit": 5000, "used": 5000 - rem, "reset": t + reset_in}  # noqa: E731
+    assert churn.quota_mode(q(4000), 1000, cfg, t) == "ok"
+    assert churn.quota_mode(q(1900), 0, cfg, t) == "lean"  # under the optional reserve
+    assert churn.quota_mode(q(3000), 6000, cfg, t) == "lean"  # 6,000/h for 30 min would cross the reserve
+    assert churn.quota_mode(q(900), 0, cfg, t) == "hold"
+    assert churn.quota_mode(None, None, cfg, t) == "ok"  # unreadable: never stops the gate
+
+
+def test_api_day_sums_the_hours_zero_readings_and_churn_callers(churn, tmp_path):
+    ql, cl = tmp_path / "q.jsonl", tmp_path / "c.log"
+    reset1, reset2 = 1792872683, 1792876283  # two hourly windows
+    ql.write_text("\n".join(json.dumps(e) for e in (
+        {"t": "2026-10-24T19:20Z", "reset": reset1, "used": 1200, "remaining": 3800},
+        {"t": "2026-10-24T20:05Z", "reset": reset1, "used": 5000, "remaining": 0},
+        {"t": "2026-10-24T20:15Z", "reset": reset2, "used": 300, "remaining": 4700},
+        {"t": "2026-10-23T20:15Z", "reset": 1, "used": 9, "remaining": 1})))
+    cl.write_text("2026-10-24T19:22Z\tpr_snapshot>cmd_tick\tgraphql\t\n2026-10-24T19:23Z\tinflight_files>x\tapi\tr\n"
+                  "2026-10-24T19:24Z\tinflight_files>x\tapi\tr\n2026-10-23T01:00Z\told\tapi\tr\n")
+    d = churn.api_day(churn.dt.date(2026, 10, 24), ql, cl)
+    assert d["readings"] == 3 and d["readings_at_zero"] == 1 and d["peak_hour"] == 5000
+    assert len(d["used_by_hour"]) == 2 and d["churn_calls"] == 3
+    assert d["churn_by_caller"] == {"inflight_files": 2, "pr_snapshot": 1}
+
+
+def test_poll_uses_a_conditional_request_and_a_304_costs_nothing(churn, monkeypatch):
+    seen = []
+    pages = iter([
+        subprocess.CompletedProcess([], 0, 'HTTP/2.0 200 OK\r\nEtag: W/"abc"\r\n\r\n[{"number": 1}]', ""),
+        subprocess.CompletedProcess([], 1, "HTTP/2.0 304 Not Modified\r\n\r\n", "gh: HTTP 304"),
+    ])
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: seen.append(cmd) or next(pages))
+    assert churn.gh_json_etag("repos/o/r/pulls") == [{"number": 1}]
+    assert churn.gh_json_etag("repos/o/r/pulls") == [{"number": 1}]  # 304: the cached body
+    assert seen[1][3:5] == ["-H", 'If-None-Match: W/"abc"']

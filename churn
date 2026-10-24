@@ -487,11 +487,104 @@ def pid_alive(pid: int | None) -> bool:
 
 
 PR_FILES_CACHE = H / "pr-files-cache.json"  # #64: watched PRs' changed files, keyed by head
+GH_QUOTA_LOG = H / "gh-quota.jsonl"  # #64: one quota reading per gate run (rate_limit is free)
+ETAG_CACHE = H / "etag-cache"  # #64: conditional requests: a 304 does not count against the quota
+# #64 (owner 2026-10-24): the account's 5,000/h REST quota is shared by churn, the workers, the owner's sessions and the
+# shepherd (the merge bot); when it ran out the shepherd failed and nothing merged. Each gate run reads the quota and
+# sets QUOTA_MODE: "ok"; "lean" (under optional_reserve, or the burn would reach the reserve before the reset): optional
+# reads are skipped; "hold" (under reserve): new worker launches wait too. Reviews, pushes and live work go on.
+QUOTA_DEFAULT = {"reserve": 1000, "optional_reserve": 2000}
+QUOTA_MODE = "ok"
 GH_CALLS = H / "gh-calls.log"  # #64: one line per gh call churn makes (time, caller, endpoint), for the API budget
 
 
+def gh_quota() -> dict | None:
+    """The core and GraphQL quota now (one free call), or None when unreadable."""
+    try:
+        r = subprocess.run(["gh", "api", "rate_limit"], capture_output=True, text=True, timeout=30)
+        res = json.loads(r.stdout).get("resources") or {}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    core, gq = res.get("core") or {}, res.get("graphql") or {}
+    if "remaining" not in core:
+        return None
+    return {"remaining": int(core["remaining"]), "limit": int(core.get("limit", 5000)), "used": int(core.get("used", 0)),
+            "reset": int(core.get("reset", 0)), "graphql_remaining": gq.get("remaining")}
+
+
+def quota_cfg(state: dict) -> dict:
+    return {**QUOTA_DEFAULT, **{k: v for k, v in (state.get("quota") or {}).items() if k in QUOTA_DEFAULT}}
+
+
+def quota_mode(q: dict | None, burn_h: float | None, cfg: dict, at: float | None = None) -> str:
+    """ok / lean / hold for a quota reading (see QUOTA_DEFAULT)."""
+    if not q:
+        return "ok"  # unreadable: never stop on a missing reading
+    if q["remaining"] < cfg["reserve"]:
+        return "hold"
+    left_min = max(0.0, (q["reset"] - (at if at is not None else time.time())) / 60)
+    projected = q["remaining"] - (burn_h or 0) * left_min / 60
+    if q["remaining"] < cfg["optional_reserve"] or projected < cfg["reserve"]:
+        return "lean"
+    return "ok"
+
+
+def quota_tick(state: dict) -> dict | None:
+    """Read the quota, work out the burn since the last reading (same reset window), log it, set QUOTA_MODE, and page
+    the owner once when it is exhausted. Returns the reading (with burn_h and mode)."""
+    global QUOTA_MODE
+    q = gh_quota()
+    if q is None:
+        QUOTA_MODE = "ok"
+        return None
+    prev = state.get("gh_quota") or {}
+    t = time.time()
+    burn = None
+    if prev.get("reset") == q["reset"] and prev.get("ts") and t - prev["ts"] > 30:
+        burn = round(max(0, q["used"] - prev["used"]) / (t - prev["ts"]) * 3600)
+    mine = 0
+    with contextlib.suppress(OSError):
+        since = iso(dt.datetime.fromtimestamp(prev.get("ts") or t - 600, dt.timezone.utc))
+        mine = sum(1 for line in GH_CALLS.read_text().splitlines() if line[:17] >= since)
+    QUOTA_MODE = quota_mode(q, burn, quota_cfg(state), t)
+    reading = {**q, "ts": t, "t": iso(now()), "burn_h": burn, "churn_calls": mine, "mode": QUOTA_MODE}
+    with contextlib.suppress(OSError):
+        with open(GH_QUOTA_LOG, "a") as fh:
+            fh.write(json.dumps(reading, sort_keys=True) + "\n")
+    if q["remaining"] == 0:
+        notify("gh-quota-out", "churn: GitHub API quota exhausted",
+               f"0 of {q['limit']} left until {iso(dt.datetime.fromtimestamp(q['reset'], dt.timezone.utc))}; the shepherd "
+               "(merge bot) shares it and cannot merge until then.", priority="high", cooldown_h=3, tags="no_entry")
+    return reading
+
+
+def gh_json_etag(path: str) -> object:
+    """gh_json with a conditional request: the cached ETag goes out as If-None-Match, and an unchanged resource answers
+    304, which does not count against the quota (#64). Falls back to a plain read when the cache is unusable."""
+    import hashlib
+    ETAG_CACHE.mkdir(parents=True, exist_ok=True)
+    f = ETAG_CACHE / (hashlib.sha1(path.encode()).hexdigest()[:20] + ".json")
+    try:
+        cached = json.loads(f.read_text())
+    except (OSError, ValueError):
+        cached = {}
+    cmd = ["gh", "api", "-i", *(["-H", f"If-None-Match: {cached['etag']}"] if cached.get("etag") else []), path]
+    r = run(cmd, timeout=60)
+    head, _, body = r.stdout.replace("\r\n", "\n").partition("\n\n")
+    status = head.split("\n", 1)[0]
+    if " 304" in status and "body" in cached:
+        return cached["body"]
+    if r.returncode or " 200" not in status:
+        return gh_json(path)
+    data = json.loads(body)
+    etag = next((ln.split(":", 1)[1].strip() for ln in head.split("\n") if ln.lower().startswith("etag:")), None)
+    with contextlib.suppress(OSError):
+        f.write_text(json.dumps({"etag": etag, "body": data}))
+    return data
+
+
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    if cmd and cmd[0] == "gh":  # #64: attribute the shared 5,000/h quota (owner 2026-10-24: it was halting work)
+    if cmd and cmd[0] == "gh" and "rate_limit" not in cmd:  # #64: attribute the shared 5,000/h quota (free reads left out)
         with contextlib.suppress(Exception):
             frame, callers = sys._getframe(1), []
             while frame and len(callers) < 3:
@@ -4216,7 +4309,7 @@ def cmd_poll(a) -> int:
     if not watched or not SNAP.exists():
         return 0
     try:
-        changed = poll_changes(watched, gh_json(f"repos/{REPO}/pulls?state=open&per_page=100"),
+        changed = poll_changes(watched, gh_json_etag(f"repos/{REPO}/pulls?state=open&per_page=100"),
                                json.loads(SNAP.read_text()))
     except (RuntimeError, ValueError):
         return 0
@@ -6369,6 +6462,13 @@ def cmd_tick(a) -> int:
             return 0
         refresh_tools()
         b = box()
+        with contextlib.suppress(Exception):
+            if (qr := quota_tick(state)) and not a.dry_run:
+                with edit_state() as st:
+                    st["gh_quota"] = qr
+            if QUOTA_MODE == "hold" and b.get("verdict") == "GREEN":  # launches wait; reviews and live work go on
+                b = {**b, "verdict": "YELLOW", "reasons": [*b.get("reasons", []),
+                     f"GitHub API quota under the reserve ({(qr or {}).get('remaining')} left): new launches wait"]}
         old = json.loads(SNAP.read_text()) if SNAP.exists() else {}
         _OPEN_CACHE.clear()
         global _INFLIGHT
@@ -6424,7 +6524,7 @@ def cmd_tick(a) -> int:
             inprog = None if inprog_all is None else [r for r in inprog_all
                                                       if os.path.basename(str(r.get("path", ""))) not in set(ign)]
             prev_occ = state.get("ci_occupancy") or {}
-            if (t_occ := parse_iso(prev_occ.get("t"))) and now() - t_occ < dt.timedelta(minutes=9):
+            if ((t_occ := parse_iso(prev_occ.get("t"))) and now() - t_occ < dt.timedelta(minutes=9)) or QUOTA_MODE != "ok":
                 occ = {k: v for k, v in prev_occ.items() if k != "t"}  # #64: poll-nudged gates reuse it (~12 calls each)
                 occ_fresh = False
             else:
@@ -6432,8 +6532,8 @@ def cmd_tick(a) -> int:
                 occ_fresh = True
             want = [*collections.Counter(cq.get("by_workflow") or {}).elements(),
                     *(os.path.basename(str(r.get("path", ""))) for r in inprog or [])]
-            for note in ci_profile_sample(state, ignore=ign, want=want):  # GitHub calls outside the state lock
-                log(note, quiet=True)
+            for note in (ci_profile_sample(state, ignore=ign, want=want) if QUOTA_MODE == "ok" else []):
+                log(note, quiet=True)  # GitHub calls outside the state lock; skipped when the API quota is lean
             live_waits = live_pr_job_waits(state, inprog, jobs=occ.get("jobs"))
             with edit_state() as st:
                 for note in retire_ci_pressure(st):
@@ -6466,7 +6566,7 @@ def cmd_tick(a) -> int:
             except (RuntimeError, OSError, ValueError) as e:  # GitHub unreadable: try again next tick
                 log(f"refill skipped: {str(e)[:160]}", quiet=True)
             try:
-                for note in goal_tick(state):
+                for note in (goal_tick(state) if QUOTA_MODE == "ok" else []):
                     log(note)
             except (RuntimeError, OSError, ValueError) as e:
                 log(f"goal measure skipped: {str(e)[:160]}", quiet=True)
@@ -6484,7 +6584,7 @@ def cmd_tick(a) -> int:
         if host_role("retro"):  # the experiment lane runs where the retro does (one host)
             did += experiment_lane(b, snap, a.dry_run)
             last_sweep = parse_iso(state.get("experiment_sweep"))
-            if not a.dry_run and (last_sweep is None or now() - last_sweep > dt.timedelta(hours=1)):
+            if not a.dry_run and QUOTA_MODE == "ok" and (last_sweep is None or now() - last_sweep > dt.timedelta(hours=1)):
                 with contextlib.suppress(Exception):
                     for line in experiment_orphans(state):
                         log(line)
@@ -6622,6 +6722,31 @@ def _median(xs: list[float]) -> float | None:
     return round((xs[len(xs) // 2] + xs[(len(xs) - 1) // 2]) / 2, 2) if xs else None
 
 
+def api_day(day: dt.date, quota_log: Path | None = None, calls_log: Path | None = None) -> dict:
+    """#64: the day's API use for the dashboard: per reset window (one hour) the most used, the readings at 0 (gate
+    runs that found the quota exhausted), and churn's own calls by caller."""
+    lo = day.isoformat()
+    windows: dict[int, int] = {}
+    zero = readings = 0
+    with contextlib.suppress(OSError):
+        for line in (quota_log or GH_QUOTA_LOG).read_text().splitlines():
+            e = _json_or_empty(line)
+            if not str(e.get("t", "")).startswith(lo) or "reset" not in e:
+                continue
+            readings += 1
+            windows[e["reset"]] = max(windows.get(e["reset"], 0), int(e.get("used") or 0))
+            zero += e.get("remaining") == 0
+    callers: collections.Counter = collections.Counter()
+    with contextlib.suppress(OSError):
+        for line in (calls_log or GH_CALLS).read_text().splitlines():
+            parts = line.split("\t")
+            if parts[0].startswith(lo) and len(parts) > 1:
+                callers[parts[1].split(">")[0]] += 1
+    hours = {dt.datetime.fromtimestamp(r - 3600, dt.timezone.utc).strftime("%H"): u for r, u in sorted(windows.items())}
+    return {"readings": readings, "used_by_hour": hours, "peak_hour": max(hours.values()) if hours else None,
+            "readings_at_zero": zero, "churn_calls": sum(callers.values()), "churn_by_caller": dict(callers.most_common(8))}
+
+
 def factory(day: dt.date, state: dict, log_text: str, quiet_text: str, merged_prs: list[dict],
             runs_dir: Path | None = None) -> dict:
     """The agent factory's own numbers for one UTC day (owner 2026-10-16: the bottleneck moved from CI to worker
@@ -6698,6 +6823,7 @@ def factory(day: dt.date, state: dict, log_text: str, quiet_text: str, merged_pr
         "idle_hours": round(idle_h, 2), "idle_causes": dict(causes.most_common()),
         "idle_blockers": dict(blockers.most_common(5)),
         "review_wait_min_median": _median(waits), "pr_open_to_merge_h_median": _median(ages),
+        "api": api_day(day),
     }
 
 
@@ -7080,6 +7206,11 @@ def cmd_status(a) -> int:
     if (state.get("credit") or {}).get("grants"):
         print(f"credit lane: ${credit_balance(state)['balance']:.2f} left; {'launches next tick' if ok else why}")
     print(f"weekly retro: {retro_due(state)[1]}")
+    if gq := state.get("gh_quota"):
+        print(f"GitHub API: {gq.get('remaining')}/{gq.get('limit')} left, resets "
+              f"{iso(dt.datetime.fromtimestamp(gq.get('reset', 0), dt.timezone.utc))}, burn "
+              f"{gq.get('burn_h') if gq.get('burn_h') is not None else '?'}/h (all users of the token), churn "
+              f"{gq.get('churn_calls')} calls since the reading before; mode {gq.get('mode')} at {gq.get('t')}")
     ex = active_experiment(state)
     print("experiments: " + (f"{ex['id']} {ex['stage']} (${exp_spent(ex)} of ${exp_cfg(state)['budget_usd']}): "
                              f"{ex['question'][:90]}" if ex else f"none active; {exp_room(state)[1]}"))
@@ -7402,6 +7533,29 @@ def cmd_experiment(a) -> int:
                       "experiments": [{k: v for k, v in e.items() if k != "arms"} | {"arms": len(e.get("arms", []))}
                                       for e in state.get("experiments", [])[-5:]]}, indent=1))
     return 0
+
+
+def cmd_gh_budget(a) -> int:
+    """#64: a script about to make N API calls asks first. Exit 0 when N fit above the reserve (plus the optional
+    reserve, so the fleet keeps its headroom), else print when they will and exit 1, or with --wait sleep until then."""
+    cfg = quota_cfg(load_state())
+    while True:
+        q = gh_quota()
+        if q is None:
+            print("quota unreadable: go ahead carefully")
+            return 0
+        room = q["remaining"] - cfg["optional_reserve"]
+        if a.calls <= room:
+            print(f"ok: {a.calls} calls fit ({q['remaining']} left, {cfg['optional_reserve']} kept for the fleet)")
+            return 0
+        wait = max(0, q["reset"] - time.time()) + 20
+        msg = (f"not now: {q['remaining']} left, {cfg['optional_reserve']} kept for the fleet; the quota resets at "
+               f"{iso(dt.datetime.fromtimestamp(q['reset'], dt.timezone.utc))}")
+        if not a.wait:
+            print(msg)
+            return 1
+        print(msg + f"; waiting {wait / 60:.0f} min", flush=True)
+        time.sleep(wait)
 
 
 def cmd_policy(a) -> int:
@@ -7733,6 +7887,9 @@ def main() -> int:
     ex.add_argument("--change", help="what the answer would change (a brief, a rule, a policy, a product claim)")
     ex.add_argument("--issue", type=int, help="an existing tracking issue (else churn opens one)")
     ex.add_argument("--note")
+    gb = sub.add_parser("gh-budget", help="do N GitHub API calls fit above the reserve now? (for scripts; free)")
+    gb.add_argument("calls", type=int)
+    gb.add_argument("--wait", action="store_true", help="sleep until they fit instead of exiting 1")
     po = sub.add_parser("policy", help="the owner's standing grants (show, or set: `policy workflows on|off`)")
     po.add_argument("name", nargs="?", choices=["workflows"])
     po.add_argument("value", nargs="?", choices=["on", "off"])
@@ -7855,6 +8012,8 @@ def main() -> int:
         return cmd_followup(a)
     if a.cmd == "policy":
         return cmd_policy(a)
+    if a.cmd == "gh-budget":
+        return cmd_gh_budget(a)
     if a.cmd == "experiment":
         return cmd_experiment(a)
     if a.cmd == "review":
