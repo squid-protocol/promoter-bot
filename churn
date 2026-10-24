@@ -486,6 +486,7 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
+PR_FILES_CACHE = H / "pr-files-cache.json"  # #64: watched PRs' changed files, keyed by head
 GH_CALLS = H / "gh-calls.log"  # #64: one line per gh call churn makes (time, caller, endpoint), for the API budget
 
 
@@ -1771,11 +1772,29 @@ def inflight_files(me: str) -> dict[str, set[str]]:
                 files |= set(json.loads((RUNS / rid / "plan.json").read_text()).get("files", []))
             res[f"worker {rid}"] = files
     snap = json.loads(SNAP.read_text()) if SNAP.exists() else {}
+    # #64 (2026-10-24): one files call per watched PR, every tick and every plan check, was the biggest single churn
+    # consumer of the API quota; a PR's files only change with its head, so they are kept per (PR, head)
+    try:
+        cache = json.loads(PR_FILES_CACHE.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    keep = {}
     for n in map(pr_num, state.get("prs", [])):
-        if snap.get(str(n), {}).get("state") != "open":
+        v = snap.get(str(n), {})
+        if v.get("state") != "open":
             continue
-        with contextlib.suppress(RuntimeError):
-            res[f"PR #{n}"] = {f["filename"] for f in gh_json(f"repos/{REPO}/pulls/{n}/files?per_page=100")}
+        hit = cache.get(str(n)) or {}
+        if v.get("head") and hit.get("head") == v["head"]:
+            files = set(hit.get("files") or [])
+        else:
+            try:
+                files = {f["filename"] for f in gh_json(f"repos/{REPO}/pulls/{n}/files?per_page=100")}
+            except RuntimeError:
+                continue
+        res[f"PR #{n}"] = files
+        keep[str(n)] = {"head": v.get("head"), "files": sorted(files)}
+    with contextlib.suppress(OSError):
+        PR_FILES_CACHE.write_text(json.dumps(keep))
     return res
 
 

@@ -4006,3 +4006,17 @@ def test_pr_snapshot_reads_watched_prs_in_one_graphql_query_and_falls_back_to_re
     assert snap["1"]["head"] == "a" * 12 and snap["1"]["check"] == ["done", "abc12345"]
     assert snap["2"]["merged"] and snap["2"]["state"] == "closed" and snap["2"]["mergeable_state"] == "clean"  # unknown keeps old
     assert snap["3"]["state"] == "closed"
+
+
+def test_inflight_files_reads_a_prs_files_once_per_head(churn, monkeypatch):
+    """#64: one files call per watched PR every tick and plan check was churn's biggest API consumer."""
+    put(churn, prs=[7, 8])
+    churn.SNAP.write_text(json.dumps({"7": {"state": "open", "head": "aaa"}, "8": {"state": "closed", "head": "bbb"}}))
+    calls = []
+    monkeypatch.setattr(churn, "gh_json", lambda path: calls.append(path) or [{"filename": "x.py"}])
+    assert churn.inflight_files("me") == {"PR #7": {"x.py"}}
+    assert churn.inflight_files("me") == {"PR #7": {"x.py"}}
+    assert len(calls) == 1  # same head: from the cache; the closed PR: never
+    churn.SNAP.write_text(json.dumps({"7": {"state": "open", "head": "ccc"}}))
+    churn.inflight_files("me")
+    assert len(calls) == 2  # a new head: read again
