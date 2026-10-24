@@ -498,6 +498,25 @@ QUOTA_MODE = "ok"
 GH_CALLS = H / "gh-calls.log"  # #64: one line per gh call churn makes (time, caller, endpoint), for the API budget
 
 
+GH_WRITE_SUBCOMMANDS = {("pr", x) for x in ("create", "edit", "merge", "ready", "comment", "close", "reopen", "review")} | \
+    {("issue", x) for x in ("create", "edit", "comment", "close", "reopen")} | \
+    {("label", x) for x in ("create", "edit", "delete")} | {("workflow", "run"), ("release", "create"), ("run", "rerun")}
+
+
+def gh_is_write(cmd: list[str]) -> bool:
+    """A content-creating (or changing) GitHub call: what the secondary limits count (#64, owner 2026-10-24)."""
+    if len(cmd) < 2:
+        return False
+    if cmd[1] == "api":
+        if "graphql" in cmd[:3]:
+            return any("mutation" in c for c in cmd)
+        for i, c in enumerate(cmd):
+            if c in ("-X", "--method") and i + 1 < len(cmd):
+                return cmd[i + 1].upper() != "GET"
+        return any(c in ("-f", "-F", "--field", "--raw-field", "--input") for c in cmd)
+    return (cmd[1], cmd[2] if len(cmd) > 2 else "") in GH_WRITE_SUBCOMMANDS
+
+
 def gh_quota() -> dict | None:
     """The core and GraphQL quota now (one free call), or None when unreadable."""
     try:
@@ -594,7 +613,8 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
             kind = "graphql" if "graphql" in cmd[:3] else cmd[1] if len(cmd) > 1 else "?"
             ep = next((c for c in cmd[2:] if c.startswith(("repos/", "orgs/", "search/", "/"))), "")
             with open(GH_CALLS, "a") as fh:
-                fh.write(f"{iso(now())}\t{'>'.join(callers)}\t{kind}\t{re.sub(r'[0-9]+', 'N', ep.split('?')[0])[:70]}\n")
+                fh.write(f"{iso(now())}\t{'>'.join(callers)}\t{kind}\t{re.sub(r'[0-9]+', 'N', ep.split('?')[0])[:70]}"
+                         f"\t{'w' if gh_is_write(cmd) else 'r'}\n")
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
@@ -6737,14 +6757,18 @@ def api_day(day: dt.date, quota_log: Path | None = None, calls_log: Path | None 
             windows[e["reset"]] = max(windows.get(e["reset"], 0), int(e.get("used") or 0))
             zero += e.get("remaining") == 0
     callers: collections.Counter = collections.Counter()
+    writes_h: collections.Counter = collections.Counter()
     with contextlib.suppress(OSError):
         for line in (calls_log or GH_CALLS).read_text().splitlines():
             parts = line.split("\t")
             if parts[0].startswith(lo) and len(parts) > 1:
                 callers[parts[1].split(">")[0]] += 1
+                if len(parts) > 4 and parts[4] == "w":
+                    writes_h[parts[0][11:13]] += 1
     hours = {dt.datetime.fromtimestamp(r - 3600, dt.timezone.utc).strftime("%H"): u for r, u in sorted(windows.items())}
     return {"readings": readings, "used_by_hour": hours, "peak_hour": max(hours.values()) if hours else None,
-            "readings_at_zero": zero, "churn_calls": sum(callers.values()), "churn_by_caller": dict(callers.most_common(8))}
+            "readings_at_zero": zero, "churn_calls": sum(callers.values()), "churn_by_caller": dict(callers.most_common(8)),
+            "churn_writes": sum(writes_h.values()), "churn_writes_busiest_hour": max(writes_h.values()) if writes_h else 0}
 
 
 def factory(day: dt.date, state: dict, log_text: str, quiet_text: str, merged_prs: list[dict],

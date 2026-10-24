@@ -4062,3 +4062,12 @@ def test_poll_uses_a_conditional_request_and_a_304_costs_nothing(churn, monkeypa
     assert churn.gh_json_etag("repos/o/r/pulls") == [{"number": 1}]
     assert churn.gh_json_etag("repos/o/r/pulls") == [{"number": 1}]  # 304: the cached body
     assert seen[1][3:5] == ["-H", 'If-None-Match: W/"abc"']
+
+
+def test_gh_calls_are_marked_read_or_write_for_the_secondary_limits(churn):
+    w = churn.gh_is_write
+    assert w(["gh", "api", "-X", "POST", "repos/o/r/issues/1/labels"]) and w(["gh", "api", "repos/o/r/issues/1/comments", "-f", "body=x"])
+    assert w(["gh", "pr", "create", "--title", "x"]) and w(["gh", "issue", "comment", "5"]) and w(["gh", "api", "-X", "DELETE", "x"])
+    assert not w(["gh", "api", "repos/o/r/pulls/1"]) and not w(["gh", "pr", "view", "1"]) and not w(["gh", "api", "-X", "GET", "x"])
+    assert not w(["gh", "api", "graphql", "-f", "query=query { viewer { login } }"])  # a GraphQL read sends fields too
+    assert w(["gh", "api", "graphql", "-f", "query=mutation { addLabels }"])
