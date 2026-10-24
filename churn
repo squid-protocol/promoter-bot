@@ -6520,6 +6520,45 @@ def _median(xs: list[float]) -> float | None:
     return round((xs[len(xs) // 2] + xs[(len(xs) - 1) // 2]) / 2, 2) if xs else None
 
 
+def factory_scorecard_extras(day: dt.date, merged_prs: list[dict], runs_dir: Path | None = None,
+                             answers: Path | None = None, snaps: Path | None = None) -> dict:
+    """Owner 2026-10-24, for the factory scorecard (squid-bot): first-pass (the day's merged churn PRs that no fix,
+    send-back or precheck retry ever touched), owner decisions (owner-answers by who answered: the owner, or the 2-tick
+    auto-hold), and the evidence ladder (programs per level, the day's last goal snapshot)."""
+    lo = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
+    hi = lo + dt.timedelta(days=1)
+    reworked: set[int] = set()
+    for m in (runs_dir or RUNS).glob("*/meta.json"):
+        try:
+            meta = json.loads(m.read_text())
+        except (OSError, ValueError):
+            continue
+        if run_kind(meta, runs_dir) == "new_work":
+            continue
+        if meta.get("pr"):
+            reworked.add(int(meta["pr"]))
+        for n in re.findall(r"PR #(\d+)", str(meta.get("task") or "")):
+            reworked.add(int(n))
+    nums = [int(p["number"]) for p in merged_prs if p.get("number")]
+    owner = auto = 0
+    with contextlib.suppress(OSError):
+        for line in (answers or H / "owner-answers.jsonl").read_text().splitlines():
+            e = _json_or_empty(line)
+            if (t := parse_iso(e.get("t"))) and lo <= t < hi:
+                if e.get("source") == "auto":
+                    auto += 1
+                else:
+                    owner += 1
+    ladder = None
+    shots = sorted((snaps or H / "progress-snapshots").glob(f"goal-{day.isoformat()}T*.json"))
+    if shots:
+        with contextlib.suppress(OSError, ValueError):
+            levels = json.loads(shots[-1].read_text()).get("levels") or {}
+            ladder = {str(k).rstrip("*"): int(v) for k, v in levels.items() if str(k).startswith("L")}
+    return {"first_pass": {"merged": len(nums), "first_pass": sum(1 for n in nums if n not in reworked)},
+            "owner_decisions": {"owner": owner, "auto": auto}, **({"ladder": ladder} if ladder else {})}
+
+
 def factory(day: dt.date, state: dict, log_text: str, quiet_text: str, merged_prs: list[dict],
             runs_dir: Path | None = None) -> dict:
     """The agent factory's own numbers for one UTC day (owner 2026-10-16: the bottleneck moved from CI to worker
@@ -6596,6 +6635,7 @@ def factory(day: dt.date, state: dict, log_text: str, quiet_text: str, merged_pr
         "idle_hours": round(idle_h, 2), "idle_causes": dict(causes.most_common()),
         "idle_blockers": dict(blockers.most_common(5)),
         "review_wait_min_median": _median(waits), "pr_open_to_merge_h_median": _median(ages),
+        **factory_scorecard_extras(day, merged_prs, runs_dir),
     }
 
 
