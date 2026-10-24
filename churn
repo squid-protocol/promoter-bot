@@ -5820,12 +5820,15 @@ def goal_measure(reports: list[dict], issues: list[dict]) -> dict:
     """Programs per level, and every program that does not translate whole (L0) with the open issues that name it.
     `untracked` = L0 programs no open issue mentions: nobody is working on them."""
     levels: collections.Counter = collections.Counter()
+    by_group: dict[str, collections.Counter] = {}
     texts = [(i["number"], f"{i.get('title', '')}\n{i.get('body') or ''}".lower()) for i in issues]
     untranslated = []
     for rep in reports:
+        group = by_group.setdefault(Path(rep["file"]).parent.name, collections.Counter())
         for p in rep.get("programs") or []:
             lv = str(p.get("level") or "?").rstrip("*")
             levels[lv] += 1
+            group[lv] += 1
             if lv != "L0":
                 continue
             t = p.get("translation") or {}
@@ -5835,7 +5838,27 @@ def goal_measure(reports: list[dict], issues: list[dict]) -> dict:
                                  "holes": t.get("hole_count"), "refused": t.get("refused"),
                                  "classes": [str(c)[:120] for c in (t.get("gap_classes") or [])[:4]], "issues": hits})
     return {"t": iso(now()), "programs": sum(levels.values()), "levels": dict(sorted(levels.items())),
-            "untranslated": untranslated, "untracked": [u["program"] for u in untranslated if not u["issues"]]}
+            "by_group": {g: dict(sorted(c.items())) for g, c in sorted(by_group.items())}, "untranslated": untranslated, "untracked": [u["program"] for u in untranslated if not u["issues"]]}
+
+
+def goal_publication(state: dict, snaps: Path | None = None) -> dict | None:
+    """Owner 2026-10-24: the dashboard's goals sheet shows the progress of whatever the factory is pointed at, from a
+    generic block (squid-bot's Fleet CI report draws any goal in this shape): levels in order, the target level, a
+    history (the day's last measurement), the current split by group, and the blockers with the issues on them."""
+    m = (state.get("goal") or {}).get("measure")
+    if not m:
+        return None
+    history: dict[str, dict] = {}
+    for f in sorted((snaps or H / "progress-snapshots").glob("goal-*.json")):
+        with contextlib.suppress(OSError, ValueError):
+            history[f.name[5:15]] = level_counts(json.loads(f.read_text()).get("levels") or {})
+    levels = sorted({k for d in [level_counts(m.get("levels") or {}), *history.values()] for k in d})
+    return {"id": "evidence-ladder", "title": "Mainframe programs by evidence level", "unit": "programs",
+            "levels": levels, "target": "L4", "group_label": "estate", "measured": m.get("t"),
+            "history": history, "groups": m.get("by_group") or {},
+            "blockers": [{"name": u.get("program"), "group": u.get("estate"), "holes": u.get("holes"),
+                          "note": "; ".join(u.get("classes") or [])[:160], "issues": u.get("issues") or []}
+                         for u in m.get("untranslated") or []]}
 
 
 def goal_summary(m: dict) -> str:
@@ -6520,6 +6543,15 @@ def _median(xs: list[float]) -> float | None:
     return round((xs[len(xs) // 2] + xs[(len(xs) - 1) // 2]) / 2, 2) if xs else None
 
 
+def level_counts(levels: dict) -> dict[str, int]:
+    """{level: n} with a carried level (`L4*`, stale but kept) folded into its level, summed."""
+    out: dict[str, int] = {}
+    for k, v in (levels or {}).items():
+        if str(k).startswith("L"):
+            out[str(k).rstrip("*")] = out.get(str(k).rstrip("*"), 0) + int(v)
+    return out
+
+
 def factory_scorecard_extras(day: dt.date, merged_prs: list[dict], runs_dir: Path | None = None,
                              answers: Path | None = None, snaps: Path | None = None) -> dict:
     """Owner 2026-10-24, for the factory scorecard (squid-bot): first-pass (the day's merged churn PRs that no fix,
@@ -6553,8 +6585,7 @@ def factory_scorecard_extras(day: dt.date, merged_prs: list[dict], runs_dir: Pat
     shots = sorted((snaps or H / "progress-snapshots").glob(f"goal-{day.isoformat()}T*.json"))
     if shots:
         with contextlib.suppress(OSError, ValueError):
-            levels = json.loads(shots[-1].read_text()).get("levels") or {}
-            ladder = {str(k).rstrip("*"): int(v) for k, v in levels.items() if str(k).startswith("L")}
+            ladder = level_counts(json.loads(shots[-1].read_text()).get("levels") or {})
     return {"first_pass": {"merged": len(nums), "first_pass": sum(1 for n in nums if n not in reworked)},
             "owner_decisions": {"owner": owner, "auto": auto}, **({"ladder": ladder} if ladder else {})}
 
@@ -6838,6 +6869,9 @@ def record_factory(c: dict, push: bool = True) -> bool:
                       "slices_merged": c.get("slices_merged", 0), "items_done": c.get("items_done", 0)}
     keep = sorted(days)[-FACTORY_DAYS:]
     data = {"repo": REPO, "updated": iso(now()), "days": {d: days[d] for d in keep}}
+    with contextlib.suppress(Exception):  # a goal block that can't be built never stops the factory numbers
+        if goal := goal_publication(load_state()):
+            data["goals"] = [goal]
     FACTORY.write_text(json.dumps(data, indent=1, sort_keys=True))
     return push_factory(data) if push else True
 
@@ -6845,7 +6879,7 @@ def record_factory(c: dict, push: bool = True) -> bool:
 # Fields of a factory day that add up across hosts (counts, hours, dollars, worker slots); the ratios are recomputed
 # from these sums, so a combined day is exact. ci_busy_hours is each host's view of the same CI queue: the max.
 FACTORY_SUM = ("churn_merged", "slices_merged", "items_done", "usd", "loop_runs", "idle_ticks", "idle_hours", "paused_hours", "max_workers",
-               "worker_hours", "precheck", "holds", "idle_causes", "idle_blockers")
+               "worker_hours", "precheck", "holds", "idle_causes", "idle_blockers", "first_pass", "owner_decisions")
 
 
 def _add(a, b):
@@ -6882,6 +6916,8 @@ def combine_factory_days(hosts: dict[str, dict]) -> dict[str, dict]:
         for k in ("review_wait_min_median", "pr_open_to_merge_h_median"):
             w = [(r[k], r.get("churn_merged") or 1) for r in rows if r.get(k) is not None]
             c[k] = round(sum(v * n for v, n in w) / sum(n for _, n in w), 2) if w else None
+        if ladders := [r["ladder"] for r in rows if r.get("ladder")]:  # one repo, one ladder: any host's view
+            c["ladder"] = ladders[-1]
         c["hosts"] = len(rows)
         out[day] = c
     return out
@@ -6905,6 +6941,8 @@ def push_factory(data: dict, tries: int = 3) -> bool:
         hosts[HOST_ID] = data["days"]
         out = {"repo": data.get("repo", REPO), "updated": data["updated"], "hosts": hosts,
                "days": combine_factory_days(hosts)}
+        if goals := data.get("goals") or remote.get("goals"):  # the host that measures the goal publishes it
+            out["goals"] = goals
         content = base64.b64encode(json.dumps(out, indent=1, sort_keys=True).encode()).decode()
         r = run(["gh", "api", "-X", "PUT", path, "-f", f"message=churn: agent factory metrics {data['updated']} ({HOST_ID})",
                  "-f", f"content={content}", "-f", f"branch={DASH_BRANCH}", *(["-f", f"sha={sha}"] if sha else [])])

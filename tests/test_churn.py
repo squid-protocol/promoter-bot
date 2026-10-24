@@ -3842,7 +3842,8 @@ def test_experiment_walks_every_stage_blind_logged_and_cleaned(churn, exp_world,
         assert churn.experiment_lane(green, {})[0].startswith("experiment E1 run ")
     arm_briefs = [c["brief"] for c in calls if c["step"].startswith("run ")]
     assert all("open NO PR" in x and "[c:-]" in x and "pr_gates.py` (not --fast)" in x for x in arm_briefs)
-    assert not any(label in c["step"] for c in calls for label in ("db", "grep"))  # labels never in a run's name
+    # labels never in a run's name (whole words: a random hex id like 3db91f may contain "db")
+    assert not any(label in c["step"].split() for c in calls for label in ("db", "grep"))
     assert "scoring next" in churn.experiment_lane(green, {})[0]
     assert churn.experiment_lane(green, {}) == ["experiment E1 blind scoring"]
     score_brief = calls[-1]["brief"]
@@ -3961,3 +3962,36 @@ def test_admission_sees_how_long_queued_jobs_have_waited(churn):
     hourly = {"ci_profile": {"target_util": 0.8, "workflows": {}, "waits": [[churn.iso(churn.now()), 1.0]] * 6},
               "ci_occupancy": {"queued_job_age_p50": 9.0, "t": churn.iso(churn.now())}}
     assert "target_util 0.80 -> 0.64" in churn.adjust_target_util(hourly)  # 9 min queued beats the 1-min started p50
+
+
+def test_factory_scorecard_extras_and_goal_publication(churn, tmp_path):
+    """Owner 2026-10-24: first-pass (merged PRs no fix/send-back touched), owner decisions by who answered, the ladder,
+    and a generic goal block for the dashboard's goals sheet."""
+    runs = tmp_path / "runs"
+    for rid, meta in {"a": {"task": "new work on #1", "pr": 11}, "b": {"task": "Fix PR #12 (red check)"},
+                      "c": {"task": "x", "resume_of": "a"}, "d": {"task": "new", "pr": 13}}.items():
+        (runs / rid).mkdir(parents=True)
+        (runs / rid / "meta.json").write_text(json.dumps({"run_id": rid, **meta}))
+    (runs / "a" / "meta.json").write_text(json.dumps({"run_id": "a", "task": "new", "pr": 11, "status": "done"}))
+    (runs / "c" / "meta.json").write_text(json.dumps({"run_id": "c", "task": "x", "resume_of": "a", "pr": 11}))
+    answers = tmp_path / "answers.jsonl"
+    answers.write_text("\n".join(json.dumps(e) for e in (
+        {"t": "2026-10-23T05:00:00Z", "source": "phone"}, {"t": "2026-10-23T06:00:00Z", "source": "auto"},
+        {"t": "2026-10-22T06:00:00Z", "source": "chat"})))
+    snaps = tmp_path / "snaps"
+    snaps.mkdir()
+    (snaps / "goal-2026-10-23T0100Z.json").write_text(json.dumps({"levels": {"L4": 1, "L0": 3}}))
+    (snaps / "goal-2026-10-23T2300Z.json").write_text(json.dumps({"levels": {"L4": 2, "L0": 2, "L4*": 1}}))
+    x = churn.factory_scorecard_extras(dt.date(2026, 10, 23), [{"number": 11}, {"number": 12}, {"number": 13}],
+                                       runs, answers, snaps)
+    assert x["first_pass"] == {"merged": 3, "first_pass": 1}  # 11 sent back, 12 fixed, 13 clean
+    assert x["owner_decisions"] == {"owner": 1, "auto": 1}
+    assert x["ladder"] == {"L4": 3, "L0": 2}  # the day's last snapshot; a carried L4* counts as L4
+    m = {"t": "2026-10-23T23:00Z", "levels": {"L0": 2, "L4": 2}, "by_group": {"e1": {"L4": 2}, "e2": {"L0": 2}},
+         "untranslated": [{"estate": "e2", "program": "P.cbl", "holes": 3, "classes": ["c"], "issues": []}]}
+    g = churn.goal_publication({"goal": {"measure": m}}, snaps)
+    assert g["levels"] == ["L0", "L4"] and g["target"] == "L4" and g["groups"]["e1"] == {"L4": 2}
+    assert set(g["history"]) == {"2026-10-23"} and g["blockers"][0]["name"] == "P.cbl"
+    combined = churn.combine_factory_days({"h1": {"d": {"first_pass": {"merged": 2, "first_pass": 1}, "ladder": {"L4": 1}}},
+                                           "h2": {"d": {"first_pass": {"merged": 3, "first_pass": 3}}}})
+    assert combined["d"]["first_pass"] == {"merged": 5, "first_pass": 4} and combined["d"]["ladder"] == {"L4": 1}
