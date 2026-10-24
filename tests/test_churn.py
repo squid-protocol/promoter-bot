@@ -3842,7 +3842,8 @@ def test_experiment_walks_every_stage_blind_logged_and_cleaned(churn, exp_world,
         assert churn.experiment_lane(green, {})[0].startswith("experiment E1 run ")
     arm_briefs = [c["brief"] for c in calls if c["step"].startswith("run ")]
     assert all("open NO PR" in x and "[c:-]" in x and "pr_gates.py` (not --fast)" in x for x in arm_briefs)
-    assert not any(label in c["step"] for c in calls for label in ("db", "grep"))  # labels never in a run's name
+    # labels never in a run's name (whole words: a random hex id like 3db91f may contain "db")
+    assert not any(label in c["step"].split() for c in calls for label in ("db", "grep"))
     assert "scoring next" in churn.experiment_lane(green, {})[0]
     assert churn.experiment_lane(green, {}) == ["experiment E1 blind scoring"]
     score_brief = calls[-1]["brief"]
