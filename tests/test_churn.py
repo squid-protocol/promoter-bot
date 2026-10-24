@@ -3760,3 +3760,21 @@ def test_scratch_watch_is_silent_when_the_tree_cannot_be_measured(churn, monkeyp
     monkeypatch.setattr(churn, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "du: cannot access"))
     monkeypatch.setattr(churn, "notify", lambda *a, **kw: pytest.fail("paged"))
     assert churn.scratch_watch({}) == []
+
+
+def test_standing_workflow_grant_allows_workflow_edits_but_not_the_shepherds(churn, tmp_path, capsys):
+    """Owner 2026-10-24: standing OK for .github/workflows edits; the merge bot's own workflows still need the PR's OK."""
+    ok = lambda: subprocess.CompletedProcess([], 0, "6/6 gates pass", "")  # noqa: E731
+    wt = _repo_with_conflict(tmp_path, conflict=False, workflow=True)
+    assert churn.precheck_problems({"worktree": str(wt), "allow_workflows": "standing"}, GOOD_BODY, gates=ok) == []
+    (wt / ".github/workflows/shepherd-event.yml").write_text("on: push\n")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-q", "-m", "shepherd")
+    probs = churn.precheck_problems({"worktree": str(wt), "allow_workflows": "standing"}, GOOD_BODY, gates=ok)
+    assert len(probs) == 1 and "shepherd-event.yml" in probs[0] and "ci.yml" not in probs[0]
+    assert churn.precheck_problems({"worktree": str(wt), "allow_workflows": True}, GOOD_BODY, gates=ok) == []
+    assert not churn.standing_workflows(churn.load_state())
+    churn.cmd_policy(argparse.Namespace(name="workflows", value="on"))
+    assert churn.standing_workflows(churn.load_state())
+    churn.cmd_policy(argparse.Namespace(name="workflows", value="off"))
+    assert not churn.standing_workflows(churn.load_state())

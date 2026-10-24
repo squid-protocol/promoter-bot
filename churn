@@ -697,8 +697,11 @@ def precheck_problems(meta: dict, body: str, gates=None) -> list[str]:
         files = [x for x in mt.stdout.splitlines()[1:] if x.strip() and not x.startswith(("Auto-merging", "CONFLICT"))]
         out.append("conflicts with main in " + ", ".join(files[:8]) + ": `git merge origin/main` (never rebase), resolve, "
                    "regenerate generated files with their tools")
-    if meta.get("allow_workflows") is False:
+    aw = meta.get("allow_workflows")
+    if aw is False or aw == "standing":
         wf = run(["git", "-C", wt, "diff", "--name-only", "origin/main...HEAD", "--", ".github/workflows"]).stdout.split()
+        if aw == "standing":  # the standing grant stops short of the shepherd's own workflows
+            wf = [f for f in wf if SHEPHERD_WORKFLOWS.match(f)]
         if wf:
             out.append(f"edits {', '.join(wf)} but the queue item has no allow_workflows: drop the workflow change "
                        "(night-shift Never rule) or say in the report that it needs the owner")
@@ -731,8 +734,11 @@ def cmd_precheck(a) -> int:
     meta = json.loads((rd / "meta.json").read_text())
     try:
         body = str(gh_json(f"repos/{REPO}/pulls/{meta['pr']}").get("body") or "")
-        if pr_allows_workflows(load_state(), meta.get("pr")):
+        st = load_state()
+        if pr_allows_workflows(st, meta.get("pr")):
             meta = {**meta, "allow_workflows": True}
+        elif not meta.get("allow_workflows") and standing_workflows(st):
+            meta = {**meta, "allow_workflows": "standing"}
         problems = precheck_problems(meta, body)
     except (RuntimeError, subprocess.TimeoutExpired, OSError, KeyError) as e:
         problems, err = [], f"precheck could not run: {e}"[:300]
@@ -1561,6 +1567,14 @@ def checklist_note(issue: int) -> str:
 
 
 WORKFLOW_GRANT_HOURS = 24
+# Owner 2026-10-24 (chat): "i approve workflow changes" -- 11 of 18 owner waits were the same workflow-edit question.
+# The standing grant (`churn policy workflows on`) allows .github/workflows edits on every item and PR, except the
+# shepherd's own workflows: the merge bot changing itself still takes the per-PR OK (`churn pr allow-workflows N`).
+SHEPHERD_WORKFLOWS = re.compile(r"^\.github/workflows/shepherd[-_.]")
+
+
+def standing_workflows(state: dict) -> bool:
+    return bool((state.get("owner_policy") or {}).get("workflows"))
 
 
 def owner_allows_workflows(state: dict, issue) -> bool:
@@ -1628,6 +1642,8 @@ def cmd_worker(a) -> int:
         cap = worker_cap(state, plan, [r.get("model", "sonnet") for r in live] + [model])
         allow_wf = ((resume_of or {}).get("allow_workflows") if resume_of else owner_allows_workflows(state, issue)) or any(
             isinstance(p, dict) and p.get("allow_workflows") and p.get("issue") == issue for p in state.get("prs", []))
+        if not allow_wf and standing_workflows(state):
+            allow_wf = "standing"
         if getattr(a, "allow_workflows", False) and not allow_wf:
             raise SystemExit(f"--allow-workflows: the owner has not allowed workflow edits for #{issue} (no allow_workflows "
                              "queue item, recent grant or `churn pr allow-workflows`); the flag only confirms a grant")
@@ -1658,7 +1674,7 @@ def cmd_worker(a) -> int:
             "resume_of": resume_of["run_id"] if resume_of else None, "plan": plan,
             "resume_base_usd": round(session_cost_at(resume_of), 4) if resume_of else 0.0,
             "check_of": getattr(a, "check_of", None), "repo": getattr(a, "repo", None) or None,
-            "allow_workflows": bool(allow_wf), "precheck_of": getattr(a, "precheck_of", None),
+            "allow_workflows": "standing" if allow_wf == "standing" else bool(allow_wf), "precheck_of": getattr(a, "precheck_of", None),
             "head_start": run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip() or None}
     if credit:
         meta.update(lane="credit", queue_item=getattr(a, "queue_item", None))
@@ -4802,7 +4818,9 @@ def fresh_spec(state: dict, snap: dict, x: dict) -> dict | None:
              f"criteria first.\n"
              + (f"\nCopy this line into the PR body under `## Owner decisions`: {owner.group(0)}\n" if owner else "")
              + ("\nThe owner queued this workflow change (allow_workflows): editing .github/workflows is in scope.\n"
-                if x.get("allow_workflows") else "")
+                if x.get("allow_workflows") else
+                "\nThe owner's standing grant allows .github/workflows edits the issue needs (not shepherd-*.yml); "
+                "review the workflow diff extra carefully.\n" if standing_workflows(state) else "")
              + f"\n{tpl}\n")
     return {"worktree": None, "branch": None, "plan": None, "brief": brief}
 
@@ -6627,6 +6645,20 @@ def requeue_next_slice(state: dict, f: dict, nxt: str | None) -> str | None:
     return f"queued the next slice of #{issue}" + ("" if nxt else " (generic: no --next)")
 
 
+def cmd_policy(a) -> int:
+    """The owner's standing grants under state.owner_policy; with no value, print them."""
+    if a.name and a.value:
+        with edit_state() as st:
+            pol = st.setdefault("owner_policy", {})
+            if a.value == "on":
+                pol[a.name] = iso(now())
+            else:
+                pol.pop(a.name, None)
+        log(f"owner policy: {a.name} {a.value}")
+    print(json.dumps(load_state().get("owner_policy") or {}, indent=1))
+    return 0
+
+
 def cmd_followup(a) -> int:
     with edit_state() as st:
         f = next((f for f in st.get("followups", []) if f["pr"] == a.number), None)
@@ -6935,6 +6967,9 @@ def main() -> int:
     pp.add_argument("--head")
     pp.add_argument("--verdict", choices=["merge", "send-back", "hold"])
     pp.add_argument("--note")
+    po = sub.add_parser("policy", help="the owner's standing grants (show, or set: `policy workflows on|off`)")
+    po.add_argument("name", nargs="?", choices=["workflows"])
+    po.add_argument("value", nargs="?", choices=["on", "off"])
     fp = sub.add_parser("followup", help="clear a merged/closed-PR followup after the issue decision")
     fp.add_argument("action", choices=["done"])
     fp.add_argument("number", type=int)
@@ -7052,6 +7087,8 @@ def main() -> int:
         return cmd_pr(a)
     if a.cmd == "followup":
         return cmd_followup(a)
+    if a.cmd == "policy":
+        return cmd_policy(a)
     if a.cmd == "review":
         return cmd_review(a)
     if a.cmd == "agy-result":
