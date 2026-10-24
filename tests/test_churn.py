@@ -3920,3 +3920,44 @@ def test_experiment_proposals_file_feeds_the_lane_one_at_a_time(churn, exp_world
     assert churn.experiment_lane(green, {}) == ["experiment E1 proposed (retro)"]
     assert "- [x] Does X help? | the brief -> E1" in churn.EXP_PROPOSALS.read_text()
     assert churn.load_state()["experiments"][0]["source"] == "retro"
+
+
+def test_ci_occupancy_counts_jobs_not_runs_and_live_waits_reuse_them(churn):
+    """2026-10-24: `in_progress` counted ~10 RUNS, which read as half the 20 runners idle; a job sample found 18-22
+    running and 41-68 queued. Occupancy reads every run's jobs once (light workflows too) and live waits reuse them."""
+    ago = lambda m: churn.iso(churn.now() - dt.timedelta(minutes=m))  # noqa: E731
+    jobs = {1: [{"id": 11, "status": "in_progress", "created_at": ago(9), "started_at": ago(5)},
+                {"id": 12, "status": "queued", "created_at": ago(8)}],
+            2: [{"id": 21, "status": "in_progress", "created_at": ago(3), "started_at": ago(2)},
+                {"id": 22, "status": "in_progress", "created_at": ago(3), "started_at": ago(1)},
+                {"id": 23, "status": "queued", "created_at": ago(30)}]}
+    calls = []
+
+    def gh(path):
+        calls.append(path)
+        return {"jobs": jobs[int(path.split("/runs/")[1].split("/")[0])]}
+
+    runs = [{"id": 1, "event": "pull_request", "created_at": ago(9), "path": ".github/workflows/smoke-test.yml"},
+            {"id": 2, "event": "pull_request", "created_at": ago(3), "path": ".github/workflows/light.yml"}]
+    occ = churn.ci_occupancy({}, runs, gh=gh)
+    assert (occ["jobs_running"], occ["jobs_queued"], occ["runs_read"]) == (3, 2, 2)
+    assert 29.5 <= occ["queued_job_age_max"] <= 31.5 and occ["queued_job_age_p50"] == occ["queued_job_age_max"]
+    n = len(calls)
+    waits = churn.live_pr_job_waits({}, runs, gh=gh, jobs=occ["jobs"])
+    assert len(calls) == n and len(waits) == 5  # no second read of the same runs
+    with_cap = churn.ci_occupancy({"ci_admission_cfg": {"occupancy_runs": 1}}, runs, gh=gh)
+    assert with_cap["runs_read"] == 1 and with_cap["runs_unread"] == 1
+
+
+def test_admission_sees_how_long_queued_jobs_have_waited(churn):
+    """Started-job waits only show the waits that ended: queued jobs' age cuts, blocks a climb, and lifts the hourly p50."""
+    st = {"ci_profile": {"target_util": 0.8, "workflows": {}, "waits": []}}
+    note = churn.fast_cut(st, [], queued_wait=1.0, queued_job_age=12.0)
+    assert note and "queued jobs' median wait so far 12.0" in note and st["ci_profile"]["target_util"] == 0.64
+    calm = {"ci_profile": {"target_util": 0.5, "workflows": {}, "waits": [],
+                           "live_waits": [[i, churn.iso(churn.now()), 0.5] for i in range(6)]}}
+    assert churn.fast_climb(calm, 0.5, queued_job_age=4.0) is None  # queued jobs still waiting: no climb
+    assert churn.fast_climb(calm, 0.5, queued_job_age=1.0) is not None
+    hourly = {"ci_profile": {"target_util": 0.8, "workflows": {}, "waits": [[churn.iso(churn.now()), 1.0]] * 6},
+              "ci_occupancy": {"queued_job_age_p50": 9.0, "t": churn.iso(churn.now())}}
+    assert "target_util 0.80 -> 0.64" in churn.adjust_target_util(hourly)  # 9 min queued beats the 1-min started p50
