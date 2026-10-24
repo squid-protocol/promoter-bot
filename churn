@@ -4460,7 +4460,7 @@ def per_push_cost(runs: list[dict], prof: dict, cfg: dict) -> float | None:
 CI_ADMISSION_DEFAULT = {"target_wait_min": 5.0, "util_init": 0.8, "util_min": 0.3, "util_max": 1.0, "util_step": 0.05,
                         "util_cut": 0.8, "pushes_per_pr": 2.0, "horizon_min": 60, "min_waits": 5,
                         "live_runs": 2, "fast_factor": 1.5, "fast_window_min": 30, "fast_every_min": 20,
-                        "hold_queue_wait_min": 10.0, "climb_every_min": 20}
+                        "hold_queue_wait_min": 10.0, "climb_every_min": 20, "occupancy_runs": 25}
 
 
 def ci_admission_cfg(state: dict) -> dict:
@@ -4484,6 +4484,10 @@ def adjust_target_util(state: dict) -> str | None:
         prof["target_util"] = u
         return None
     p50, target = waits[len(waits) // 2], float(cfg["target_wait_min"])
+    occ = state.get("ci_occupancy") or {}
+    if (age := occ.get("queued_job_age_p50")) is not None and (t := parse_iso(occ.get("t"))) \
+            and now() - t < dt.timedelta(minutes=30):
+        p50 = max(p50, float(age))  # started jobs only show the waits that ended; the ones still queued are longer
     if p50 > target:
         new = max(float(cfg["util_min"]), u * float(cfg["util_cut"]))
     elif p50 < 0.6 * target:
@@ -4495,19 +4499,51 @@ def adjust_target_util(state: dict) -> str | None:
         if round(new, 3) != round(u, 3) else None
 
 
-def live_pr_job_waits(state: dict, in_progress: list[dict] | None, gh=None) -> list[list]:
+def ci_occupancy(state: dict, in_progress: list[dict] | None, gh=None) -> dict:
+    """Runner occupancy from the jobs of every run in progress (newest occupancy_runs, one API call each), counting the
+    ignored light workflows too: they hold runners. 2026-10-24: the snapshot's `in_progress` counts RUNS (~10), which
+    read as half the 20-runner pool idle; a job-level sample found 18-22 jobs running and 41-68 queued, queued jobs
+    waiting a median 1.5-8 min and up to 37 min, while the started-job wait churn tuned on said ~3.6 min. Returns
+    jobs_running, jobs_queued, queued_job_age_p50 / _max (minutes so far), runs_read, and `jobs` {run id: jobs} for
+    live_pr_job_waits to reuse."""
+    n = int(ci_admission_cfg(state)["occupancy_runs"])
+    runs = sorted((r for r in in_progress or [] if r.get("id")), key=lambda r: str(r.get("created_at") or ""),
+                  reverse=True)
+    jobs_by_run, running, ages = {}, 0, []
+    for r in runs[:n]:
+        try:
+            jobs = (gh or gh_json)(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100&filter=latest").get("jobs", [])
+        except RuntimeError:
+            continue
+        jobs_by_run[r["id"]] = jobs
+        for j in jobs:
+            if j.get("status") == "in_progress":
+                running += 1
+            elif j.get("status") in ("queued", "waiting", "pending") and (c := parse_iso(j.get("created_at"))):
+                ages.append(round(max(0.0, (now() - c).total_seconds() / 60), 1))
+    ages.sort()
+    return {"jobs_running": running, "jobs_queued": len(ages), "runs_read": len(jobs_by_run),
+            **({"runs_unread": len(runs) - n} if len(runs) > n else {}),
+            "queued_job_age_p50": ages[len(ages) // 2] if ages else None, "queued_job_age_max": ages[-1] if ages else None,
+            "jobs": jobs_by_run}
+
+
+def live_pr_job_waits(state: dict, in_progress: list[dict] | None, gh=None, jobs: dict | None = None) -> list[list]:
     """[job id, wait min] for the jobs of the newest live_runs pull_request runs in progress: a started job's queue
-    wait, or a queued job's wait so far (a lower bound). One API call per run read."""
+    wait, or a queued job's wait so far (a lower bound). One API call per run read, none for a run in `jobs`
+    (ci_occupancy already read it)."""
     n = int(ci_admission_cfg(state)["live_runs"])
     runs = sorted((r for r in in_progress or [] if r.get("event") == "pull_request" and r.get("id")),
                   key=lambda r: str(r.get("created_at") or ""), reverse=True)[:n]
     out = []
     for r in runs:
         try:
-            jobs = (gh or gh_json)(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100").get("jobs", [])
+            got = (jobs or {}).get(r["id"])
+            jobs_r = got if got is not None else (gh or gh_json)(
+                f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100").get("jobs", [])
         except RuntimeError:
             continue
-        for j in jobs:
+        for j in jobs_r:
             if j.get("conclusion") == "skipped" or not (c := parse_iso(j.get("created_at"))):
                 continue
             s = None if j.get("status") == "queued" else parse_iso(j.get("started_at"))
@@ -4515,7 +4551,8 @@ def live_pr_job_waits(state: dict, in_progress: list[dict] | None, gh=None) -> l
     return out
 
 
-def fast_cut(state: dict, live: list[list], queued_wait: float | None = None) -> str | None:
+def fast_cut(state: dict, live: list[list], queued_wait: float | None = None,
+             queued_job_age: float | None = None) -> str | None:
     """Fold this tick's live job waits into ci_profile.live_waits (by job id, fast_window_min kept) and cut target_util
     (x util_cut) when their p50, or `queued_wait` (the queued runs' median wait, which no started job shows), is over
     fast_factor x target_wait_min; at most every fast_every_min."""
@@ -4529,7 +4566,8 @@ def fast_cut(state: dict, live: list[list], queued_wait: float | None = None) ->
     waits = sorted(x[2] for x in prof["live_waits"])
     limit = float(cfg["fast_factor"]) * float(cfg["target_wait_min"])
     over = [(v, what) for v, what in ((waits[len(waits) // 2] if len(waits) >= int(cfg["min_waits"]) else None,
-                                       "live PR job wait p50"), (queued_wait, "queued runs' median wait"))
+                                       "live PR job wait p50"), (queued_wait, "queued runs' median wait"),
+                                      (queued_job_age, "queued jobs' median wait so far"))
             if v is not None and float(v) > limit]
     last = parse_iso(prof.get("fast_cut_at"))
     if not over or (last and now() - last < dt.timedelta(minutes=float(cfg["fast_every_min"]))):
@@ -4541,7 +4579,7 @@ def fast_cut(state: dict, live: list[list], queued_wait: float | None = None) ->
     return f"ci admission: {what} {v} min over {limit:g}: target_util {u:.2f} -> {new:.2f} (fast cut)"
 
 
-def fast_climb(state: dict, queued_wait: float | None) -> str | None:
+def fast_climb(state: dict, queued_wait: float | None, queued_job_age: float | None = None) -> str | None:
     """The fast cut's other half (2026-10-23): cuts came every tick but the climb only hourly, on completed-run waits,
     so the 2026-10-23 storm left target_util at the 0.3 floor for half a day while live waits were 2 min. Raise it by
     util_step at most every climb_every_min while the live PR job wait p50 (as folded by fast_cut) and the queued runs'
@@ -4552,6 +4590,7 @@ def fast_climb(state: dict, queued_wait: float | None) -> str | None:
     waits = sorted(x[2] for x in prof.get("live_waits", []))
     calm = 0.6 * float(cfg["target_wait_min"])
     if (u >= float(cfg["util_max"]) or queued_wait is None or float(queued_wait) >= calm
+            or (queued_job_age is not None and float(queued_job_age) >= calm)
             or len(waits) < int(cfg["min_waits"]) or waits[len(waits) // 2] >= calm):
         return None
     every = dt.timedelta(minutes=float(cfg["climb_every_min"]))
@@ -4648,6 +4687,7 @@ def log_ci_snapshot(state: dict, q: dict, path: Path | None = None) -> None:
     row = {"t": iso(now()), "host": HOST_ID, **{k: v for k, v in q.items() if k not in ("t", "by_workflow")},
            **{k: v for k, v in (state.get("ci_backlog") or {}).items() if k != "t"},
            **{k: v for k, v in (state.get("ci_admission") or {}).items() if k != "t"},
+           **{k: v for k, v in (state.get("ci_occupancy") or {}).items() if k != "t"},
            "mode": state.get("ci_mode", "calm"), "mode_since": state.get("ci_mode_since"),
            "running": len(live), "running_backfill": sum(r.get("lane") == "backfill" for r in live),
            "queue_len": len(state.get("queue", []))}
@@ -6369,18 +6409,23 @@ def cmd_tick(a) -> int:
             for note in gc_worktrees_if_due(b):
                 log(note)
             ign = ci_cfg(state)["ignore_workflows"]
-            cq, inprog = ci_queue(ignore=ign), ci_in_progress(ignore=ign)
+            cq, inprog_all = ci_queue(ignore=ign), ci_in_progress()
+            inprog = None if inprog_all is None else [r for r in inprog_all
+                                                      if os.path.basename(str(r.get("path", ""))) not in set(ign)]
+            occ = ci_occupancy(state, inprog_all) if inprog_all is not None else {}
             want = [*collections.Counter(cq.get("by_workflow") or {}).elements(),
                     *(os.path.basename(str(r.get("path", ""))) for r in inprog or [])]
             for note in ci_profile_sample(state, ignore=ign, want=want):  # GitHub calls outside the state lock
                 log(note, quiet=True)
-            live_waits = live_pr_job_waits(state, inprog)
+            live_waits = live_pr_job_waits(state, inprog, jobs=occ.get("jobs"))
             with edit_state() as st:
                 for note in retire_ci_pressure(st):
                     log(note)
                 st["ci_profile"] = state.get("ci_profile") or st.get("ci_profile")
                 qw = None if "error" in cq else cq.get("median_wait_min")
-                if note := fast_cut(st, live_waits, qw) or fast_climb(st, qw):
+                st["ci_occupancy"] = {**{k: v for k, v in occ.items() if k != "jobs"}, "t": iso(now())} if occ else {}
+                qa = occ.get("queued_job_age_p50")
+                if note := fast_cut(st, live_waits, qw, qa) or fast_climb(st, qw, qa):
                     log(note)
                 st["ci_backlog"] = {**ci_backlog(st, cq, inprog), "t": iso(now())}
                 st["ci_admission"] = {**ci_admission(st, st["ci_backlog"], cq), "t": iso(now())}  # #38: decides the mode
@@ -7024,7 +7069,12 @@ def cmd_status(a) -> int:
         wfs = (state.get("ci_profile") or {}).get("workflows") or {}
         print(f"CI backlog: {bl.get('backlog_min')} min to drain on {bl.get('pool')} runners "
               f"({bl.get('queued_rm')} queued + {bl.get('active_rm')} in-progress runner-min); PR job wait p50 "
-              f"{bl.get('job_wait_p50')} min (n={bl.get('job_wait_n')}); {len(wfs)} workflows profiled")
+              f"{bl.get('job_wait_p50')} min (n={bl.get('job_wait_n')}, started jobs only); {len(wfs)} workflows profiled")
+    if oc := state.get("ci_occupancy"):
+        print(f"CI runners: {oc.get('jobs_running')} jobs running of {(state.get('ci_backlog') or {}).get('pool', '?')}, "
+              f"{oc.get('jobs_queued')} queued inside running runs + {cq.get('queued', '?')} runs not started; queued jobs "
+              f"waiting {oc.get('queued_job_age_p50')} min median, {oc.get('queued_job_age_max')} max "
+              f"({oc.get('runs_read')} runs read at {oc.get('t', '?')})")
     if ad := state.get("ci_admission"):
         lw = sorted(x[2] for x in (state.get("ci_profile") or {}).get("live_waits", []))
         print(f"CI admission: admits {ad.get('admit')} launch(es) now" + (f" (HELD: {ad['held']})" if ad.get("held") else "")
