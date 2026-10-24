@@ -3961,3 +3961,48 @@ def test_admission_sees_how_long_queued_jobs_have_waited(churn):
     hourly = {"ci_profile": {"target_util": 0.8, "workflows": {}, "waits": [[churn.iso(churn.now()), 1.0]] * 6},
               "ci_occupancy": {"queued_job_age_p50": 9.0, "t": churn.iso(churn.now())}}
     assert "target_util 0.80 -> 0.64" in churn.adjust_target_util(hourly)  # 9 min queued beats the 1-min started p50
+
+
+def test_standing_grant_releases_workflow_holds_so_the_pr_is_reviewed_again(churn):
+    """2026-10-24: owner-approved workflow PRs stayed on `hold` at their head, which makes no need: stuck for hours."""
+    head = "abc123def456"
+    put(churn, owner_policy={"workflows": "2026-10-24T13:02Z"},
+        prs=[{"number": 6404, "reviewed_head": head, "verdict": "hold", "note": "edits cics-crucible.yml without allow_workflows"},
+             {"number": 6500, "reviewed_head": head, "verdict": "hold", "note": "cpp baseline -1.2pt: owner call"},
+             {"number": 6501, "reviewed_head": head, "verdict": "hold", "note": "edits shepherd-event.yml workflow"}])
+    snap = {str(n): {"state": "open", "head": head} for n in (6404, 6500, 6501)}
+    with churn.edit_state() as st:
+        lines = churn.release_workflow_holds(st, snap)
+    assert len(lines) == 1 and lines[0].startswith("PR #6404: workflow hold released")
+    st = churn.load_state()
+    assert churn.verdict_at_head(st, "6404", snap["6404"]) is None  # unreviewed again: the next tick reviews it
+    assert churn.verdict_at_head(st, "6500", snap["6500"]) == "hold"  # not a workflow hold: stays the owner's
+    assert churn.verdict_at_head(st, "6501", snap["6501"]) == "hold"  # the shepherd's own workflow: per-PR OK still
+    put(churn, prs=[{"number": 6404, "reviewed_head": head, "verdict": "hold", "note": "workflow edit"}])
+    with churn.edit_state() as st:
+        assert churn.release_workflow_holds(st, snap) == []  # no standing grant: holds stand
+
+
+def test_pr_snapshot_reads_watched_prs_in_one_graphql_query_and_falls_back_to_rest(churn, monkeypatch):
+    """#64 (2026-10-24): one REST call per watched PR per gate run was ~33 of ~60 calls a gate, 16-24 gates an hour."""
+    calls = []
+    gql = {"data": {"repository": {
+        "p1": {"number": 1, "state": "OPEN", "headRefOid": "a" * 40, "headRefName": "churn/1-x", "mergeStateStatus": "DIRTY",
+               "body": "Closes #9\nChecklist: done [c:abc12345]", "labels": {"nodes": [{"name": "shepherd:merge"}]}},
+        "p2": {"number": 2, "state": "MERGED", "headRefOid": "b" * 40, "headRefName": "churn/2-y", "mergeStateStatus": "UNKNOWN",
+               "body": "", "labels": {"nodes": []}}, "p3": None}}}
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(gql), "")
+
+    monkeypatch.setattr(churn, "run", fake_run)
+    monkeypatch.setattr(churn, "gh_json", lambda path: calls.append(path) or {
+        "state": "closed", "merged": False, "head": {"sha": "c" * 40, "ref": "x"}, "mergeable_state": "clean", "labels": [], "body": ""})
+    snap = churn.pr_snapshot([1, 2, 3], {"2": {"mergeable_state": "clean"}})
+    assert len([c for c in calls if isinstance(c, list)]) == 1  # one GraphQL query for all three
+    assert calls[-1] == f"repos/{churn.REPO}/pulls/3"  # the one GraphQL could not see: REST
+    assert snap["1"]["mergeable_state"] == "dirty" and snap["1"]["labels"] == ["shepherd:merge"] and snap["1"]["closes"]
+    assert snap["1"]["head"] == "a" * 12 and snap["1"]["check"] == ["done", "abc12345"]
+    assert snap["2"]["merged"] and snap["2"]["state"] == "closed" and snap["2"]["mergeable_state"] == "clean"  # unknown keeps old
+    assert snap["3"]["state"] == "closed"
