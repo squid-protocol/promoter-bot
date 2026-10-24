@@ -220,7 +220,8 @@ LANES = ("normal", "ci", "backfill")
 # their PRs add ~nothing to the shared 20-job runner pool. Only the batched tag + gitgalaxy pin bump touches gitgalaxy CI.
 CRUCIBLE_REPOS = {"estate-crucible", "cics-crucible"}
 QUEUE_KEYS = {"issue", "model", "task", "needs_owner", "backend", "pr", "after_prs", "allow_workflows", "agy_step", "lane", "repo", "after_merge",
-              "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "scope", "promoted", "rescue"}
+              "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "scope", "promoted", "rescue",
+              "regraft", "also_prs"}
 # Owner 2026-10-15: follow-ups ("Siblings of #X" rounds) were jumping the line ahead of the work they came from. Normal
 # items now launch by tier, then queue position: each era's core functionality, then customer-facing items, then
 # translation scores, then follow-ups. `--front` only reorders within a tier. The tier comes from the issue's
@@ -286,6 +287,8 @@ def _norm_queue(q):
         q["pr"] = _int(q["pr"])
     if q.get("wait_run") is not None:
         q["wait_run"] = _int(q["wait_run"])
+    if "also_prs" in q:
+        q["also_prs"] = [_int(x) for x in (q["also_prs"] if isinstance(q["also_prs"], list) else [q["also_prs"]])]
     if "after_prs" in q:
         ap = q["after_prs"] if isinstance(q["after_prs"], list) else [q["after_prs"]]
         q["after_prs"] = [_int(x) for x in ap]
@@ -1619,12 +1622,7 @@ def make_worktree(issue: int, stamp: str) -> tuple[Path, str]:
         if not done:
             return wt, branch
         wt = WT / f"churn-{issue}-{stamp}"  # its PR is merged/closed: start a new branch off origin/main
-    branch = f"churn/{issue}-{stamp}"
-    run(["git", "-C", str(V6), "fetch", "-q", "origin"], timeout=120)
-    r = run(["git", "-C", str(V6), "worktree", "add", "-q", "-b", branch, str(wt), "origin/main"])
-    if r.returncode != 0:
-        raise SystemExit(f"worktree add failed: {r.stderr.strip()}")
-    return wt, branch
+    return new_worktree(issue, stamp, wt)
 
 
 def use_systemd() -> bool:
@@ -5276,6 +5274,147 @@ def rescue_task(n, branch: str | None, issue: int, loops: int, why: list[str]) -
             f"There is no second rescue: if this fails again the PR goes to the owner.")
 
 
+# Owner 2026-10-24: a PR far behind the train never recovers by merging main. #5898/#5900 (10-21) used their two
+# fix runs and their rescue, parked as "owner decides", the tick auto-held them, and they sat 3 days while main moved
+# ~560 commits on (18 of 19 conflicts were generated det-sweep ledgers). A stale PR (conflicting and STALE_BEHIND
+# commits behind, or past its rescue) is REGRAFTED once instead: a fresh branch off current main carries only the PR's
+# net hand-written change, generated files are regenerated, a new PR supersedes the old one. Stale PRs of one issue go
+# in one regraft. If the PR is still open after its regraft, the gate closes it and queues the slice afresh on the
+# issue; the owner is asked only when the regraft run says only the owner can rule.
+STALE_BEHIND = 150
+BEHIND_TTL_H = 6
+REGRAFT_TAG = "REGRAFT"
+GENERATED_RE = re.compile(r"(^docs/|det_sweep_coverage/|baseline[^/]*\.json$|ledger|_report\b|\.test_durations$|"
+                          r"^tests/fixtures/evidence_report/|CHANGELOG)")
+REGRAFT_VERDICT_RE = re.compile(r"REGRAFT VERDICT:\s*(REGRAFTED|DONE|RESTART|OWNER)\b:?\s*(.*)", re.I)
+
+
+def behind_main(entry: dict | None, n: int, head: str, compare=None) -> int:
+    """Commits on main that PR n's head lacks, cached on its state.prs entry per head for BEHIND_TTL_H (0 = unknown)."""
+    if entry is None or not head:
+        return 0
+    c = entry.get("behind") or {}
+    if c.get("head") == head and (t := parse_iso(c.get("t"))) and now() - t < dt.timedelta(hours=BEHIND_TTL_H):
+        return int(c.get("n") or 0)
+    try:
+        k = int(((compare or gh_json)(f"repos/{REPO}/compare/{head}...main") or {}).get("ahead_by") or 0)
+    except (RuntimeError, ValueError, AttributeError, TypeError):
+        return int(c.get("n") or 0) if c.get("head") == head else 0
+    entry["behind"] = {"head": head, "n": k, "t": iso(now())}
+    return k
+
+
+def conflict_files(n: int) -> list[str] | None:
+    """Files PR n's head conflicts on against origin/main (git merge-tree in V6), or None when unknown."""
+    if run(["git", "-C", str(V6), "fetch", "-q", "origin", "main", f"pull/{n}/head:refs/churn/regraft/{n}"],
+           timeout=180).returncode:
+        return None
+    r = run(["git", "-C", str(V6), "merge-tree", "--write-tree", "--name-only", "origin/main", f"refs/churn/regraft/{n}"])
+    if r.returncode not in (0, 1):
+        return None
+    if not r.returncode:
+        return []
+    files = []
+    for x in r.stdout.splitlines()[1:]:  # first line is the tree; names until the blank line, then messages
+        if not x.strip():
+            break
+        files.append(x.strip())
+    return files
+
+
+def was_regrafted(pr: int, issue: int) -> str | None:
+    """The newest finished regraft run that carried PR pr (one regraft per PR; a crashed or limit-killed one does not
+    count), or None."""
+    hits = [m for d in RUNS.glob(f"{issue}-*") if (m := _run_meta(d.name))
+            and m.get("status") == "done" and re.match(rf"{REGRAFT_TAG} \(PR [^)]*#{pr}\b", m.get("task") or "")]
+    return max(hits, key=lambda m: m.get("started", "")).get("run_id") if hits else None
+
+
+def regraft_verdict(rid: str) -> tuple[str, str] | None:
+    """The run's closing `REGRAFT VERDICT: X ...` line as (X, rest), or None (no verdict: it failed or is unread)."""
+    with contextlib.suppress(OSError, ValueError):
+        result = str(json.loads((RUNS / rid / "out.json").read_text()).get("result") or "")
+        if hits := REGRAFT_VERDICT_RE.findall(result):
+            return hits[-1][0].upper(), hits[-1][1].strip()[:300]
+    return None
+
+
+def regraft_task(prs: list[int], issue: int, behind: int, files: list[str] | None, why: list[str]) -> str:
+    """The regraft brief: re-apply the PRs' net hand-written change on a fresh branch off current main."""
+    names = ", ".join(f"#{p}" for p in prs)
+    hand = [f for f in files or [] if not GENERATED_RE.search(f)]
+    seen = (f" Conflicts against main: {len(files)} files, hand-written: {', '.join(hand[:8]) or 'none'}."
+            if files is not None else "")
+    many = (f" The PRs are stacked slices of #{issue}: carry them as ONE new PR if together they stay within the "
+            f"5-hand-written-file rule, else one new PR per old PR." if len(prs) > 1 else "")
+    src = " ".join(f"`git fetch origin pull/{p}/head:regraft-src-{p}`" for p in prs)
+    return (f"{REGRAFT_TAG} (PR {names}): {behind} commits behind main ({' + '.join(why)}); merging main into it has "
+            f"stopped working.{seen}{many} Do NOT merge main into the old branch and do NOT rebase or force-push it. "
+            f"Your worktree is a FRESH branch off current origin/main. 1. {src}; the PR's own change is "
+            f"`git diff $(git merge-base origin/main regraft-src-N) regraft-src-N`. 2. Check it is still needed: if main "
+            f"already does it, close the old PR(s) with a comment naming the main commit, verdict DONE. 3. Re-apply only "
+            f"the hand-written files (`git apply -3`, or by hand against main's CURRENT version: the code under it may have "
+            f"moved). Never carry generated files (coverage ledgers, baselines, generated docs/reports): regenerate them "
+            f"with the repo's tools after the change. 4. Gates, push, open the new PR: the old title, `Part of #{issue}`, "
+            f"`Supersedes {names}`, and the old body's class table, owner decisions and `Checklist:` line. Then close each "
+            f"old PR with a comment linking the new one. Verdict REGRAFTED. 5. If the change no longer fits main (the code "
+            f"it touched was rewritten), close the old PR(s) saying why and append `## Plan (regraft of PR {names})` to "
+            f"issue #{issue} with Sonnet-sized steps, verdict RESTART. OWNER only for a ruling only the owner can make: "
+            f"one plain question. End your report with exactly one line `REGRAFT VERDICT: REGRAFTED #<new> | DONE | "
+            f"RESTART | OWNER: <question>`.")
+
+
+def owner_held(n: int) -> bool:
+    """The owner (not the tick's auto-hold) answered "hold" on PR n's item in owner-answers.jsonl."""
+    with contextlib.suppress(OSError):
+        for line in (H / "owner-answers.jsonl").read_text().splitlines():
+            with contextlib.suppress(ValueError):
+                e = json.loads(line)
+                if (isinstance(e, dict) and str(e.get("answer", "")).lower() == "hold"
+                        and re.search(rf"PR #{n}\b", str(e.get("item", "")))
+                        and not str(e.get("note", "")).startswith("auto-hold")):
+                    return True
+    return False
+
+
+def expire_owner_parks(state: dict) -> list[str]:
+    """Drop the fix-loop cap's "owner decides" items the owner never answered (only the tick's auto-hold): they parked
+    forever while main ran away from the PR. The next pass judges the PR again, and it is regrafted. Kept: an item with
+    a note (the owner or a regraft parked it) or a real owner hold."""
+    out, keep = [], []
+    for q in state.get("queue", []):
+        if (q.get("auto") == "pr-fix" and q.get("needs_owner") and q.get("pr") and not q.get("note")
+                and not owner_held(int(q["pr"]))):
+            out.append(f"#{q['pr']}")
+            continue
+        keep.append(q)
+    state["queue"] = keep
+    return out
+
+
+def close_and_restart(state: dict, n: int, issue: int, rid: str) -> None:
+    """A PR still open after its regraft: close it (pointing at the run) and queue its slice afresh on the issue."""
+    run(["gh", "pr", "close", str(n), "-R", REPO, "--comment",
+         f"Closed by churn: this PR fell too far behind main and its regraft (run {rid}) could not carry it. The slice "
+         f"is queued again on #{issue}, from current main."])
+    state.setdefault("queue", []).append({
+        "issue": issue, "model": "sonnet", "needs_owner": False, "auto": "restart", "tier": "followup",
+        "task": f"RESTART the slice of closed PR #{n} from current main: its regraft (run {rid}) could not carry it. "
+                f"Read `gh pr view {n}` and its diff for what to reuse and the issue's latest `## Plan` section; re-do "
+                f"the change on a fresh branch, regenerate generated files, one PR."})
+
+
+def new_worktree(issue: int, stamp: str, wt: Path | None = None) -> tuple[Path, str]:
+    """A new churn/<issue>-<stamp> branch off freshly fetched origin/main in its own worktree."""
+    wt = wt or WT / f"churn-{issue}-{stamp}"
+    branch = f"churn/{issue}-{stamp}"
+    run(["git", "-C", str(V6), "fetch", "-q", "origin"], timeout=120)
+    r = run(["git", "-C", str(V6), "worktree", "add", "-q", "-b", branch, str(wt), "origin/main"])
+    if r.returncode != 0:
+        raise SystemExit(f"worktree add failed: {r.stderr.strip()}")
+    return wt, branch
+
+
 FIX_SETTLE_MIN = 15  # a run on the PR finished this recently: CI on its push has not reported yet (#20)
 
 
@@ -5321,7 +5460,7 @@ def carry_reviews(state: dict, snap: dict, compare=None) -> list[str]:
     return out
 
 
-def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None) -> list[str]:
+def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=None, conflicts=None) -> list[str]:
     """Owner 2026-10-13: #5038/#5041 sat conflicting for hours because a tick with no free slot only logged them and
     stuck_seen then hid them. Any watched open PR that is conflicting (dirty) or shepherd:needs-fix, with no live worker
     on it and no queue item for it, gets a fix item at the FRONT of the queue (key "pr").
@@ -5329,9 +5468,9 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None) -> list[st
     merged a tick dropped the fix item ("clean, nothing to fix"), the head never moved, and 5 items blocked on it idled
     the slots ~20 h. A send-back stays a need until the head changes."""
     live = [r for r in state.get("running", []) if pid_alive(r.get("pid"))]
-    queued = {int(q["pr"]) for q in state.get("queue", []) if q.get("pr")}
+    added = [f"expired:{x}" for x in expire_owner_parks(state)]
+    queued = {int(p) for q in state.get("queue", []) for p in [q.get("pr"), *q.get("also_prs", [])] if p}
     issue_of = {pr_num(p): p.get("issue") for p in state.get("prs", []) if isinstance(p, dict)}
-    added = []
     for n, v in snap.items():
         if v.get("state") != "open" or int(n) in queued or pr_in_hand(n, v, live) or flaked(state, n, v):
             continue
@@ -5372,11 +5511,45 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None) -> list[st
                 continue
         loops = recent_fix_runs(int(n), issue)
         # Owner 2026-10-17: two Sonnet fix runs, then ONE Opus rescue that judges the PR (save / slice / restart /
-        # owner); a PR that fails again after its rescue goes to the owner. Before: the owner at 3 runs, no rescue.
+        # owner). 2026-10-24: a PR that fails again after its rescue, or falls STALE_BEHIND behind main while
+        # conflicting, is regrafted (see STALE_BEHIND); the owner hears of it only if the regraft asks.
         rescued = loops >= RESCUE_AT and was_rescued(int(n), issue)
         rescue = loops >= RESCUE_AT and not rescued
-        if rescued:  # 2026-10-16: chains of 3+ workers chased one PR's CI timings; the owner decides
-            why.append(f"{loops} fix runs in {FIX_LOOP_WINDOW_H} h and an Opus rescue already ran, owner decides")
+        dirty = "conflicts with main" in why
+        behind = behind_main(entry, int(n), v.get("head", ""), compare) if dirty else 0
+        if rescued or (dirty and behind >= STALE_BEHIND):
+            if rescued:
+                why.append(f"{loops} fix runs in {FIX_LOOP_WINDOW_H} h and an Opus rescue already ran")
+            if rid := was_regrafted(int(n), issue):  # its one regraft ran and the PR is still open
+                verdict = regraft_verdict(rid)
+                if verdict and verdict[0] == "OWNER":
+                    state.setdefault("queue", []).insert(0, {
+                        "issue": issue, "pr": int(n), "model": "opus", "needs_owner": True, "auto": "pr-fix",
+                        "note": f"regraft {rid} asks: {verdict[1]}"[:300],
+                        "task": f"Owner ruling for PR #{n}: its regraft (run {rid}) asks: {verdict[1]}",
+                        **({"head": v["head"]} if v.get("head") else {})})
+                    added.append(f"#{n} (owner: the regraft asks)")
+                elif verdict and verdict[0] in ("REGRAFTED", "DONE"):  # the run left the old PR open: close it
+                    run(["gh", "pr", "close", str(n), "-R", REPO, "--comment",
+                         f"Closed by churn: superseded by its regraft (run {rid}: {verdict[0]} {verdict[1]})."[:900]])
+                    added.append(f"closed:#{n} (regraft {verdict[0].lower()})")
+                else:
+                    close_and_restart(state, int(n), issue, rid)
+                    added.append(f"restart:#{n}")
+                continue
+            group = [int(n)] + sorted(
+                int(k) for k, o in snap.items() if k != n and o.get("state") == "open" and int(k) not in queued
+                and o.get("mergeable_state") == "dirty" and str(o.get("branch", "")).startswith(f"churn/{issue}-")
+                and not pr_in_hand(k, o, live) and not was_regrafted(int(k), issue))
+            files = (conflicts or conflict_files)(int(n)) if dirty else None
+            hand = files is None or any(not GENERATED_RE.search(f) for f in files)
+            state.setdefault("queue", []).insert(0, {
+                "issue": issue, "pr": int(n), "model": "opus" if hand else "sonnet", "needs_owner": False,
+                "task": regraft_task(group, issue, behind, files, why), "auto": "pr-fix", "regraft": True,
+                **({"also_prs": group[1:]} if group[1:] else {}), **({"head": v["head"]} if v.get("head") else {})})
+            queued.update(group)
+            added.append(f"#{n} (regraft{', with ' + ', '.join(f'#{g}' for g in group[1:]) if group[1:] else ''})")
+            continue
         note = next((str(p.get("note") or "") for p in state.get("prs", []) if isinstance(p, dict) and pr_num(p) == int(n)), "")
         review = (f" The review at this head asked for: {note[:400]} (This item comes back every tick until the head "
                   f"changes: to defer it use `churn queue wait`, never `churn queue rm`.)" if sent_back and note else "")
@@ -5387,7 +5560,7 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None) -> list[st
                 f"(never rebase), resolve (regenerate generated docs, never hand-merge them), read any red check and fix "
                 f"what is real, gates, push; report the PR's CI." + review)
         state.setdefault("queue", []).insert(0, {"issue": issue, "pr": int(n), "model": "opus" if rescue else "sonnet",
-                                                 "task": task, "needs_owner": rescued, "auto": "pr-fix",
+                                                 "task": task, "needs_owner": False, "auto": "pr-fix",
                                                  **({"rescue": True} if rescue else {}),
                                                  **({"head": v["head"]} if v.get("head") else {})})
         added.append(f"#{n}")
@@ -5548,6 +5721,8 @@ def direct_spec(state: dict, snap: dict, x: dict) -> dict | None:
     - an item whose plan was held, once the overlap cleared: it implements the saved plan, no new plan run."""
     def tree(meta):
         return meta if meta.get("worktree") and Path(meta["worktree"]).is_dir() else None
+    if x.get("regraft"):  # a fresh branch off current main, made at launch (direct_launches)
+        return {"worktree": None, "branch": None, "plan": False, "fresh": True, "brief": x["task"]}
     if x.get("pr"):
         branch = (snap.get(str(x["pr"])) or {}).get("branch")
         metas = sorted((m for d in RUNS.glob(f"{x['issue']}-*") if (m := _run_meta(d.name))), key=lambda m: m.get("started", ""))
@@ -5653,7 +5828,8 @@ def direct_launches(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
         ok, _ = (True, "") if plan else pace_allows(state, x.get("model", "sonnet"))
         if not ok:
             break
-        what = (f"PR fix #{x['pr']}" + (" (warm resume)" if spec.get("resume_run") else "") if x.get("pr") else "backfill resume" if spec.get("lane") else
+        what = (f"PR fix #{x['pr']}" + (" (warm resume)" if spec.get("resume_run") else " (regraft)" if spec.get("fresh")
+                                        else "") if x.get("pr") else "backfill resume" if spec.get("lane") else
                 f"held plan {spec['held_plan']}" if spec.get("held_plan") else "new issue, gate brief")
         did.append(f"#{x['issue']} ({what})")
         if dry_run:
@@ -5664,6 +5840,11 @@ def direct_launches(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
                     cmd_worker(argparse.Namespace(resume_run=spec["resume_run"], message=spec["brief"], force=False,
                                                   plan=False))
                 else:
+                    if spec.get("fresh"):
+                        wt, branch = new_worktree(x["issue"], now().strftime("%Y%m%dT%H%MZ") + "-regraft")
+                        spec.update(worktree=str(wt), branch=branch,
+                                    brief=f"Your working directory {wt} is a fresh git worktree, on branch {branch} off "
+                                          f"current origin/main. Handoff notes go in {H}.\n\n{spec['brief']}")
                     cmd_worker(argparse.Namespace(resume_run=None, issue=x["issue"], model=x.get("model", "sonnet"),
                                                   task=x.get("task"), brief=spec["brief"], brief_file=None, force=False,
                                                   plan=spec["plan"], worktree=spec["worktree"], branch=spec.get("branch"),
@@ -6527,7 +6708,13 @@ def cmd_tick(a) -> int:
                 log("dropped PR-fix items whose PR moved on (new head or closed): " + ", ".join(pruned))
             noise = [x[6:] for x in fixes if x.startswith("noise:")]
             updated = [x[8:] for x in fixes if x.startswith("updated:")]
-            fixes = [x for x in fixes if not x.startswith(("noise:", "updated:"))]
+            expired = [x[8:] for x in fixes if x.startswith("expired:")]
+            ended = [x for x in fixes if x.startswith(("restart:", "closed:"))]
+            fixes = [x for x in fixes if not x.startswith(("noise:", "updated:", "expired:", "restart:", "closed:"))]
+            if expired:
+                log("owner parks the owner never answered, judged again (stale -> regraft): " + ", ".join(expired))
+            if ended:
+                log("PRs still open after their regraft, closed by the gate: " + ", ".join(ended))
             if updated:
                 log("updated with main by the gate (update-branch, no worker): " + ", ".join(updated))
             if noise:

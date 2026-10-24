@@ -42,6 +42,9 @@ def churn(tmp_path, monkeypatch):
     mod.real_checklist_note = mod.checklist_note
     monkeypatch.setattr(mod, "checklist_note", lambda n: "")
     monkeypatch.setattr(mod, "update_branch", lambda n: False)  # a real conflict: queue the Claude fix as before
+    mod.real_behind_main = mod.behind_main
+    monkeypatch.setattr(mod, "behind_main", lambda entry, n, head, compare=None: 0)  # not stale, without asking GitHub
+    monkeypatch.setattr(mod, "conflict_files", lambda n: None)  # never fetch into the host's checkout
     monkeypatch.setattr(mod, "start_precheck", lambda rid: None)
     monkeypatch.setitem(mod.REFILL_DEFAULT, "enabled", False)  # refill tests turn it on; it reads GitHub
     monkeypatch.setitem(mod.CLAIMS_DEFAULT, "enabled", False)  # claim tests turn it on with a fake GitHub
@@ -1694,13 +1697,13 @@ def test_a_held_plan_approval_is_new_work_not_a_fix_loop(churn):
     assert churn.run_kind({"resume_of": "5078-b"}) == "send_back"
 
 
-def _fix_runs(churn, k, rescue=False):
+def _fix_runs(churn, k, rescue=False, expect="#5180"):
     for i in range(k):
         _run(churn, f"5176-{i}", issue=5176, task="Fix PR #5180 (b): shepherd:needs-fix", started=churn.iso(churn.now()))
     if rescue:
         _run(churn, "5176-r", issue=5176, task=churn.rescue_task(5180, "b", 5176, k, []), started=churn.iso(churn.now()))
     st = {"prs": [{"number": 5180, "issue": 5176}], "queue": [], "running": []}
-    assert churn.queue_pr_fixes(st, {"5180": pr(ms="dirty", branch="churn/5176-x")}) == ["#5180"]
+    assert churn.queue_pr_fixes(st, {"5180": pr(ms="dirty", branch="churn/5176-x")}) == [expect]
     return st["queue"][0]
 
 
@@ -1720,9 +1723,113 @@ def test_two_sonnet_fix_runs_bring_one_opus_rescue_that_judges_first(churn):
     assert st["queue"][0].get("rescue") is True and not st.get("quarantine")  # the validator keeps the key
 
 
-def test_a_pr_that_fails_after_its_rescue_goes_to_the_owner(churn):
-    q = _fix_runs(churn, 2, rescue=True)
-    assert q["model"] == "sonnet" and q["needs_owner"] and "an Opus rescue already ran, owner decides" in q["task"]
+def test_a_pr_that_fails_after_its_rescue_is_regrafted_not_parked_for_the_owner(churn):
+    q = _fix_runs(churn, 2, rescue=True, expect="#5180 (regraft)")
+    assert q["regraft"] and not q["needs_owner"] and q["model"] == "opus"  # conflicts unknown: Opus
+    assert q["task"].startswith("REGRAFT (PR #5180)") and "an Opus rescue already ran" in q["task"]
+    assert "do NOT rebase" in q["task"] and "REGRAFT VERDICT:" in q["task"] and "Supersedes #5180" in q["task"]
+    st = {"queue": [dict(q, also_prs=["5181"])]}
+    churn.normalize_state(st)
+    assert st["queue"][0]["regraft"] is True and st["queue"][0]["also_prs"] == [5181] and not st.get("quarantine")
+
+
+# ---------------------------------------------------------------- stale PRs: regraft (owner 2026-10-24)
+def _stale(churn, monkeypatch, behind=560, files=("tests/equivalence/det_sweep_coverage/a.json",)):
+    monkeypatch.setattr(churn, "behind_main", lambda entry, n, head, compare=None: behind)
+    monkeypatch.setattr(churn, "conflict_files", lambda n: list(files) if files is not None else None)
+
+
+def test_a_far_behind_conflicting_pr_is_regrafted_on_sonnet_when_only_generated_files_conflict(churn, monkeypatch):
+    _stale(churn, monkeypatch)
+    st = {"prs": [{"number": 5900, "issue": 5252}], "queue": [], "running": []}
+    snap = {"5900": pr(ms="dirty", branch="churn/5252-b"), "5898": pr(ms="dirty", branch="churn/5252-a"),
+            "6000": pr(ms="dirty", branch="churn/77-x")}
+    added = churn.queue_pr_fixes(st, snap)
+    assert "#5900 (regraft, with #5898)" in added and "#6000 (regraft)" in added and len(added) == 2
+    q = next(q for q in st["queue"] if q["pr"] == 5900)
+    assert q["model"] == "sonnet" and q["also_prs"] == [5898] and "560 commits behind" in q["task"]
+    assert "pull/5898/head" in q["task"] and "ONE new PR" in q["task"] and "hand-written: none" in q["task"]
+    assert churn.queue_pr_fixes(st, snap) == []  # both PRs are queued now
+
+
+def test_a_hand_written_conflict_takes_opus_and_a_near_pr_still_gets_a_plain_fix(churn, monkeypatch):
+    _stale(churn, monkeypatch, files=["tests/tools/equivalence_cics.py", "docs/x.md"])
+    st = {"prs": [{"number": 5900, "issue": 5252}], "queue": [], "running": []}
+    churn.queue_pr_fixes(st, {"5900": pr(ms="dirty", branch="churn/5252-b")})
+    assert st["queue"][0]["model"] == "opus" and "equivalence_cics.py" in st["queue"][0]["task"]
+    _stale(churn, monkeypatch, behind=20)
+    st = {"prs": [{"number": 5900, "issue": 5252}], "queue": [], "running": []}
+    assert churn.queue_pr_fixes(st, {"5900": pr(ms="dirty", branch="churn/5252-b")}) == ["#5900"]
+    assert not st["queue"][0].get("regraft")
+
+
+def test_behind_is_cached_per_head(churn):
+    calls = []
+    e = {"number": 1}
+    compare = lambda path: calls.append(path) or {"ahead_by": 321}
+    assert churn.real_behind_main(e, 1, "h1", compare) == 321 == churn.real_behind_main(e, 1, "h1", compare)
+    assert len(calls) == 1 and calls[0].endswith("/compare/h1...main")
+    def down(path):
+        raise RuntimeError("gh: 502")
+    assert churn.real_behind_main(e, 1, "h2", down) == 0  # new head, unreadable: unknown
+    assert churn.real_behind_main(None, 1, "h1", compare) == 0
+
+
+def test_an_auto_held_owner_park_expires_and_the_pr_is_regrafted(churn, monkeypatch):
+    _stale(churn, monkeypatch)
+    parked = {"issue": 5252, "pr": 5900, "model": "sonnet", "task": "Fix PR #5900: owner decides", "needs_owner": True,
+              "auto": "pr-fix"}
+    (churn.H / "owner-answers.jsonl").write_text(json.dumps(
+        {"id": "o39", "item": "queue #5252 (PR #5900): Fix", "answer": "hold", "note": "auto-hold: no owner answer"}) + "\n")
+    st = {"prs": [], "queue": [dict(parked), dict(parked, pr=6116, note="owner: wait for the release"),
+                               dict(parked, pr=6157)], "running": []}
+    (churn.H / "owner-answers.jsonl").write_text((churn.H / "owner-answers.jsonl").read_text() + json.dumps(
+        {"id": "o50", "item": "queue #1 (PR #6157): Fix", "answer": "hold", "note": "", "source": "phone"}) + "\n")
+    added = churn.queue_pr_fixes(st, {"5900": pr(ms="dirty", branch="churn/5252-b")})
+    assert added == ["expired:#5900", "#5900 (regraft)"]
+    assert [q["pr"] for q in st["queue"]] == [5900, 6116, 6157] and st["queue"][0]["regraft"]  # noted / real holds stay
+
+
+def _regraft_run(churn, result, status="done"):
+    rid = "5252-20261024T2300Z"
+    _run(churn, rid, issue=5252, status=status, started=churn.iso(churn.now() - churn.dt.timedelta(hours=2)),
+         finished=churn.iso(churn.now() - churn.dt.timedelta(hours=1)),
+         task=churn.regraft_task([5900, 5898], 5252, 560, None, ["conflicts with main"]))
+    (churn.RUNS / rid / "out.json").write_text(json.dumps({"result": result}))
+    return rid
+
+
+def test_after_its_regraft_a_still_open_pr_is_closed_and_its_slice_queued_afresh(churn, monkeypatch):
+    _stale(churn, monkeypatch)
+    rid = _regraft_run(churn, "ran out of ideas")
+    closed = []
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: closed.append(cmd) or churn.subprocess.CompletedProcess(cmd, 0, "", ""))
+    st = {"prs": [{"number": 5900, "issue": 5252}], "queue": [], "running": []}
+    assert churn.queue_pr_fixes(st, {"5900": pr(ms="dirty", branch="churn/5252-b")}) == ["restart:#5900"]
+    assert closed[0][:4] == ["gh", "pr", "close", "5900"] and rid in closed[0][-1]
+    q = st["queue"][0]
+    assert q["auto"] == "restart" and "pr" not in q and q["task"].startswith("RESTART the slice of closed PR #5900")
+
+
+def test_a_regraft_verdict_decides_what_happens_to_the_old_pr(churn, monkeypatch):
+    _stale(churn, monkeypatch)
+    closed = []
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: closed.append(cmd) or churn.subprocess.CompletedProcess(cmd, 0, "", ""))
+    snap = {"5898": pr(ms="dirty", branch="churn/5252-a")}
+    _regraft_run(churn, "pushed.\nREGRAFT VERDICT: REGRAFTED #6600")
+    st = {"prs": [], "queue": [], "running": []}
+    assert churn.queue_pr_fixes(st, snap) == ["closed:#5898 (regraft regrafted)"] and st["queue"] == []
+    _regraft_run(churn, "REGRAFT VERDICT: OWNER: keep the X6 assumption or drop it?")
+    assert churn.queue_pr_fixes(st, snap) == ["#5898 (owner: the regraft asks)"]
+    assert st["queue"][0]["needs_owner"] and "X6 assumption" in st["queue"][0]["note"]
+    assert churn.expire_owner_parks(st) == []  # a regraft's owner question does not expire
+
+
+def test_a_crashed_regraft_does_not_count_and_a_regraft_item_launches_on_a_fresh_branch(churn):
+    _regraft_run(churn, "", status="crashed")
+    assert churn.was_regrafted(5900, 5252) is None
+    spec = churn.direct_spec({}, {}, item(5252, pr=5900, regraft=True, task="REGRAFT (PR #5900): x"))
+    assert spec["fresh"] and spec["worktree"] is None and spec["brief"] == "REGRAFT (PR #5900): x"
 
 
 # ---------------------------------------------------------------- liveness (2026-10-16 audit, step 1)
