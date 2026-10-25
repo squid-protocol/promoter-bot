@@ -4207,6 +4207,9 @@ def tend_bot_prs(gh=None, sh=None) -> list[str]:
                 mem["dispatched"] = iso(t)
                 lines.append(f"bot PR #{n} {why}: dispatched {wf} on main to rebuild it")
             continue
+        labels = {lb.get("name") for lb in (pr.get("labels") or ())}
+        if "shepherd:merge" in labels:
+            continue  # shepherd owns flake reruns and status digests; only the rebuild-on-conflict/stale check stays here
         failed = [r for r in gh(f"repos/{REPO}/actions/runs?head_sha={head}&per_page=50").get("workflow_runs", [])
                   if r.get("conclusion") in ("failure", "timed_out")]
         names = ", ".join(r.get("name", "?") for r in failed)[:300]
