@@ -3899,7 +3899,8 @@ def gate_alerts(state: dict, b: dict, snap: dict) -> None:
 # tree itself: over max_gb the owner is paged and GnuCOBOL containers older than any honest step are removed (`docker rm
 # -f` needs only the docker group, though the looping process inside runs as root; the worker's pkill was refused).
 SCRATCH_DEFAULT = {"path": "/tmp/gitgalaxy-scratch", "max_gb": 50, "reap": True, "reap_after_min": 30,
-                   "image": "gitgalaxy-gnucobol"}
+                   "image": "gitgalaxy-gnucobol", "idle_h": 24, "sweep_every_h": 1, "sweep_dirs": ["claude"],
+                   "keep": ["locks", "ci-digest", "bg"]}
 
 
 def scratch_cfg(state: dict) -> dict:
@@ -3938,12 +3939,90 @@ def proof_containers(image: str) -> list[tuple[str, str, float]]:
     return out
 
 
+# Owner 2026-10-24 (#31 ask 3): workers leave one scratch dir per run under /tmp/gitgalaxy-scratch/claude and nothing
+# removed them: nyx reached 67 GB in ~200 dirs (#6166 15 GB, #5863 mutation 10 GB) while the watch above only paged.
+# Hourly, a dir under sweep_dirs (or a loose file at the top) untouched for idle_h and not in use by any process goes.
+def newer_than(path: str, cutoff: float) -> bool:
+    """True when path or anything under it was modified after cutoff (stops at the first such entry)."""
+    stack = [path]
+    while stack:
+        p = stack.pop()
+        try:
+            if os.lstat(p).st_mtime > cutoff:
+                return True
+            with os.scandir(p) as it:
+                for e in it:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    elif e.stat(follow_symlinks=False).st_mtime > cutoff:
+                        return True
+        except (NotADirectoryError, FileNotFoundError, PermissionError):
+            continue
+    return False
+
+
+def paths_in_use(root: str) -> set[str]:
+    """Paths under root that some process has as its cwd or an open file (read from /proc)."""
+    root = root.rstrip("/") + "/"
+    used = set()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        links = [f"/proc/{pid}/cwd"]
+        with contextlib.suppress(OSError):
+            links += [f"/proc/{pid}/fd/{fd}" for fd in os.listdir(f"/proc/{pid}/fd")]
+        for link in links:
+            with contextlib.suppress(OSError):
+                if (t := os.readlink(link)).startswith(root):
+                    used.add(t)
+    return used
+
+
+def scratch_sweep(cfg: dict) -> list[str]:
+    """Remove idle worker scratch; one log line when anything went."""
+    base = cfg["path"].rstrip("/")
+    if not os.path.isdir(base):
+        return []
+    cutoff = time.time() - cfg["idle_h"] * 3600
+    used = paths_in_use(base)
+    cands = [e.path for e in os.scandir(base) if e.is_file(follow_symlinks=False) and e.name not in cfg["keep"]]
+    for d in cfg["sweep_dirs"]:
+        with contextlib.suppress(OSError):
+            cands += [e.path for e in os.scandir(f"{base}/{d}")]
+    gone, stuck = [], []
+    for p in sorted(cands):
+        if any(u == p or u.startswith(p + "/") for u in used) or newer_than(p, cutoff):
+            continue
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p, ignore_errors=True)  # files a root container wrote can refuse; reported, not fatal
+        else:
+            with contextlib.suppress(OSError):
+                os.unlink(p)
+        (stuck if os.path.lexists(p) else gone).append(p.removeprefix(base + "/"))
+    if not gone and not stuck:
+        return []
+    return [f"scratch sweep: removed {len(gone)} idle (> {cfg['idle_h']} h) entr{'y' if len(gone) == 1 else 'ies'} "
+            f"under {base}" + (f": {', '.join(gone[:8])}" + (" ..." if len(gone) > 8 else "") if gone else "")
+            + (f"; could not fully remove {', '.join(stuck[:5])}" if stuck else "")]
+
+
+def scratch_sweep_if_due(state: dict, cfg: dict) -> list[str]:
+    last = parse_iso(state.get("scratch_sweep_at"))
+    if not cfg["idle_h"] or (last and now() - last < dt.timedelta(hours=cfg["sweep_every_h"])):
+        return []
+    with edit_state() as st:
+        st["scratch_sweep_at"] = iso(now())
+    return scratch_sweep(cfg)
+
+
 def scratch_watch(state: dict) -> list[str]:
-    """Log lines when the scratch tree is over its limit (after reaping stale proof containers and paging); else []."""
+    """Log lines when the scratch tree is over its limit (after reaping stale proof containers and paging), plus the
+    hourly idle sweep's line; else []."""
     cfg = scratch_cfg(state)
+    swept = scratch_sweep_if_due(state, cfg)
     usage = scratch_usage(cfg["path"])
     if usage is None or usage[0] < cfg["max_gb"]:
-        return []
+        return swept
     total, top = usage
     reaped = []
     if cfg["reap"]:
@@ -3956,7 +4035,7 @@ def scratch_watch(state: dict) -> list[str]:
     notify("scratch-big", f"churn: scratch at {total:.0f} GB", line.removeprefix("scratch watch: ")
            + "\nA runaway writer fills the disk and stops every Claude session; check it now.",
            priority="urgent", cooldown_h=1, tags="floppy_disk")
-    return [line]
+    return swept + [line]
 
 
 def guarded_tick(fn) -> int:

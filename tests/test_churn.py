@@ -26,6 +26,7 @@ def churn(tmp_path, monkeypatch):
     mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("churn_under_test", loader))
     loader.exec_module(mod)
     monkeypatch.setattr(mod, "pid_alive", lambda pid: bool(pid) and pid > 0)
+    monkeypatch.setitem(mod.SCRATCH_DEFAULT, "path", str(tmp_path / "scratch"))  # never sweep a host's real scratch
     mod.real_issue_meta = mod.issue_meta
     monkeypatch.setattr(mod, "issue_meta", lambda n: None)
     mod.real_worktree_pr = mod.worktree_pr
@@ -3567,6 +3568,50 @@ def test_scratch_watch_reaps_stale_proof_containers_and_pages_over_the_limit(chu
     du["out"] = "99614720\t/s\n"
     assert "no stale proof container" in churn.scratch_watch({"scratch_watch": {"path": "/s", "reap": False}})[0]
     assert removed == []  # reap off: page only
+
+
+def test_scratch_sweep_removes_idle_worker_dirs_only(churn, monkeypatch, tmp_path):
+    """2026-10-24 (#31 ask 3): ~200 per-run dirs (67 GB) piled up under scratch/claude on nyx; nothing removed them."""
+    import os
+    base = tmp_path / "scratch"
+    old = churn.time.time() - 30 * 3600
+
+    def mk(rel, age=old, is_dir=True):
+        p = base / rel
+        if is_dir:
+            (p / "sub").mkdir(parents=True)
+            (p / "sub" / "f").write_text("x")
+            for q in (p / "sub" / "f", p / "sub", p):
+                os.utime(q, (age, age))
+        else:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("x")
+            os.utime(p, (age, age))
+        return p
+
+    idle, busy, fresh = mk("claude/6166"), mk("claude/4767"), mk("claude/5051")
+    (fresh / "sub" / "new").write_text("recent")  # one recent file anywhere keeps the dir
+    stray = mk("old.log", is_dir=False)
+    kept = [mk("locks"), mk("ci-digest"), mk("other/x")]  # keep list, and dirs outside sweep_dirs, are never swept
+    monkeypatch.setattr(churn, "paths_in_use", lambda root: {str(busy / "sub" / "f")})
+    cfg = churn.scratch_cfg({"scratch_watch": {"path": str(base)}})
+    lines = churn.scratch_sweep(cfg)
+    assert not idle.exists() and not stray.exists()
+    assert busy.exists() and fresh.exists() and all(p.exists() for p in kept)
+    assert "removed 2 idle (> 24 h) entries" in lines[0] and "claude/6166" in lines[0] and "old.log" in lines[0]
+    assert churn.scratch_sweep(cfg) == []  # nothing left to remove: silent
+
+
+def test_scratch_sweep_runs_hourly_and_can_be_turned_off(churn, monkeypatch):
+    calls = []
+    monkeypatch.setattr(churn, "scratch_sweep", lambda cfg: calls.append(cfg["idle_h"]) or ["swept"])
+    cfg = churn.scratch_cfg({})
+    assert churn.scratch_sweep_if_due({}, cfg) == ["swept"]
+    st = churn.load_state()
+    assert st.get("scratch_sweep_at")
+    assert churn.scratch_sweep_if_due(st, cfg) == []  # within sweep_every_h
+    assert churn.scratch_sweep_if_due({}, churn.scratch_cfg({"scratch_watch": {"idle_h": 0}})) == []
+    assert calls == [24]
 
 
 def test_scratch_watch_is_silent_when_the_tree_cannot_be_measured(churn, monkeypatch):
