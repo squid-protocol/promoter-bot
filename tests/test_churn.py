@@ -4072,22 +4072,114 @@ def test_the_ladder_generator_slices_each_estate_of_the_focus_ladder(churn, monk
     assert churn.ladder_items(st, {}) == []  # the anchor left the focus
 
 
-def test_a_starved_focus_pages_once_and_drift_pages_when_launches_leave_it(churn, monkeypatch):
+def test_starvation_asks_the_tick_first_and_pages_only_if_it_stays_unresolved(churn, monkeypatch):
     pages = []
     monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: pages.append((key, msg)) or True)
-    f = _focus(churn, monkeypatch)
-    put(churn, focus=f, max_workers=1, queue=[item(3799)])
+    put(churn, focus=_focus(churn, monkeypatch), max_workers=1, queue=[item(3799)])
+    for _ in range(2):
+        churn.focus_alerts(churn.load_state(), {}, [])
+    st = churn.load_state()
+    need = churn.focus_need(st, {})
+    assert need and "TRIVIAL blocker" in need and "churn focus filler" in need and not pages  # the model first
+    for _ in range(4):
+        churn.focus_alerts(churn.load_state(), {}, [])
+    assert [k for k, _ in pages] == ["focus-starved"]  # unresolved for STARVE_PAGE passes: now the owner
+
+
+def test_focus_work_held_by_ci_or_the_box_is_not_starvation(churn, monkeypatch):
+    put(churn, focus=_focus(churn, monkeypatch), max_workers=1, queue=[item(6072, task="[ladder:zecs] slice")])
     for _ in range(3):
         churn.focus_alerts(churn.load_state(), {}, [])
-    starved = [m for k, m in pages if k == "focus-starved"]
-    assert len(starved) == 1 and "Focus items queued: 0" in starved[0]  # paged at the 2nd idle pass only
-    for k, issue in enumerate([3799, 3798, 3784, 6072]):
-        _run(churn, f"{issue}-{k}", issue=issue, started=churn.iso(churn.now() - churn.dt.timedelta(hours=1)))
-    assert churn.focus_share(churn.load_state()) == (1, 4)
+    assert churn.load_state()["focus"]["idle_passes"] == 0 and churn.focus_need(churn.load_state(), {}) is None
+
+
+def _filler_ns(**kw):
+    return argparse.Namespace(**{"action": "filler", "args": [], "skip": None, "hours": 4, "reason": "ladder waits on "
+                                 "the owner's X6 ruling", "max": None, **kw})
+
+
+def test_the_tick_opens_filler_only_while_the_focus_starves(churn, monkeypatch):
+    pages = []
+    monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: pages.append(key) or True)
+    put(churn, focus=_focus(churn, monkeypatch))
+    monkeypatch.setenv("CHURN_RUN", "1")
+    with pytest.raises(SystemExit, match="only while the gate reports the focus starved"):
+        churn.cmd_focus(_filler_ns())
     with churn.edit_state() as st:
-        st["focus"]["drift_checked"] = churn.iso(churn.now() - churn.dt.timedelta(hours=7))
-    churn.focus_alerts(churn.load_state(), {}, ["#6072 (launched)"])
-    assert any(k == "focus-drift" and "1 of 4" in m for k, m in pages)
+        st["focus"]["idle_passes"] = churn.STARVE_PASSES
+    churn.cmd_focus(_filler_ns(hours=99))
+    w = churn.load_state()["focus"]["filler"]
+    assert w["by"] == "tick" and w["max"] == churn.FILLER_MAX and pages == ["focus-filler"]  # the owner hears why
+    assert churn.parse_iso(w["until"]) <= churn.now() + churn.dt.timedelta(hours=churn.FILLER_HOURS_MAX, minutes=1)
+    assert churn.filler_open(churn.load_state()) and churn.focus_need(churn.load_state(), {}) is None
+    monkeypatch.delenv("CHURN_RUN")
+    churn.cmd_focus(_filler_ns(args=["off"]))
+    assert not churn.filler_open(churn.load_state())
+
+
+def test_filler_launches_only_when_no_focus_item_can_and_never_reorders_the_focus(churn, monkeypatch):
+    f = _focus(churn, monkeypatch, filler={"until": churn.iso(churn.now() + churn.dt.timedelta(hours=2)), "launched": 0,
+                                           "max": 2})
+    st = {"focus": f, "running": [], "queue": [item(3799), item(6072, task="[ladder:zecs] slice", wait_until="x")]}
+    st["queue"][1]["wait_until"] = churn.iso(churn.now() + churn.dt.timedelta(hours=1))  # the focus item waits
+    assert churn.pick_item(st, {}, "calm")[1]["issue"] == 3799  # filler takes the gap
+    st["queue"][1].pop("wait_until")
+    assert churn.pick_item(st, {}, "calm")[1]["issue"] == 6072  # focus work ready again: focus first
+    st["focus"]["filler"]["launched"] = 2
+    st["queue"] = st["queue"][:1]
+    assert churn.pick_item(st, {}, "calm") == (None, None)  # the window's launches are used up
+
+
+def test_a_filler_launch_is_a_capped_sonnet_slice_that_says_no_follow_ups(churn, monkeypatch, tmp_path):
+    monkeypatch.setattr(churn, "make_worktree", lambda i, s: (tmp_path, "churn/3799-x"))
+    monkeypatch.setattr(churn, "crucible_repo_of", lambda i: None)
+    monkeypatch.setattr(churn, "spawn_detached", lambda *a, **k: 4242)
+    f = _focus(churn, monkeypatch, filler={"until": churn.iso(churn.now() + churn.dt.timedelta(hours=2)), "launched": 0,
+                                           "max": 2})
+    put(churn, focus=f, max_workers=1)
+    ns = argparse.Namespace(resume_run=None, issue=3799, model="opus", task="graph ledger", brief="b", brief_file=None,
+                            worktree=None, repo=None, force=False, lane=None, plan=False, check_of=None)
+    assert churn.cmd_worker(ns) == 0
+    rid = next(d.name for d in churn.RUNS.glob("3799-*"))
+    meta = json.loads((churn.RUNS / rid / "meta.json").read_text())
+    assert meta["filler"] and meta["model"] == "sonnet" and meta["budget_usd"] == churn.FILLER_BUDGET_USD
+    assert "churn will not queue a next slice" in (churn.RUNS / rid / "prompt.md").read_text()
+    st = churn.load_state()
+    assert st["focus"]["filler"]["launched"] == 1 and st["running"][0]["filler"]
+    assert churn.filler_branch("churn/3799-x")  # its PR's fixes may run after the window closes
+    assert churn.in_focus(st, {"issue": 3799, "filler_pr": True}) and not churn.in_focus(st, {"issue": 3799})
+
+
+def test_filler_queue_adds_need_an_open_window_and_stay_capped(churn, monkeypatch, capsys):
+    f = _focus(churn, monkeypatch)
+    put(churn, focus=f)
+    a = lambda **kw: argparse.Namespace(**{"action": "add", "issue": 5003, "model": "sonnet", "task": "LE dates slice",
+                                           "needs_owner": False, "backend": None, "pr": None, "after_pr": None,
+                                           "after_merge": False, "allow_workflows": False, "agy_step": None, "lane": None,
+                                           "repo": None, "before_issue": None, "front": False, "index": None,
+                                           "note": None, "filler": True, **kw})
+    churn.cmd_queue(a())
+    assert churn.load_state()["queue"] == [] and "no filler window open" in capsys.readouterr().out
+    with churn.edit_state() as st:
+        st["focus"]["filler"] = {"until": churn.iso(churn.now() + churn.dt.timedelta(hours=2)), "launched": 0, "max": 4}
+    for n in range(churn.FILLER_QUEUE_MAX + 1):
+        churn.cmd_queue(a(issue=5003 + n))
+    q = churn.load_state()["queue"]
+    assert len(q) == churn.FILLER_QUEUE_MAX and all(x["filler"] for x in q)
+
+
+def test_the_launch_mix_tells_filler_from_leaks(churn, monkeypatch):
+    pages = []
+    monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: pages.append((key, msg)) or True)
+    put(churn, focus=_focus(churn, monkeypatch), max_workers=1)
+    started = churn.iso(churn.now() - churn.dt.timedelta(hours=1))
+    for k, (issue, fill) in enumerate([(6072, False), (5003, True), (5004, True), (5005, True), (3799, False)]):
+        _run(churn, f"{issue}-{k}", issue=issue, started=started, **({"filler": True} if fill else {}))
+    assert churn.focus_share(churn.load_state()) == {"focus": 1, "filler": 3, "leak": 1, "total": 5}
+    churn.focus_alerts(churn.load_state(), {}, ["#6072"])
+    keys = [k for k, _ in pages]
+    assert "focus-drift" in keys and "focus-filler-share" in keys
+    assert any("1 of 5 launches" in m for k, m in pages if k == "focus-drift")
     put(churn)  # no focus at all: page that, launch nothing
     churn.focus_alerts(churn.load_state(), {}, [])
     assert pages[-1][0] == "focus-none"

@@ -1691,9 +1691,11 @@ def owner_allows_workflows(state: dict, issue) -> bool:
 def cmd_worker(a) -> int:
     stamp = now().strftime("%Y%m%dT%H%MZ")
     resume_of = None
+    filler = False
     if a.resume_run:
         prev = json.loads((RUNS / a.resume_run / "meta.json").read_text())
         resume_of = prev
+        filler = bool(prev.get("filler"))
         issue, model, task = prev["issue"], prev["model"], prev.get("task", "")
         wt, branch = Path(prev["worktree"]), prev["branch"]
         prompt = a.message
@@ -1701,12 +1703,16 @@ def cmd_worker(a) -> int:
         issue, model, task = a.issue, a.model, a.task or ""
         if getattr(a, "off_focus", False):
             owner_only("churn worker --off-focus")
-        elif not getattr(a, "check_of", None) and not in_focus(load_state(), {"issue": issue, "task": task,
-                                                                             "lane": getattr(a, "lane", None)}):
-            f = focus_cfg(load_state())
-            raise SystemExit(f"#{issue} is off the focus ({f.get('name')}: {', '.join(f'#{n}' for n in f.get('issues', []))})"
-                             ": not launched. Only the owner widens the focus (`churn focus add`) or runs it anyway "
-                             "(`churn worker --off-focus`).")
+        elif not getattr(a, "check_of", None) and not filler_branch(getattr(a, "branch", None)) and not in_focus(
+                cur := load_state(), {"issue": issue, "task": task, "lane": getattr(a, "lane", None)}):
+            f = focus_cfg(cur)
+            if not filler_open(cur):
+                raise SystemExit(f"#{issue} is off the focus ({f.get('name')}: "
+                                 f"{', '.join(f'#{n}' for n in f.get('issues', []))}) and no filler window is open: not "
+                                 "launched. Filler opens when the focus starves (`churn focus filler`); only the owner "
+                                 "widens the focus (`churn focus add`) or runs it anyway (`churn worker --off-focus`).")
+            filler, model = True, "sonnet"  # filler: one capped Sonnet slice
+            a.budget_usd = min(float(getattr(a, "budget_usd", None) or FILLER_BUDGET_USD), FILLER_BUDGET_USD)
         prompt = Path(a.brief_file).read_text() if a.brief_file else a.brief
         if not prompt:
             raise SystemExit("worker needs --brief-file or --brief")
@@ -1783,6 +1789,8 @@ def cmd_worker(a) -> int:
     run_id = f"{issue}-{stamp}" + ("-check" if getattr(a, "check_of", None) else "")
     rd = RUNS / run_id
     rd.mkdir(parents=True, exist_ok=False)
+    if filler and not resume_of:
+        prompt += FILLER_NOTE
     (rd / "prompt.md").write_text(prompt)
     meta = {"run_id": run_id, "issue": issue, "model": model, "task": task, "worktree": str(wt), "branch": branch,
             "started": iso(now()), "resume_session": resume_of["session_id"] if resume_of else None,
@@ -1790,7 +1798,8 @@ def cmd_worker(a) -> int:
             "resume_base_usd": round(session_cost_at(resume_of), 4) if resume_of else 0.0,
             "check_of": getattr(a, "check_of", None), "repo": getattr(a, "repo", None) or None,
             "allow_workflows": "standing" if allow_wf == "standing" else bool(allow_wf), "precheck_of": getattr(a, "precheck_of", None),
-            "head_start": run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip() or None}
+            "head_start": run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip() or None,
+            **({"filler": True} if filler else {})}
     if credit:
         meta.update(lane="credit", queue_item=getattr(a, "queue_item", None))
     if getattr(a, "budget_usd", None):  # the credit lane's balance, the retro's cap
@@ -1806,11 +1815,13 @@ def cmd_worker(a) -> int:
         state.setdefault("running", []).append(
             {"agent": f"churn {run_id}", "run_id": run_id, "pid": meta["pid"], "issue": issue, "model": model,
              "started": meta["started"], "task": task[:200], **({"lane": lane} if lane else {}),
-             **({"scope": scope} if scope else {}),
+             **({"scope": scope} if scope else {}), **({"filler": True} if filler else {}),
              **({"cpu_quota": quota} if quota else {})})
+        if filler and not resume_of and (w := state.get("focus", {}).get("filler")):
+            w["launched"] = int(w.get("launched", 0)) + 1
         state.setdefault("usage", {}).setdefault("launches", []).append(meta["started"])
         state["usage"]["launches"] = state["usage"]["launches"][-50:]
-    log(f"launched {model} worker {run_id} (#{issue}{', resumes ' + meta['resume_of'] if resume_of else ''}"
+    log(f"launched {model} worker {run_id} (#{issue}{', FILLER' if filler else ''}{', resumes ' + meta['resume_of'] if resume_of else ''}"
         f"{', plan first' if plan else ''}{', checks agy ' + meta['check_of'] if meta['check_of'] else ''}) pid {meta['pid']} in {wt}")
     print(json.dumps({"run_id": run_id, "pid": meta["pid"], "worktree": str(wt), "branch": branch}))
     return 0
@@ -4942,14 +4953,33 @@ CORE_RESERVE = 1
 # claim) went unnoticed while the slots filled with whatever was left. The focus is one owner-set allowlist per host,
 # enforced where work is picked and where every worker launches (cmd_worker), so no path around it exists:
 # - launchable: the focus issues (their PR fixes too), red main, and the owner-budgeted retro/experiment lanes;
-# - everything else stays parked (queued, never picked) or is recorded in focus.parked instead of queued;
-# - no focus work launchable while a slot is free -> the owner is paged ("focus starved") instead of a fallback;
-# - every 6 h the share of launches inside the focus is checked; under DRIFT_SHARE_MIN pages "drift";
 # - only the owner changes it: `churn focus ...` refuses inside any run churn started (CHURN_RUN).
+# Same day, owner: "that sounds like the factory will scream to a halt ... it's okay if we have some work that gets in
+# from not the current goal to keep the rate of production up, but we don't want those to launch more follow-up work
+# that reshuffles the queue; when the system legitimately runs out of goal work, a model should check for a trivial
+# blocker and whether it's okay to switch to general work." So, FILLER:
+# - a free slot with no launchable focus work for STARVE_PASSES gate passes is a "focus starved" need for the tick:
+#   it first looks for a trivial blocker of focus work and fixes it; only if the focus is really out of work does it
+#   open a filler window (`churn focus filler --hours H --reason R`, allowed to the tick only while starving);
+# - inside the window, off-focus queue items launch, but only when no focus item can (focus always picks first, so
+#   filler never reorders the focus), at most FILLER_MAX launches, Sonnet, capped at FILLER_BUDGET_USD;
+# - filler is terminal: its merged PR queues no next slice or checklist line (those stay focus-only), the worker is
+#   told so, and the tick may add filler items only with `--filler` while the window is open (FILLER_QUEUE_MAX);
+# - starvation still unresolved after STARVE_PAGE passes pages the owner; every 6 h the launch mix is checked: any
+#   off-focus launch that was not filler pages "drift" (a leak), and filler over FILLER_SHARE_PAGE of launches pages
+#   "the focus keeps starving".
 FOCUS_EXEMPT_LANES = ("retro", "experiment")
-DRIFT_SHARE_MIN = 0.9
 DRIFT_EVERY_H = 6
 STARVE_PASSES = 2
+STARVE_PAGE = 6
+FILLER_MAX = 4
+FILLER_QUEUE_MAX = 4
+FILLER_HOURS_MAX = 12
+FILLER_BUDGET_USD = 8.0
+FILLER_SHARE_PAGE = 0.5
+FILLER_NOTE = ("\n\nFILLER WORK (the host's focus is out of launchable work, so this slice keeps production going): "
+               "do this one PR-sized slice only. Do not plan follow-ups: list what is left under **Remaining slices** / "
+               "**Sibling gaps** and stop; churn will not queue a next slice for filler work.\n")
 
 
 def focus_cfg(state: dict) -> dict:
@@ -4966,12 +4996,36 @@ def focus_issues(state: dict) -> list[int]:
 
 def in_focus(state: dict, x: dict) -> bool:
     """May item / launch x run under the focus? With no focus set only red main and the exempt lanes run: churn never
-    roams free (the free-roaming refill was where the drift came from)."""
+    roams free (the free-roaming refill was where the drift came from). Filler is decided separately (filler_open)."""
     if x.get("auto") == "main-red" or str(x.get("task", "")).startswith("Main is red:"):
         return True  # a red main blocks every merge, the focus's too
     if x.get("lane") in FOCUS_EXEMPT_LANES:
         return True
+    if x.get("filler_pr"):
+        return True  # fixing a filler PR finishes work in hand; a PR left to rot is the stale-PR problem again
     return x.get("issue") is not None and int(x["issue"]) in set(focus_issues(state))
+
+
+def filler_branch(branch: str | None) -> bool:
+    """A filler run opened this branch (its PR's fixes may run after the window closed)."""
+    if not branch or not (m := re.match(r"churn/(\d+)-", branch)):
+        return False
+    return any(mt.get("filler") and mt.get("branch") == branch for d in RUNS.glob(f"{m.group(1)}-*")
+               if (mt := _run_meta(d.name)))
+
+
+def filler_window(state: dict) -> dict:
+    return focus_cfg(state).get("filler") or {}
+
+
+def filler_open(state: dict) -> bool:
+    """A filler window is open and has launches left."""
+    w = filler_window(state)
+    return bool((t := parse_iso(w.get("until"))) and t > now() and int(w.get("launched", 0)) < int(w.get("max", FILLER_MAX)))
+
+
+def starving(state: dict) -> bool:
+    return int(focus_cfg(state).get("idle_passes", 0)) >= STARVE_PASSES
 
 
 def owner_only(what: str) -> None:
@@ -4989,24 +5043,48 @@ def park_off_focus(state: dict, issue: int, task: str, source: str) -> str:
     return f"off focus ({f.get('name') or 'focus'}): #{issue} not queued, parked"
 
 
-def focus_share(state: dict, hours: float = 24) -> tuple[int, int]:
-    """(launches inside the focus, all launches) over the last `hours`, since the focus was set: new worker runs only
-    (not checks, prechecks or resumes)."""
+def focus_share(state: dict, hours: float = 24) -> dict:
+    """Launch mix over the last `hours` since the focus was set: {focus, filler, leak, total}. New worker runs only (not
+    checks, prechecks or resumes). `leak` = off-focus and not filler: something launched around the focus."""
     f = focus_cfg(state)
     cut = max(now() - dt.timedelta(hours=hours), parse_iso(f.get("set")) or now() - dt.timedelta(hours=hours))
-    inside = total = 0
+    out = {"focus": 0, "filler": 0, "leak": 0, "total": 0}
     for d in RUNS.glob("*-*"):
         m = _run_meta(d.name)
         t = parse_iso(m.get("started"))
         if not t or t < cut or m.get("check_of") or m.get("precheck_of") or m.get("resume_of"):
             continue
-        total += 1
-        inside += in_focus(state, {"issue": m.get("issue"), "task": m.get("task"), "lane": m.get("lane")})
-    return inside, total
+        out["total"] += 1
+        kind = ("focus" if in_focus(state, {"issue": m.get("issue"), "task": m.get("task"), "lane": m.get("lane")})
+                else "filler" if m.get("filler") else "leak")
+        out[kind] += 1
+    return out
+
+
+def focus_need(state: dict, snap: dict | None) -> str | None:
+    """The tick's "focus starved" need: find a trivial blocker first, open filler only if the focus is really out."""
+    if not focus_on(state) or not starving(state) or filler_open(state):
+        return None
+    f = focus_cfg(state)
+    why = idle_causes(state, snap, state.get("ci_mode", "calm"))
+    queued = sorted({f"#{x['issue']}" for x in state.get("queue", []) if in_focus(state, x)})
+    lad = (f.get("ladder") or {}).get("anchor")
+    return (f"focus starved: a worker slot has been free for {f.get('idle_passes')} gate passes and no work of the focus "
+            f"'{f.get('name')}' ({', '.join(f'#{n}' for n in focus_issues(state))}) can launch ({why}; focus items "
+            f"queued: {', '.join(queued) or 'none'}). 1) Look for a TRIVIAL blocker of focus work and fix it: a focus "
+            f"item waiting on something already done (`churn queue wait` expired, a merged --after-pr), a focus issue "
+            f"with no queued next step (queue it: `churn queue add --issue <focus issue> ...`)"
+            + (f", a stale evidence measure the ladder #{lad} slices from (`churn goal measure`)" if lad else "")
+            + ", a report waiting for review. 2) Only if the focus is truly out of launchable work for now (blocked on "
+            f"CI, an owner ruling, another host's claim, or done), open filler: `churn focus filler --hours <1-"
+            f"{FILLER_HOURS_MAX}> --reason \"<one plain sentence: why the focus cannot use the slot>\"`. Filler launches "
+            f"the off-focus queue items already queued; if there are none, add at most {FILLER_QUEUE_MAX} small, "
+            f"self-contained ones with `churn queue add --filler --issue <n> --task ...` (burned estates, open scope:core "
+            f"or scope:sweep issues, one PR each, never an epic). Say in your summary which of the two you did.")
 
 
 def focus_alerts(state: dict, snap: dict | None, launched: list[str]) -> list[str]:
-    """Starvation and drift pages for the focus. Returns log lines."""
+    """Starvation bookkeeping, the unresolved-starvation page and the launch-mix pages. Returns log lines."""
     if not focus_on(state):
         notify("focus-none", "no focus set", "This host has no focus, so churn launches nothing but red-main fixes. "
                "Set one: `churn focus set NAME N..` (and `churn focus ladder N` for a ladder).", priority="high",
@@ -5017,38 +5095,43 @@ def focus_alerts(state: dict, snap: dict | None, launched: list[str]) -> list[st
     name = f.get("name") or "the focus"
     live = claude_slot_holders(state)
     free = len(live) < int(state.get("max_workers", 1))
-    focus_live = [r for r in live if in_focus(state, r)]
     held = (t := parse_iso(state.get("paused_until"))) and t > now()  # a limit / offline pause: not starvation
-    starving = free and not launched and not focus_live and not state.get("workers_paused") and not held
+    focus_live = [r for r in live if in_focus(state, r)]
+    # focus work that exists but waits on CI admission, the box or the pace is not starvation: filler would wait too
+    ready = focus_pick(state, snap, "calm", True)[1] is not None
+    starved = free and not launched and not focus_live and not ready and not state.get("workers_paused") and not held
     with edit_state() as st:
         fs = st.setdefault("focus", {})
-        fs["idle_passes"] = int(fs.get("idle_passes", 0)) + 1 if starving else 0
+        fs["idle_passes"] = int(fs.get("idle_passes", 0)) + 1 if starved and not filler_open(st) else 0
         idle = fs["idle_passes"]
         last = parse_iso(fs.get("drift_checked"))
         drift_due = not last or now() - last >= dt.timedelta(hours=DRIFT_EVERY_H)
         if drift_due:
             fs["drift_checked"] = iso(now())
-    if starving and idle == STARVE_PASSES:
-        mode = state.get("ci_mode", "calm")
-        why = idle_causes(state, snap, mode)
-        queued = [x for x in state.get("queue", []) if in_focus(state, x)]
-        msg = (f"{name}: a worker slot is free and no focus work can launch ({why}). Focus items queued: "
-               f"{len(queued)}" + (f" ({', '.join(sorted({f'#{x['issue']}' for x in queued}))})" if queued else
-                                   ": none -- queue the next step or widen the focus (`churn focus add N`)."))
+    if idle == STARVE_PAGE:
+        why = idle_causes(state, snap, state.get("ci_mode", "calm"))
+        msg = (f"{name}: a worker slot has been free for {idle} gate passes, no focus work can launch ({why}), and the "
+               f"tick neither cleared a blocker nor opened filler. Look at `churn focus`.")
         notify("focus-starved", "focus starved", msg, priority="high", cooldown_h=6)
         out.append(f"FOCUS starved: {msg}")
     if drift_due:
-        inside, total = focus_share(state)
-        if total >= 3 and inside / total < DRIFT_SHARE_MIN:
-            msg = (f"{name}: only {inside} of {total} launches in the last 24 h were focus work "
-                   f"(< {DRIFT_SHARE_MIN:.0%}). Something launches around the focus: check `churn focus`.")
+        mix = focus_share(state)
+        if mix["leak"]:
+            msg = (f"{name}: {mix['leak']} of {mix['total']} launches in the last 24 h were neither focus work nor "
+                   f"filler. Something launches around the focus: check `churn focus`.")
             notify("focus-drift", "focus drift", msg, priority="high", cooldown_h=DRIFT_EVERY_H)
             out.append(f"FOCUS drift: {msg}")
+        if mix["total"] >= 4 and mix["filler"] / mix["total"] > FILLER_SHARE_PAGE:
+            msg = (f"{name}: {mix['filler']} of {mix['total']} launches in the last 24 h were filler: the focus keeps "
+                   f"running out of launchable work. Widen it or unblock it (`churn focus`).")
+            notify("focus-filler-share", "focus keeps starving", msg, cooldown_h=24)
+            out.append(f"FOCUS filler share: {msg}")
     return out
 
 
 def cmd_focus(a) -> int:
-    """`churn focus` (status), `set NAME N..`, `add N..`, `rm N..`, `ladder ANCHOR [--skip P..]`, `off`."""
+    """`churn focus` (status), `set NAME N..`, `add N..`, `rm N..`, `ladder ANCHOR [--skip P..]`, `off`,
+    `filler --hours H --reason R [--max N]` / `filler off` (the tick may open filler only while starving)."""
     args = list(a.args or [])
     if a.action == "status":
         state = load_state()
@@ -5062,13 +5145,45 @@ def cmd_focus(a) -> int:
             below = (goal_cfg(state).get("measure") or {}).get("below") or {}
             print(f"  ladder #{lad['anchor']}, skip {', '.join(lad.get('skip') or []) or 'none'}: "
                   + "; ".join(f"{e} {len(ps)}" for e, ps in below.items()))
-        inside, total = focus_share(state)
-        print(f"  last 24 h: {inside}/{total} launches inside the focus")
+        mix = focus_share(state)
+        print(f"  last 24 h: {mix['total']} launches: {mix['focus']} focus, {mix['filler']} filler, {mix['leak']} leaked")
+        w = filler_window(state)
+        if filler_open(state):
+            print(f"  filler OPEN until {w['until']} ({w.get('launched', 0)}/{w.get('max', FILLER_MAX)} launched, by "
+                  f"{w.get('by')}): {w.get('reason')}")
+        elif f.get("idle_passes"):
+            print(f"  starving: {f['idle_passes']} idle gate passes" + (" (the tick is asked)" if starving(state) else ""))
         q = state.get("queue", [])
-        print(f"  queued: {sum(in_focus(state, x) for x in q)} focus, {sum(not in_focus(state, x) for x in q)} parked "
-              f"off-focus items")
+        print(f"  queued: {sum(in_focus(state, x) for x in q)} focus, {sum(not in_focus(state, x) for x in q)} off-focus "
+              f"(launch only as filler)")
         for p in (f.get("parked") or [])[-10:]:
             print(f"  not queued (off focus, {p.get('source')}, {p.get('t')}): #{p['issue']} {p['task'][:100]}")
+        return 0
+    if a.action == "filler":
+        with edit_state() as st:
+            f = st.setdefault("focus", {})
+            if args[:1] == ["off"]:
+                f.pop("filler", None)
+                msg = "filler closed"
+            else:
+                tick = bool(os.environ.get("CHURN_RUN"))
+                if tick and not starving(st):
+                    raise SystemExit("focus filler: the tick may open filler only while the gate reports the focus "
+                                     "starved; focus work can launch now")
+                if not focus_on(st):
+                    raise SystemExit("focus filler: no focus set")
+                if not a.reason:
+                    raise SystemExit("focus filler --hours H --reason \"why the focus cannot use the slot\"")
+                hours = min(float(a.hours or 6), FILLER_HOURS_MAX)
+                f["filler"] = {"until": iso(now() + dt.timedelta(hours=hours)), "reason": a.reason[:300],
+                               "by": "tick" if tick else "owner", "launched": 0, "max": int(a.max or FILLER_MAX),
+                               "t": iso(now())}
+                f["idle_passes"] = 0
+                msg = f"filler open for {hours:g} h (max {f['filler']['max']} launches, {f['filler']['by']}): {a.reason[:200]}"
+        log(msg)
+        print(msg)
+        if "open" in msg and os.environ.get("CHURN_RUN"):
+            notify("focus-filler", "filler on", f"{focus_cfg(load_state()).get('name')}: {msg}", cooldown_h=1)
         return 0
     owner_only("churn focus " + a.action)
     with edit_state() as st:
@@ -5137,13 +5252,22 @@ def stamp_scopes(state: dict, limit: int = 6) -> list[str]:
 
 
 def pick_item(state: dict, snap: dict | None, mode: str) -> tuple[int, dict] | tuple[None, None]:
-    """The next Claude queue item for this CI mode, among the launchable focus items: PR fixes, then red main, then the
-    `ci` lane, then `normal` items by queue position when CI is calm, or `backfill` items when it is busy (at most
-    backfill_max running). Calm mode offers backfill too once the slots have sat idle for backfill_idle_ticks ticks.
-    2026-10-25: the focus replaced the ranking layers (scope, tier, goal stage, core slot): every launchable item is
-    focus work, so queue position orders it."""
+    """The next Claude queue item for this CI mode: focus work first (focus_pick); only when none can launch and a
+    filler window is open, an off-focus item as filler (the same order among the off-focus items)."""
+    hit = focus_pick(state, snap, mode, True)
+    if hit[1] is None and filler_open(state):
+        hit = focus_pick(state, snap, mode, False)
+    return hit
+
+
+def focus_pick(state: dict, snap: dict | None, mode: str, focus: bool) -> tuple[int, dict] | tuple[None, None]:
+    """Among the launchable focus (or, focus=False, off-focus) items: PR fixes, then red main, then the `ci` lane, then
+    `normal` items by queue position when CI is calm, or `backfill` items when it is busy (at most backfill_max
+    running). Calm mode offers backfill too once the slots have sat idle for backfill_idle_ticks ticks.
+    2026-10-25: the focus replaced the ranking layers (scope, tier, goal stage, core slot), so queue position orders."""
     q = [(i, x) for i, x in enumerate(state.get("queue", [])) if not x.get("needs_owner") and x.get("backend") != "agy"
-         and in_focus(state, x) and not blocked_by(x, snap, state) and not waiting(x) and not plan_overlap(state, x)]
+         and in_focus(state, x) == focus and not blocked_by(x, snap, state) and not waiting(x)
+         and not plan_overlap(state, x)]
     for want in (lambda x: x.get("pr"), lambda x: x.get("auto") == "main-red", lambda x: x.get("lane") == "ci"):
         if hit := next(((i, x) for i, x in q if want(x)), None):
             return hit  # a PR fix finishes work in hand; a red main blocks every PR
@@ -5745,6 +5869,7 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
                 f"what is real, gates, push; report the PR's CI." + review)
         state.setdefault("queue", []).insert(0, {"issue": issue, "pr": int(n), "model": "opus" if rescue else "sonnet",
                                                  "task": task, "needs_owner": False, "auto": "pr-fix",
+                                                 **({"filler_pr": True} if filler_branch(v.get("branch")) else {}),
                                                  **({"rescue": True} if rescue else {}),
                                                  **({"head": v["head"]} if v.get("head") else {})})
         added.append(f"#{n}")
@@ -6879,6 +7004,8 @@ def cmd_tick(a) -> int:
         for k, why in found.items():
             wants[k] = (f"liveness: {why} -> give it a next step (review it, queue a fix, `churn queue wait`, hold it "
                         f"for the owner, `churn pr watch` / `unwatch`, `churn review done`, `churn followup done`)")
+        if need := focus_need(state, snap):
+            wants["focus starved"] = need
         for f in state.get("followups", []):
             wants[f"followup #{f['pr']}"] = (
                 f"followup: PR #{f['pr']} {f['kind']}" + (f" (issue #{f['issue']})" if f.get("issue") else "")
@@ -7555,10 +7682,16 @@ def cmd_queue(a) -> int:
             if getattr(a, "repo", None):
                 item["repo"] = a.repo
             if not in_focus(state, item):
-                msg = park_off_focus(state, a.issue, a.task, "queue add")
-                log(msg)
-                print(msg + " (`churn focus` lists it; only the owner widens the focus)")
-                return 0
+                queued_filler = sum(1 for x in q if x.get("filler"))
+                if getattr(a, "filler", False) and filler_open(state) and queued_filler < FILLER_QUEUE_MAX:
+                    item["filler"] = True  # launches only as filler, below every focus item
+                else:
+                    why = ("" if not getattr(a, "filler", False) else " (no filler window open)" if not filler_open(state)
+                           else f" (already {queued_filler} filler items queued)")
+                    msg = park_off_focus(state, a.issue, a.task, "queue add") + why
+                    log(msg)
+                    print(msg + " (`churn focus` lists it; only the owner widens the focus)")
+                    return 0
             meta = issue_meta(a.issue) if not a.pr else None
             if meta is not None and (sc := issue_scope(a.issue, meta)):
                 item["scope"] = sc
@@ -7621,7 +7754,7 @@ def cmd_queue(a) -> int:
         extra = "".join([f" [PR #{item['pr']}]" if item.get("pr") else "", f" [{item['lane']}]" if item.get("lane") else "",
                          f" [{item['repo']}]" if item.get("repo") else "",
                          f" [{item['scope']}]" if item.get("scope") else "",
-                         "" if in_focus(state, item) else " [off focus: parked]",
+                         "" if in_focus(state, item) else " [filler]" if item.get("filler") else " [off focus: filler only]",
                          f" [after {','.join('#' + str(n) for n in item['after_prs'])}]" if item.get("after_prs") else "",
                          f" [waits {w}]" if (w := waiting(item)) else ""])
         print(f"{i:2}  #{item['issue']:<5} {who:<6}{flag}{extra} {item['task'][:100]}")
@@ -8084,6 +8217,8 @@ def main() -> int:
     qp.add_argument("--model", default="sonnet", choices=["haiku", "sonnet", "opus"])
     qp.add_argument("--task", help="what the worker should do (one or two sentences; the tick turns it into a brief)")
     qp.add_argument("--front", action="store_true", help="add at the front of the queue")
+    qp.add_argument("--filler", action="store_true",
+                    help=f"add: an off-focus item for an open filler window (at most {FILLER_QUEUE_MAX} queued)")
     qp.add_argument("--needs-owner", action="store_true", help="park it until the owner decides")
     qp.add_argument("--index", type=int, help="position shown by `churn queue` (for rm / top / route / park)")
     qp.add_argument("--pr", type=int, help="a fix item for this existing PR (work on its branch)")
@@ -8177,11 +8312,15 @@ def main() -> int:
     gl = sub.add_parser("goal", help="the evidence measure the focus ladder reads: status (default) / measure")
     gl.add_argument("action", nargs="?", default="status", choices=["status", "measure"])
     gl.add_argument("args", nargs="*")
-    fo = sub.add_parser("focus", help="the owner's focus, the only work this host launches: status (default) / "
-                                      "set NAME N.. / add N.. / rm N.. / ladder ANCHOR|off [--skip P..] / off")
-    fo.add_argument("action", nargs="?", default="status", choices=["status", "set", "add", "rm", "ladder", "off"])
+    fo = sub.add_parser("focus", help="the owner's focus, what this host launches first and alone: status (default) / "
+                                      "set NAME N.. / add N.. / rm N.. / ladder ANCHOR|off [--skip P..] / off / "
+                                      "filler --hours H --reason R | filler off")
+    fo.add_argument("action", nargs="?", default="status", choices=["status", "set", "add", "rm", "ladder", "off", "filler"])
     fo.add_argument("args", nargs="*")
     fo.add_argument("--skip", nargs="*", help="ladder: programs the ladder leaves out (owner rulings)")
+    fo.add_argument("--hours", type=float, help=f"filler: how long the window stays open (max {FILLER_HOURS_MAX})")
+    fo.add_argument("--reason", help="filler: one plain sentence, why the focus cannot use the slot")
+    fo.add_argument("--max", type=int, help=f"filler: launches the window allows (default {FILLER_MAX})")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
     sub.add_parser("poll", help="every 2 min: one gh call; start the gate at once when a watched PR changed")
     sub.add_parser("sync", help="sync pulse now: test origin/main and fast-forward this install (the gate does it hourly)")
