@@ -3337,6 +3337,7 @@ def settle_check(state: dict, issue: int, pr: int, status: str, key: str, left_t
     note += f", {len(left)} left"
     i["body"] = body
     if (issue_scope(issue, i) == "core" and refill_cfg(state)["enabled"] and not state.get("workers_paused")
+            and issue != goal_cfg(state).get("ladder_anchor")  # the ladder refill slices it by estate
             and not foreign_claim(i) and not host_skips(i)
             and not any(x.get("issue") == issue for s in ("queue", "running") for x in state.get(s, []))
             and (c := next_check(i, state))):
@@ -4934,7 +4935,7 @@ def core_short(state: dict) -> bool:
 # config, `churn goal measure` (the gate every measure_every_h) reads the repo's evidence reports, counts programs per
 # level and names the programs with holes that no open issue mentions; the tick is asked to file and add those.
 GOAL_DEFAULT = {"order": ["translate", "l5", "breadth"], "stage": "translate", "measure_every_h": 6,
-                "line_partials_max": 3}
+                "line_partials_max": 3, "ladder_anchor": None, "ladder_skip": [], "excluded": []}
 GOAL_REPORTS = _CFG.get("goal_reports") or {}  # {"fetch": "branch", "ref": "origin/branch", "path": "dir/of/reports"}
 
 
@@ -6110,6 +6111,8 @@ def refill_candidates(state: dict, issues: list[dict], in_pr: set[int], callgrap
         sc = next((x[6:] for x in names if x.startswith("scope:")), None)
         if is_callgraph(i) != callgraph or names & SKIP_LABELS or i["number"] in taken | in_pr | recent:
             continue
+        if excluded_issue(state, i):
+            continue
         if not callgraph and sc not in ("core", "sweep", "infra"):
             continue  # frontier waits for the owner; unlabelled goes to stage 2
         if recently_worked(i["number"], float(cfg["cooldown_h"])):
@@ -6202,14 +6205,17 @@ def goal_reports() -> list[dict]:
 
 def goal_measure(reports: list[dict], issues: list[dict]) -> dict:
     """Programs per level, and every program that does not translate whole (L0) with the open issues that name it.
-    `untracked` = L0 programs no open issue mentions: nobody is working on them."""
+    `untracked` = L0 programs no open issue mentions: nobody is working on them. `below` = {estate: [[program, level]]}
+    for the programs at L1-L3, which the ladder refill slices by estate."""
     levels: collections.Counter = collections.Counter()
     texts = [(i["number"], f"{i.get('title', '')}\n{i.get('body') or ''}".lower()) for i in issues]
-    untranslated = []
+    untranslated, below = [], collections.defaultdict(list)
     for rep in reports:
         for p in rep.get("programs") or []:
             lv = str(p.get("level") or "?").rstrip("*")
             levels[lv] += 1
+            if lv in ("L1", "L2", "L3"):
+                below[Path(rep["file"]).parent.name].append([Path(str(p.get("program", ""))).stem, lv])
             if lv != "L0":
                 continue
             t = p.get("translation") or {}
@@ -6219,7 +6225,8 @@ def goal_measure(reports: list[dict], issues: list[dict]) -> dict:
                                  "holes": t.get("hole_count"), "refused": t.get("refused"),
                                  "classes": [str(c)[:120] for c in (t.get("gap_classes") or [])[:4]], "issues": hits})
     return {"t": iso(now()), "programs": sum(levels.values()), "levels": dict(sorted(levels.items())),
-            "untranslated": untranslated, "untracked": [u["program"] for u in untranslated if not u["issues"]]}
+            "untranslated": untranslated, "untracked": [u["program"] for u in untranslated if not u["issues"]],
+            "below": {e: sorted(ps) for e, ps in sorted(below.items())}}
 
 
 def goal_summary(m: dict) -> str:
@@ -6264,8 +6271,68 @@ def goal_need(state: dict) -> str:
             f"`churn goal add {g['stage']} <n>` and `churn queue add --issue <n> --tier era-core --front`.")
 
 
+# Owner 2026-10-25: the factory drifted off the L1->L4 ladder. The estate slices were queued by hand once (10-23), merged,
+# and nothing queued the next round: the rule refill skips an issue with an open PR or a run in the last 12 h, so it fell
+# through to infra and call-graph work (~20 of ~240 merges on 10-24 were ladder work), and the checklist's "SPLIT FIRST"
+# kept re-slicing #6072's estate lines (12 partials on one line: estate-sized data PRs are partial by design). Now, with
+# goal.ladder_anchor set, every gate pass queues one slice per estate that has programs below L4 (from the goal measure)
+# and no ladder item queued, running or in an open PR; an estate is queued again only after a newer measure.
+LADDER_TAG = "[ladder:{}]"
+
+
+def ladder_items(state: dict, snap: dict | None) -> list[dict]:
+    """New ladder slices for the anchor issue, one per estate (also stamps goal.ladder_queued). [] when off."""
+    g = goal_cfg(state)
+    anchor = g.get("ladder_anchor")
+    if (not anchor or anchor not in set((g.get("issues") or {}).get("ladder") or []) or state.get("workers_paused")
+            or not refill_cfg(state)["enabled"]):
+        return []
+    m = g.get("measure") or {}
+    measured = parse_iso(m.get("t"))
+    live = [r for r in state.get("running", []) if pid_alive(r.get("pid"))]
+    tasks = [str(x.get("task") or "") for x in [*state.get("queue", []), *live]]
+    branches = {v.get("branch") for v in (snap or {}).values() if v.get("state") == "open"}
+    tasks += [str(mt.get("task") or "") for d in RUNS.glob(f"{anchor}-*")
+              if (mt := _run_meta(d.name)) and mt.get("branch") in branches]
+    ours = " ".join(t for t in tasks if "[ladder:" in t)
+    others = " ".join(t for t in tasks if "[ladder:" not in t)
+    skip = {str(x).lower() for x in g.get("ladder_skip") or []}
+    last = dict(g.get("ladder_queued") or {})
+    out = []
+    for estate, progs in sorted((m.get("below") or {}).items()):
+        tag = LADDER_TAG.format(estate)
+        if tag in ours or ((t := parse_iso(last.get(estate))) and (not measured or measured <= t)):
+            continue  # in hand, or this measure was already sliced: wait for a newer one
+        progs = [(p, lv) for p, lv in progs if p.lower() not in skip
+                 and not re.search(rf"\b{re.escape(p)}\b", others, re.I)]  # another item already works on it
+        if not progs:
+            continue
+        names = ", ".join(f"{p} ({lv})" for p, lv in progs)
+        out.append({"issue": int(anchor), "model": "sonnet", "needs_owner": False, "auto": "ladder", "scope": "core",
+                    "task": f"{tag} ladder slice of #{anchor}, estate {estate}: lift every program below L4 at the "
+                            f"latest evidence report ({names}). Re-measure at origin/main first (`ladder_gaps.py`): drop "
+                            f"what is already L4. ONE PR for the estate, one or both rungs, data only (case scenarios, "
+                            f"reviewed infeasible outcomes with their reason; the ladder-slice skill, `ladder_refresh.py`); "
+                            f"state before/after coverage per program. A program that will not close goes under "
+                            f"**Remaining slices** with why; a harness or tool gap is a sibling for #6271, never code in "
+                            f"this PR. Burned estates only; evidence levels, not 'proven'."})
+        last[estate] = iso(now())
+    if out:
+        state.setdefault("goal", {})["ladder_queued"] = last
+    return out
+
+
+def excluded_issue(state: dict, i: dict) -> bool:
+    """Owner-excluded work (goal.excluded, e.g. the sunset L5 mutation issues) and the "Siblings of" issues filed from
+    it: the refill never queues them, whatever their scope label says (#6166 came back as scope:sweep on 10-24)."""
+    ex = {int(x) for x in goal_cfg(state).get("excluded") or []}
+    return i.get("number") in ex or any(int(n) in ex for n in re.findall(r"Siblings of #(\d+)", str(i.get("title", ""))))
+
+
 def cmd_goal(a) -> int:
-    """`churn goal` (status), `stage NAME`, `add STAGE N..`, `rm N..`, `order A,B,..`, `measure`."""
+    """`churn goal` (status), `stage NAME`, `add STAGE N..`, `rm N..`, `order A,B,..`, `measure`; `ladder N|off` (the
+    issue the ladder refill slices by estate), `skip|unskip PROGRAM..` (programs it leaves out), `exclude|include N..`
+    (issues the refill never queues, nor their "Siblings of" issues)."""
     args = list(a.args or [])
     if a.action == "measure":
         state = load_state()
@@ -6274,6 +6341,25 @@ def cmd_goal(a) -> int:
         for note in goal_tick(state, force=True):
             log(note)
             print(note)
+    elif a.action in ("ladder", "skip", "unskip", "exclude", "include"):
+        with edit_state() as st:
+            gs = st.setdefault("goal", {})
+            if a.action == "ladder":
+                if len(args) != 1:
+                    raise SystemExit("goal ladder N|off")
+                gs["ladder_anchor"] = None if args[0] == "off" else _int(args[0])
+                msg = f"goal ladder anchor -> {gs['ladder_anchor'] or 'off'}"
+            elif a.action in ("skip", "unskip"):
+                cur = [x for x in gs.get("ladder_skip") or [] if x.lower() not in {y.lower() for y in args}]
+                gs["ladder_skip"] = sorted(cur + list(args)) if a.action == "skip" else cur
+                msg = f"goal ladder skip: {', '.join(gs['ladder_skip']) or 'none'}"
+            else:
+                nums = {_int(x) for x in args}
+                cur = set(gs.get("excluded") or []) - nums
+                gs["excluded"] = sorted(cur | nums) if a.action == "exclude" else sorted(cur)
+                msg = f"goal excluded: {', '.join(f'#{n}' for n in gs['excluded']) or 'none'}"
+        log(f"{msg} (owner)")
+        print(msg)
     elif a.action in ("stage", "add", "rm", "order"):
         with edit_state() as st:
             gs = st.setdefault("goal", {})
@@ -6317,6 +6403,11 @@ def cmd_goal(a) -> int:
                       + (", ".join(f"#{n}" for n in u["issues"]) or "NO ISSUE"))
         elif not GOAL_REPORTS:
             print("not measured: no goal_reports in the host config")
+        if g.get("ladder_anchor"):
+            print(f"ladder refill: #{g['ladder_anchor']}, skip {', '.join(g.get('ladder_skip') or []) or 'none'}; "
+                  + "; ".join(f"{e} {len(ps)}" for e, ps in ((g.get("measure") or {}).get("below") or {}).items()))
+        if g.get("excluded"):
+            print("excluded from the refill: " + ", ".join(f"#{n}" for n in g["excluded"]))
         queued = [x for x in state.get("queue", []) if goal_rank(state, x) == 0]
         print(f"queued for the active stage: {', '.join(f'#{x['issue']}' for x in queued) or 'none'}")
     return 0
@@ -6695,6 +6786,11 @@ def cmd_tick(a) -> int:
                         log("review kept across the gate's update-branch: " + ", ".join(carried))
                 pruned = prune_pr_fixes(st, snap)
                 fixes = queue_pr_fixes(st, snap)
+                with contextlib.suppress(Exception):
+                    if ladder := ladder_items(st, snap):
+                        st.setdefault("queue", []).extend(ladder)
+                        log("ladder refill: queued " + ", ".join(re.match(r"\[ladder:([^\]]+)\]", x["task"]).group(1)
+                                                                  for x in ladder))
                 with contextlib.suppress(Exception):
                     if stamped := stamp_scopes(st):
                         log("scope from labels: " + ", ".join(stamped), quiet=True)
@@ -8167,7 +8263,8 @@ def main() -> int:
     cl.add_argument("--dry-run", action="store_true")
     gl = sub.add_parser("goal", help="the factory's goal: status (default) / stage NAME / add STAGE N.. / rm N.. / "
                                      "order A,B,.. / measure")
-    gl.add_argument("action", nargs="?", default="status", choices=["status", "stage", "add", "rm", "order", "measure"])
+    gl.add_argument("action", nargs="?", default="status", choices=["status", "stage", "add", "rm", "order", "measure",
+                                                                      "ladder", "skip", "unskip", "exclude", "include"])
     gl.add_argument("args", nargs="*")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
     sub.add_parser("poll", help="every 2 min: one gh call; start the gate at once when a watched PR changed")

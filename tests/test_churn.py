@@ -4178,3 +4178,77 @@ def test_gh_calls_are_marked_read_or_write_for_the_secondary_limits(churn):
     assert not w(["gh", "api", "repos/o/r/pulls/1"]) and not w(["gh", "pr", "view", "1"]) and not w(["gh", "api", "-X", "GET", "x"])
     assert not w(["gh", "api", "graphql", "-f", "query=query { viewer { login } }"])  # a GraphQL read sends fields too
     assert w(["gh", "api", "graphql", "-f", "query=mutation { addLabels }"])
+
+
+# ---------------------------------------------------------------- ladder refill (owner 2026-10-25)
+def _ladder_state(**goal):
+    return {"queue": [], "running": [], "prs": [],
+            "goal": {"issues": {"ladder": [6072, 6271]}, "order": ["translate", "ladder"], "stage": "ladder",
+                     "ladder_anchor": 6072,
+                     "measure": {"t": "2026-10-25T01:25Z",
+                                 "below": {"cics-genapp": [["lgapvs01", "L3"], ["lgtestp1", "L2"]],
+                                           "cics-banking-sample-application-cbsa": [["CRECUST", "L3"], ["INQACC", "L2"]],
+                                           "zecs": [["ZECS001", "L2"]]}}, **goal}}
+
+
+def test_goal_measure_lists_programs_below_l4_by_estate(churn):
+    reps = [{"file": "r/cics-genapp/report.json", "programs": [
+        {"program": "base/src/lgtestp1.cbl", "level": "L2"}, {"program": "base/src/lgacdb01.cbl", "level": "L4"},
+        {"program": "base/src/lgstsq.cbl", "level": "L3*"}, {"program": "x/lgx.cbl", "level": "L0"}]}]
+    m = churn.goal_measure(reps, [])
+    assert m["below"] == {"cics-genapp": [["lgstsq", "L3"], ["lgtestp1", "L2"]]}
+
+
+def test_the_ladder_refill_queues_one_slice_per_estate_minus_skips_and_programs_in_hand(churn, monkeypatch):
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
+    st = _ladder_state(ladder_skip=["CRECUST"])
+    st["queue"] = [item(5252, task="slice 3 of 3: lgapvs01/lgupvs01 fix Lgapvs01Service")]
+    out = churn.ladder_items(st, {})
+    tags = [x["task"].split("]")[0] + "]" for x in out]
+    assert tags == ["[ladder:cics-banking-sample-application-cbsa]", "[ladder:cics-genapp]", "[ladder:zecs]"]
+    cbsa, genapp, _ = out
+    assert "INQACC (L2)" in cbsa["task"] and "CRECUST" not in cbsa["task"]
+    assert "lgtestp1 (L2)" in genapp["task"] and "lgapvs01" not in genapp["task"]  # #5252 has it
+    assert all(x["issue"] == 6072 and x["scope"] == "core" and x["auto"] == "ladder" for x in out)
+    st["queue"] += out
+    assert churn.ladder_items(st, {}) == []  # queued: not again
+    st["queue"] = st["queue"][:1]
+    assert churn.ladder_items(st, {}) == []  # launched or merged since: waits for a newer measure
+    st["goal"]["measure"]["t"] = churn.iso(churn.now() + churn.dt.timedelta(minutes=1))
+    assert len(churn.ladder_items(st, {})) == 3
+
+
+def test_a_ladder_slice_in_an_open_pr_is_not_queued_again_and_the_refill_can_be_off(churn, monkeypatch):
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
+    st = _ladder_state()
+    _run(churn, "6072-a", issue=6072, branch="churn/6072-a", task="[ladder:zecs] ladder slice of #6072, estate zecs")
+    out = churn.ladder_items(st, {"7000": pr(branch="churn/6072-a")})
+    assert "[ladder:zecs]" not in " ".join(x["task"] for x in out) and len(out) == 2
+    assert churn.ladder_items(_ladder_state(ladder_anchor=None), {}) == []
+    assert churn.ladder_items(_ladder_state(issues={"ladder": []}), {}) == []  # anchor not a ladder-stage issue
+    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", False)
+    assert churn.ladder_items(_ladder_state(), {}) == []
+
+
+def test_excluded_issues_and_their_siblings_never_refill(churn):
+    st = {"goal": {"excluded": [4049, 5863]}}
+    assert churn.excluded_issue(st, {"number": 4049, "title": "x"})
+    assert churn.excluded_issue(st, {"number": 6166, "title": "Siblings of #4049: COUSR00C userlist failed-XCTL"})
+    assert not churn.excluded_issue(st, {"number": 6271, "title": "Equivalence harness gaps"})
+    issues = [{"number": 6166, "title": "Siblings of #4049: x", "labels": [{"name": "scope:sweep"}], "body": ""},
+              {"number": 5003, "title": "LE date services", "labels": [{"name": "scope:sweep"}], "body": ""}]
+    got = churn.refill_candidates({**st, "queue": [], "running": []}, issues, set())
+    assert [i["number"] for i in got] == [5003]
+
+
+def test_goal_subcommands_set_the_ladder_anchor_skips_and_exclusions(churn, capsys):
+    ns = lambda action, *args: churn.argparse.Namespace(action=action, args=list(args))
+    churn.cmd_goal(ns("ladder", "6072"))
+    churn.cmd_goal(ns("skip", "CRECUST", "BANKDATA"))
+    churn.cmd_goal(ns("unskip", "bankdata"))
+    churn.cmd_goal(ns("exclude", "4049", "4443"))
+    churn.cmd_goal(ns("include", "4443"))
+    g = churn.load_state()["goal"]
+    assert g["ladder_anchor"] == 6072 and g["ladder_skip"] == ["CRECUST"] and g["excluded"] == [4049]
+    churn.cmd_goal(ns("ladder", "off"))
+    assert churn.load_state()["goal"]["ladder_anchor"] is None
