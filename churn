@@ -4190,14 +4190,14 @@ def tend_bot_prs(gh=None, sh=None) -> list[str]:
             continue
         n, head = pr["number"], pr["head"]["sha"]
         mem = seen.get(str(n)) or {}
-        mem = mem if mem.get("head") == head else {"head": head}
+        mem = mem if mem.get("head") == head else {"head": head, "seen_at": iso(t)}
         keep[str(n)] = mem
         if mem.get("dispatched"):
             continue  # its rebuild is on the way: a new head starts over
         full = gh(f"repos/{REPO}/pulls/{n}")
         if full.get("mergeable_state") in (None, "unknown"):
             continue  # GitHub computes it lazily; the first pass on #5317 read it unknown and reran a conflicting PR
-        age_h = (t - parse_iso(pr["created_at"])).total_seconds() / 3600
+        age_h = (t - parse_iso(mem.get("seen_at") or pr["created_at"])).total_seconds() / 3600
         if full.get("mergeable_state") == "dirty" or age_h > BOT_PR_MAX_AGE_H:
             if any(gh(f"repos/{REPO}/actions/workflows/{wf}/runs?status={st}&per_page=5").get("workflow_runs")
                    for st in ("queued", "in_progress")):

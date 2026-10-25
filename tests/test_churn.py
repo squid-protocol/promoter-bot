@@ -2755,8 +2755,12 @@ def test_bot_pr_rebuild_waits_for_a_running_refresh_and_old_prs_are_rebuilt(bot)
     g = _BotGH(state="dirty", busy=True)
     assert churn.tend_bot_prs(g.gh, g.sh) == [] and g.calls == []
     g = _BotGH(age_h=30)
+    churn.BOT_PRS.write_text(json.dumps({"5317": {"head": g.head, "seen_at": g.created}}))
     [line] = churn.tend_bot_prs(g.gh, g.sh)
     assert "open 30 h" in line
+    # A rebuilt head on a >24h-old PR gets a fresh 24h clock instead of immediately looping (#6428)
+    g.head = "bbb222"
+    assert churn.tend_bot_prs(g.gh, g.sh) == [] and len(g.calls) == 1
 
 
 def test_bot_pr_red_check_is_rerun_once_then_pages(bot):
