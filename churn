@@ -102,6 +102,7 @@ WINDOW_H = 5
 SOFT_LAUNCHES_PER_HOUR = 3
 TICK_TIMEOUT_S = 90 * 60
 WORKER_ENV = {
+    "CHURN_RUN": "1",  # owner 2026-10-25: the focus is the owner's; `churn focus` edits refuse inside a tick or worker
     "GITGALAXY_MAINFRAME_CORPORA": str(V6 / ".mainframe_corpora"),
     "JAVA_HOME": "/usr/lib/jvm/java-17-openjdk-amd64",
     "JDK_17": "/usr/lib/jvm/java-17-openjdk-amd64",
@@ -222,23 +223,9 @@ CRUCIBLE_REPOS = {"estate-crucible", "cics-crucible"}
 QUEUE_KEYS = {"issue", "model", "task", "needs_owner", "backend", "pr", "after_prs", "allow_workflows", "agy_step", "lane", "repo", "after_merge",
               "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "scope", "promoted", "rescue",
               "regraft", "also_prs"}
-# Owner 2026-10-15: follow-ups ("Siblings of #X" rounds) were jumping the line ahead of the work they came from. Normal
-# items now launch by tier, then queue position: each era's core functionality, then customer-facing items, then
-# translation scores, then follow-ups. `--front` only reorders within a tier. The tier comes from the issue's
-# `tier:<name>` label (`churn queue add` / `queue retier`); an item with no tier is a follow-up if it names siblings.
-TIERS = ("era-core", "customer", "score", "followup")
-TIER_RANK = {"era-core": 0, "customer": 1, "score": 2, None: 3, "followup": 4}
-# Owner 2026-10-16 (scope retag): every issue carries scope:core|sweep|frontier|infra. Normal and backfill work launches
-# core, then sweep (and unlabelled), then infra; frontier ("Gap Atlas": mapped, not yet built) never launches unless the
-# owner promotes the item (`churn queue promote`), which also gives it core priority. PR fixes, the ci lane and RESUME
-# items are work in flight and are never held by scope.
+# Scope labels (scope:core|sweep|frontier|infra) are kept on items for the scorecard; they no longer order or hold work.
+# Tiers, promotion and scope ranks were retired 2026-10-25: the owner's focus decides what launches.
 SCOPES = ("core", "sweep", "frontier", "infra")
-# Owner 2026-10-22: a promotion is the owner's word on the ISSUE, not on one queue item. It was lost at every launch, so
-# each followup slice of a promoted frontier issue came back held (nyx: #5620 and #5640, three times in a day).
-# state["promoted_issues"] {issue: when} makes every queue item for that issue promoted, for PROMOTE_DAYS after the
-# last promote; `churn queue unpromote --issue N` ends it.
-PROMOTE_DAYS = 30
-SCOPE_RANK = {"core": 0, None: 1, "sweep": 1, "infra": 2, "frontier": 3}
 
 
 def _int(x) -> int:
@@ -300,12 +287,8 @@ def _norm_queue(q):
         q.pop("scope", None)
     elif q["scope"] not in SCOPES:
         raise ValueError(f"queue item scope {q['scope']!r} not in {SCOPES}")
-    if not q.get("promoted"):
-        q.pop("promoted", None)
-    if q.get("tier") is None:
-        q.pop("tier", None)
-    elif q["tier"] not in TIERS:
-        raise ValueError(f"queue item tier {q['tier']!r} not in {TIERS}")
+    q.pop("promoted", None)  # promotion retired 2026-10-25
+    q.pop("tier", None)  # tiers retired 2026-10-25
     if q.get("repo") is not None and q["repo"] not in CRUCIBLE_REPOS:
         raise ValueError(f"queue item repo {q['repo']!r} not in {sorted(CRUCIBLE_REPOS)}")
     # Unknown keys pass through untouched (2026-10-16: a churn process still running the previous code quarantined every
@@ -411,20 +394,9 @@ def normalize_state(state: dict) -> list[str]:
     except ValueError as e:
         quarantine("max_workers", state.get("max_workers"), str(e))
         state["max_workers"] = 2
-    promo = state.get("promoted_issues", {})
-    if not isinstance(promo, dict):
-        quarantine("promoted_issues", promo, "not an object")
-        promo = {}
-    promo = {str(k): t for k, t in promo.items()
-             if (ts := parse_iso(t)) and now() - ts < dt.timedelta(days=PROMOTE_DAYS)}
-    if promo:
-        state["promoted_issues"] = promo
-        for x in state["queue"]:
-            if str(x.get("issue")) in promo:
-                x["promoted"] = True
-    else:
-        state.pop("promoted_issues", None)
-    for key in ("agy", "features", "usage", "credit", "retro", "goal"):
+    for gone in ("promoted_issues", "line_partials", "refill"):  # retired 2026-10-25 (the focus replaced them)
+        state.pop(gone, None)
+    for key in ("agy", "features", "usage", "credit", "retro", "goal", "focus"):
         if not isinstance(state.get(key, {}), dict):
             quarantine(key, state[key], "not an object")
             state[key] = {}
@@ -1140,8 +1112,7 @@ def live_opus_count(state: dict) -> int:
 
 def ci_priced(state: dict, x: dict) -> bool:
     """A new normal-lane item whose PR runs on this repo's CI: what CI admission meters (#38)."""
-    return (x.get("lane") in (None, "normal") and not x.get("pr") and not x.get("repo") and x.get("backend") != "agy"
-            and not (x.get("scope") == "core" and core_short(state)))
+    return x.get("lane") in (None, "normal") and not x.get("pr") and not x.get("repo") and x.get("backend") != "agy"
 
 
 def budget_picks(state: dict, snap: dict | None, mode: str, n: int, plan: dict | None) -> list[tuple[int, dict]]:
@@ -1728,6 +1699,14 @@ def cmd_worker(a) -> int:
         prompt = a.message
     else:
         issue, model, task = a.issue, a.model, a.task or ""
+        if getattr(a, "off_focus", False):
+            owner_only("churn worker --off-focus")
+        elif not getattr(a, "check_of", None) and not in_focus(load_state(), {"issue": issue, "task": task,
+                                                                             "lane": getattr(a, "lane", None)}):
+            f = focus_cfg(load_state())
+            raise SystemExit(f"#{issue} is off the focus ({f.get('name')}: {', '.join(f'#{n}' for n in f.get('issues', []))})"
+                             ": not launched. Only the owner widens the focus (`churn focus add`) or runs it anyway "
+                             "(`churn worker --off-focus`).")
         prompt = Path(a.brief_file).read_text() if a.brief_file else a.brief
         if not prompt:
             raise SystemExit("worker needs --brief-file or --brief")
@@ -2110,12 +2089,12 @@ def credit_committed(state: dict) -> float:
 
 def credit_pick(state: dict, snap: dict, cfg: dict) -> tuple[dict, dict] | tuple[None, None]:
     """The first queue item the credit lane can run with no model tick (direct_spec): PR fixes first, then normal and
-    ci items by scope and tier. Items queued for Opus stay with the plan unless the lane itself runs Opus."""
+    ci items by position. Items queued for Opus stay with the plan unless the lane itself runs Opus."""
     q = [(i, x) for i, x in enumerate(state.get("queue", [])) if not x.get("needs_owner") and x.get("backend") != "agy"
          and x.get("lane", "normal") in ("normal", "ci") and not blocked_by(x, snap, state) and not waiting(x)
-         and not plan_overlap(state, x) and not scope_held(x)
+         and not plan_overlap(state, x) and in_focus(state, x)
          and (x.get("model", "sonnet") != "opus" or cfg["model"] == "opus")]
-    q.sort(key=lambda ix: (not ix[1].get("pr"), scope_rank(ix[1]), TIER_RANK[item_tier(ix[1])], ix[0]))
+    q.sort(key=lambda ix: (not ix[1].get("pr"), ix[0]))
     for _, x in q:
         if (spec := direct_spec(state, snap, x)) is not None:
             return x, spec
@@ -3016,7 +2995,6 @@ def reap_agy(state: dict, r: dict) -> dict:
             "report": str(rd / "report.md"), "review_model": "sonnet"}
 
 
-
 def reap(state: dict) -> list[dict]:
     """Move finished churn workers from `running` to `reports_pending`; ledger + limit detection."""
     done, keep = [], []
@@ -3322,10 +3300,6 @@ def settle_check(state: dict, issue: int, pr: int, status: str, key: str, left_t
         body = new
         note += ", ticked"
     elif status == "partial":
-        parts = state.setdefault("line_partials", {})
-        parts[key] = int(parts.pop(key, 0)) + 1  # re-inserted last: the 300 most recent lines are kept
-        for k in list(parts)[:-300]:
-            del parts[k]
         line = next(c["text"] for c in checklist(body) if c["key"] == key)
         msg = (f"#{pr} merged: a partial slice of [c:{key}] \"{line[:200]}\""
                + (f"; left: {left_text}" if left_text else "") + " (promoter-bot)")
@@ -3336,18 +3310,12 @@ def settle_check(state: dict, issue: int, pr: int, status: str, key: str, left_t
         return None
     note += f", {len(left)} left"
     i["body"] = body
-    if (issue_scope(issue, i) == "core" and refill_cfg(state)["enabled"] and not state.get("workers_paused")
-            and issue != goal_cfg(state).get("ladder_anchor")  # the ladder refill slices it by estate
+    if (not state.get("workers_paused") and in_focus(state, {"issue": issue})
+            and issue != ladder_anchor(state)  # the ladder refill slices it by estate
             and not foreign_claim(i) and not host_skips(i)
             and not any(x.get("issue") == issue for s in ("queue", "running") for x in state.get(s, []))
             and (c := next_check(i, state))):
-        item = refill_item(i, check=c)
-        if (n := int((state.get("line_partials") or {}).get(c["key"], 0))) >= int(goal_cfg(state)["line_partials_max"]):
-            item["task"] = (f"SPLIT FIRST: [c:{c['key']}] has had {n} partial slices. Before more code, propose splitting "
-                            "it into concrete PR-sized checklist lines in your report (the tick edits the issue), then "
-                            "do the first of them. " + item["task"])
-            note += f" (split first: {n} partials)"
-        state.setdefault("queue", []).append(item)
+        state.setdefault("queue", []).append(refill_item(i, check=c))
         note += f"; queued next line [c:{c['key']}]"
     return note
 
@@ -4864,26 +4832,6 @@ def backfill_rank(x: dict) -> int:
     return 2 if "mutation" in str(x.get("task", "")).lower() else 1
 
 
-def in_flight(x: dict) -> bool:
-    """A PR fix, a ci-lane item or a RESUME of a preempted run: work already under way, never held by scope."""
-    return bool(x.get("pr")) or x.get("lane") == "ci" or str(x.get("task", "")).startswith("RESUME")
-
-
-def scope_held(x: dict) -> bool:
-    return x.get("scope") == "frontier" and not x.get("promoted") and not in_flight(x)
-
-
-def scope_rank(x: dict) -> int:
-    return 0 if x.get("promoted") else SCOPE_RANK.get(x.get("scope"), 1)
-
-
-def item_tier(x: dict) -> str | None:
-    """The item's tier; an untiered "Siblings of #X" item is a follow-up (its task names the class it widens)."""
-    if x.get("tier"):
-        return x["tier"]
-    return "followup" if re.search(r"\bsiblings of\b", str(x.get("task", "")), re.I) else None
-
-
 def issue_meta(n: int) -> dict | None:
     """Issue #n's title + labels (one gh call), or None if unreadable."""
     r = run(["gh", "issue", "view", str(n), "--repo", REPO, "--json", "title,labels"])
@@ -4902,54 +4850,191 @@ def issue_scope(n: int, meta: dict | None = None) -> str | None:
     return next((x[6:] for x in names if x.startswith("scope:") and x[6:] in SCOPES), None)
 
 
-def issue_tier(n: int, meta: dict | None = None) -> str | None:
-    """Tier from issue #n's `tier:<name>` label; else "followup" for a "Siblings of" issue; None if unknown."""
-    d = meta if meta is not None else issue_meta(n)
-    if d is None:
-        return None
-    for lab in d.get("labels") or []:
-        name = str(lab.get("name", ""))
-        if name.startswith("tier:") and name[5:] in TIERS:
-            return name[5:]
-    return "followup" if str(d.get("title", "")).lower().startswith("siblings of") else None
-
-
 # Owner 2026-10-18: 20 of 70 merged PRs were core (33 infra). With 2 workers, ci-lane, infra and backfill items could
 # hold both slots while a core item waited (in busy mode normal items never launched at all). `core_reserve` (default
 # 1) Claude workers stay on scope:core whenever a core item can launch; PR fixes still go first (finishing beats starting).
 CORE_RESERVE = 1
 
 
-def core_short(state: dict) -> bool:
-    """Fewer live (or just-picked) Claude workers on scope:core than state.core_reserve."""
-    held = sum(1 for r in state.get("running", []) if r.get("scope") == "core" and r.get("backend") != "agy"
-               and r.get("lane") not in ("backfill", "credit") and (r.get("picked") or pid_alive(r.get("pid"))))
-    return held < int(state.get("core_reserve", CORE_RESERVE))
+# ---------------------------------------------------------------- focus (owner 2026-10-25)
+# "We keep on not being able to focus: the system just switches." Goal stages, tiers, scope ranks, the core slot and
+# host lanes all only RANKED work; every way of adding work (rule refill, call-graph filler, follow-up next slices,
+# the tick's own queue adds and goal edits) kept feeding other issues, and a focus item that vanished (dropped for a
+# claim) went unnoticed while the slots filled with whatever was left. The focus is one owner-set allowlist per host,
+# enforced where work is picked and where every worker launches (cmd_worker), so no path around it exists:
+# - launchable: the focus issues (their PR fixes too), red main, and the owner-budgeted retro/experiment lanes;
+# - everything else stays parked (queued, never picked) or is recorded in focus.parked instead of queued;
+# - no focus work launchable while a slot is free -> the owner is paged ("focus starved") instead of a fallback;
+# - every 6 h the share of launches inside the focus is checked; under DRIFT_SHARE_MIN pages "drift";
+# - only the owner changes it: `churn focus ...` refuses inside any run churn started (CHURN_RUN).
+FOCUS_EXEMPT_LANES = ("retro", "experiment")
+DRIFT_SHARE_MIN = 0.9
+DRIFT_EVERY_H = 6
+STARVE_PASSES = 2
 
 
-# Owner 2026-10-21: the factory had throughput but no goal. Work entered from labels, checklist lines and refills, so the
-# queue drifted to wherever reviews had last filed siblings: 6 of 10 burned programs that did not translate whole had
-# no issue at all, and the core slot took core items by position alone. The goal is an ordered list of stages, each an
-# issue set (`churn goal add STAGE N`); the active stage's issues launch first in every pick (PR fixes, the core slot,
-# normal work) and in the rule refill, later stages next, everything else after. With `goal_reports` in the host
-# config, `churn goal measure` (the gate every measure_every_h) reads the repo's evidence reports, counts programs per
-# level and names the programs with holes that no open issue mentions; the tick is asked to file and add those.
-GOAL_DEFAULT = {"order": ["translate", "l5", "breadth"], "stage": "translate", "measure_every_h": 6,
-                "line_partials_max": 3, "ladder_anchor": None, "ladder_skip": [], "excluded": []}
+def focus_cfg(state: dict) -> dict:
+    return state.get("focus") or {}
+
+
+def focus_on(state: dict) -> bool:
+    return bool(focus_cfg(state).get("issues"))
+
+
+def focus_issues(state: dict) -> list[int]:
+    return [int(n) for n in focus_cfg(state).get("issues") or []]
+
+
+def in_focus(state: dict, x: dict) -> bool:
+    """May item / launch x run under the focus? With no focus set only red main and the exempt lanes run: churn never
+    roams free (the free-roaming refill was where the drift came from)."""
+    if x.get("auto") == "main-red" or str(x.get("task", "")).startswith("Main is red:"):
+        return True  # a red main blocks every merge, the focus's too
+    if x.get("lane") in FOCUS_EXEMPT_LANES:
+        return True
+    return x.get("issue") is not None and int(x["issue"]) in set(focus_issues(state))
+
+
+def owner_only(what: str) -> None:
+    if os.environ.get("CHURN_RUN"):
+        raise SystemExit(f"{what}: owner only. This runs inside a churn tick or worker (CHURN_RUN), and the focus is the "
+                         "owner's decision; say what should change in your report instead.")
+
+
+def park_off_focus(state: dict, issue: int, task: str, source: str) -> str:
+    """Record work that was not queued because it is off the focus (the owner sees it in `churn focus`)."""
+    f = state.setdefault("focus", {})
+    parked = [p for p in f.get("parked") or [] if p.get("issue") != issue][-49:]
+    parked.append({"issue": int(issue), "task": str(task)[:200], "source": source, "t": iso(now())})
+    f["parked"] = parked
+    return f"off focus ({f.get('name') or 'focus'}): #{issue} not queued, parked"
+
+
+def focus_share(state: dict, hours: float = 24) -> tuple[int, int]:
+    """(launches inside the focus, all launches) over the last `hours`, since the focus was set: new worker runs only
+    (not checks, prechecks or resumes)."""
+    f = focus_cfg(state)
+    cut = max(now() - dt.timedelta(hours=hours), parse_iso(f.get("set")) or now() - dt.timedelta(hours=hours))
+    inside = total = 0
+    for d in RUNS.glob("*-*"):
+        m = _run_meta(d.name)
+        t = parse_iso(m.get("started"))
+        if not t or t < cut or m.get("check_of") or m.get("precheck_of") or m.get("resume_of"):
+            continue
+        total += 1
+        inside += in_focus(state, {"issue": m.get("issue"), "task": m.get("task"), "lane": m.get("lane")})
+    return inside, total
+
+
+def focus_alerts(state: dict, snap: dict | None, launched: list[str]) -> list[str]:
+    """Starvation and drift pages for the focus. Returns log lines."""
+    if not focus_on(state):
+        notify("focus-none", "no focus set", "This host has no focus, so churn launches nothing but red-main fixes. "
+               "Set one: `churn focus set NAME N..` (and `churn focus ladder N` for a ladder).", priority="high",
+               cooldown_h=12)
+        return []
+    out = []
+    f = focus_cfg(state)
+    name = f.get("name") or "the focus"
+    live = claude_slot_holders(state)
+    free = len(live) < int(state.get("max_workers", 1))
+    focus_live = [r for r in live if in_focus(state, r)]
+    held = (t := parse_iso(state.get("paused_until"))) and t > now()  # a limit / offline pause: not starvation
+    starving = free and not launched and not focus_live and not state.get("workers_paused") and not held
+    with edit_state() as st:
+        fs = st.setdefault("focus", {})
+        fs["idle_passes"] = int(fs.get("idle_passes", 0)) + 1 if starving else 0
+        idle = fs["idle_passes"]
+        last = parse_iso(fs.get("drift_checked"))
+        drift_due = not last or now() - last >= dt.timedelta(hours=DRIFT_EVERY_H)
+        if drift_due:
+            fs["drift_checked"] = iso(now())
+    if starving and idle == STARVE_PASSES:
+        mode = state.get("ci_mode", "calm")
+        why = idle_causes(state, snap, mode)
+        queued = [x for x in state.get("queue", []) if in_focus(state, x)]
+        msg = (f"{name}: a worker slot is free and no focus work can launch ({why}). Focus items queued: "
+               f"{len(queued)}" + (f" ({', '.join(sorted({f'#{x['issue']}' for x in queued}))})" if queued else
+                                   ": none -- queue the next step or widen the focus (`churn focus add N`)."))
+        notify("focus-starved", "focus starved", msg, priority="high", cooldown_h=6)
+        out.append(f"FOCUS starved: {msg}")
+    if drift_due:
+        inside, total = focus_share(state)
+        if total >= 3 and inside / total < DRIFT_SHARE_MIN:
+            msg = (f"{name}: only {inside} of {total} launches in the last 24 h were focus work "
+                   f"(< {DRIFT_SHARE_MIN:.0%}). Something launches around the focus: check `churn focus`.")
+            notify("focus-drift", "focus drift", msg, priority="high", cooldown_h=DRIFT_EVERY_H)
+            out.append(f"FOCUS drift: {msg}")
+    return out
+
+
+def cmd_focus(a) -> int:
+    """`churn focus` (status), `set NAME N..`, `add N..`, `rm N..`, `ladder ANCHOR [--skip P..]`, `off`."""
+    args = list(a.args or [])
+    if a.action == "status":
+        state = load_state()
+        f = focus_cfg(state)
+        if not focus_on(state):
+            print("no focus set: nothing launches but red-main fixes (`churn focus set NAME N..`)")
+            return 0
+        lad = f.get("ladder") or {}
+        print(f"focus: {f.get('name')} (set {f.get('set')}): " + ", ".join(f"#{n}" for n in focus_issues(state)))
+        if lad.get("anchor"):
+            below = (goal_cfg(state).get("measure") or {}).get("below") or {}
+            print(f"  ladder #{lad['anchor']}, skip {', '.join(lad.get('skip') or []) or 'none'}: "
+                  + "; ".join(f"{e} {len(ps)}" for e, ps in below.items()))
+        inside, total = focus_share(state)
+        print(f"  last 24 h: {inside}/{total} launches inside the focus")
+        q = state.get("queue", [])
+        print(f"  queued: {sum(in_focus(state, x) for x in q)} focus, {sum(not in_focus(state, x) for x in q)} parked "
+              f"off-focus items")
+        for p in (f.get("parked") or [])[-10:]:
+            print(f"  not queued (off focus, {p.get('source')}, {p.get('t')}): #{p['issue']} {p['task'][:100]}")
+        return 0
+    owner_only("churn focus " + a.action)
+    with edit_state() as st:
+        f = st.setdefault("focus", {})
+        if a.action == "set":
+            if len(args) < 2:
+                raise SystemExit("focus set NAME N..")
+            f.update(name=args[0], issues=sorted({_int(x) for x in args[1:]}), set=iso(now()), idle_passes=0)
+            msg = f"focus set: {args[0]} = " + ", ".join(f"#{n}" for n in f["issues"])
+        elif a.action in ("add", "rm"):
+            nums = {_int(x) for x in args}
+            cur = set(f.get("issues") or [])
+            f["issues"] = sorted(cur | nums if a.action == "add" else cur - nums)
+            msg = f"focus {a.action}: " + ", ".join(f"#{n}" for n in sorted(nums)) + f" -> {len(f['issues'])} issues"
+        elif a.action == "ladder":
+            if len(args) < 1:
+                raise SystemExit("focus ladder ANCHOR|off [--skip PROGRAM..]")
+            if args[0] == "off":
+                f.pop("ladder", None)
+                msg = "focus ladder off"
+            else:
+                anchor = _int(args[0])
+                f["ladder"] = {"anchor": anchor, "skip": sorted(set(a.skip or []))}
+                f["issues"] = sorted(set(f.get("issues") or []) | {anchor})
+                msg = f"focus ladder #{anchor}, skip {', '.join(f['ladder']['skip']) or 'none'}"
+        elif a.action == "off":
+            st["focus"] = {"parked": f.get("parked") or []}
+            msg = "focus off: nothing launches but red-main fixes until a new focus is set"
+        else:
+            raise SystemExit(f"focus {a.action}?")
+    log(f"{msg} (owner)")
+    print(msg)
+    return 0
+
+
+# The evidence measure (2026-10-21; its goal stages became the focus on 2026-10-25): with `goal_reports` in the host
+# config the gate reads the repo's evidence reports every measure_every_h, counts programs per level, lists the programs
+# below L4 per estate (the focus ladder slices them) and names L0 programs no open issue mentions (the tick files issues
+# for those but never queues them).
+GOAL_DEFAULT = {"measure_every_h": 6}
 GOAL_REPORTS = _CFG.get("goal_reports") or {}  # {"fetch": "branch", "ref": "origin/branch", "path": "dir/of/reports"}
 
 
 def goal_cfg(state: dict) -> dict:
     return {**GOAL_DEFAULT, **(state.get("goal") or {})}
-
-
-def goal_rank(state: dict, x: dict) -> int:
-    """0 = the active stage's issue, 1.. = later stages, len(order) = not goal work (earlier, finished stages too)."""
-    g = goal_cfg(state)
-    order = list(g["order"])
-    stages = order[order.index(g["stage"]):] if g["stage"] in order else order
-    issues = g.get("issues") or {}
-    return next((k for k, s in enumerate(stages) if x.get("issue") in set(issues.get(s) or [])), len(order))
 
 
 def stamp_scopes(state: dict, limit: int = 6) -> list[str]:
@@ -4969,52 +5054,34 @@ def stamp_scopes(state: dict, limit: int = 6) -> list[str]:
         if sc := issue_scope(x["issue"], meta):
             x["scope"] = sc
             out.append(f"#{x['issue']} {sc}")
-        if not x.get("tier") and (tier := issue_tier(x["issue"], meta)):
-            x["tier"] = tier
     return out
 
 
 def pick_item(state: dict, snap: dict | None, mode: str) -> tuple[int, dict] | tuple[None, None]:
-    """The next Claude queue item for this CI mode: PR fixes (core first), then a core item while core_short, then the
-    `ci` lane (all always), then `normal` items
-    when CI is calm (by tier, then position), or `backfill` items when it is busy (at most backfill_max running).
-    2026-10-16: calm mode offers backfill too once the slots have sat idle (nothing else launchable) for
-    backfill_idle_ticks ticks in a row; the streak keeps a just-unblocked normal item from losing its box to it."""
+    """The next Claude queue item for this CI mode, among the launchable focus items: PR fixes, then red main, then the
+    `ci` lane, then `normal` items by queue position when CI is calm, or `backfill` items when it is busy (at most
+    backfill_max running). Calm mode offers backfill too once the slots have sat idle for backfill_idle_ticks ticks.
+    2026-10-25: the focus replaced the ranking layers (scope, tier, goal stage, core slot): every launchable item is
+    focus work, so queue position orders it."""
     q = [(i, x) for i, x in enumerate(state.get("queue", [])) if not x.get("needs_owner") and x.get("backend") != "agy"
-         and not blocked_by(x, snap, state) and not waiting(x) and not plan_overlap(state, x) and not scope_held(x)]
-    fix = min(((i, x) for i, x in q if x.get("pr")), key=lambda ix: (scope_rank(ix[1]), goal_rank(state, ix[1]), ix[0]),
-              default=None)
-    if fix:
-        return fix
-    for i, x in q:
-        if x.get("auto") == "main-red":
-            return i, x  # a red main blocks every PR, core ones too
-    if core_short(state) and (core := min(((i, x) for i, x in q if x.get("scope") == "core"
-                                           and x.get("lane") in (None, "normal", "ci")),
-                                          key=lambda ix: (goal_rank(state, ix[1]), TIER_RANK[item_tier(ix[1])], ix[0]),
-                                          default=None)):
-        return core  # the core slot: at least core_reserve workers on scope:core, in busy mode too
-    for i, x in q:
-        if x.get("lane") == "ci":
-            return i, x
+         and in_focus(state, x) and not blocked_by(x, snap, state) and not waiting(x) and not plan_overlap(state, x)]
+    for want in (lambda x: x.get("pr"), lambda x: x.get("auto") == "main-red", lambda x: x.get("lane") == "ci"):
+        if hit := next(((i, x) for i, x in q if want(x)), None):
+            return hit  # a PR fix finishes work in hand; a red main blocks every PR
     cfg = ci_cfg(state)
     live = [r for r in state.get("running", []) if r.get("lane") == "backfill" and pid_alive(r.get("pid"))]
+    backfill = min(((i, x) for i, x in q if x.get("lane") == "backfill"), key=lambda ix: (backfill_rank(ix[1]), ix[0]),
+                   default=(None, None))
     if mode == "busy":
         since = parse_iso(state.get("ci_mode_since"))
         if since and (now() - since).total_seconds() / 60 < float(cfg["backfill_min_busy_min"]):
             return None, None  # a short busy spell: a backfill launched now would be preempted again within minutes
-        if len(live) < int(cfg["backfill_max"]):
-            return min(((i, x) for i, x in q if x.get("lane") == "backfill"),
-                       key=lambda ix: (scope_rank(ix[1]), backfill_rank(ix[1]), ix[0]), default=(None, None))
-        return None, None
-    normal = min(((i, x) for i, x in q if x.get("lane") in (None, "normal")),
-                 key=lambda ix: (scope_rank(ix[1]), goal_rank(state, ix[1]), TIER_RANK[item_tier(ix[1])], ix[0]),
-                 default=(None, None))
+        return backfill if len(live) < int(cfg["backfill_max"]) else (None, None)
+    normal = next(((i, x) for i, x in q if x.get("lane") in (None, "normal")), (None, None))
     if normal[1] is not None or len(live) >= int(cfg["backfill_max"]) \
             or int(state.get("idle_streak", 0)) < int(cfg["backfill_idle_ticks"]):
         return normal
-    return min(((i, x) for i, x in q if x.get("lane") == "backfill"),
-               key=lambda ix: (scope_rank(ix[1]), backfill_rank(ix[1]), ix[0]), default=(None, None))
+    return backfill
 
 
 def idle_causes(state: dict, snap: dict | None, mode: str) -> str:
@@ -5027,8 +5094,8 @@ def idle_causes(state: dict, snap: dict | None, mode: str) -> str:
             c["agy"] += 1
         elif x.get("needs_owner"):
             c["owner"] += 1
-        elif scope_held(x):
-            c["frontier"] += 1
+        elif not in_focus(state, x):
+            c["off-focus"] += 1
         elif bl := blocked_by(x, snap, state):
             c["blocked"] += 1
             blockers.update(bl)
@@ -5727,6 +5794,7 @@ def lanes(b: dict, snap: dict, claude_paused: bool, dry_run: bool = False) -> li
     paused = parse_iso(cfg.get("paused_until"))
     live_agy = [r for r in state.get("running", []) if r.get("backend") == "agy" and pid_alive(r.get("pid"))]
     item = next((q for q in state.get("queue", []) if q.get("backend") == "agy" and not q.get("needs_owner")
+                 and in_focus(state, q)
                  and not blocked_by(q, snap) and not waiting(q)), None)
     if (item and cfg["enabled"] and not (paused and now() < paused) and len(live_agy) < cfg["max_running"]
             and b.get("verdict") == "GREEN" and b.get("free_slots", 0) >= 1 and len(prs_needing_work(snap, live_claude, state)) < 3):
@@ -6004,46 +6072,18 @@ def model_tick(reasons: list[str], model: str, state: dict, b: dict) -> dict:
         return {}
 
 
-# ---------------------------------------------------------------- refill
-# Owner 2026-10-17: the queue ran dry overnight (idle 02:21-04:21Z with budget left) until the owner topped it up.
-# Below a low-water mark the gate refills it in three stages:
-#  1. rules, no model: open burned-estate issues (scope core > sweep > infra; bugs, then priority), skipping epics,
-#     frontier, unlabelled (stage 2 labels them), call-graph issues (stage 3), queued/running/open-PR issues and any
-#     issue worked in the last cooldown_h;
-#  2. nothing found: the next Sonnet tick gets a "refill" need (label, split epics, file sibling gaps, queue them),
-#     at most every agent_every_h;
-#  3. still dry an hour after that ask: call-graph work (epic #3772, effectively endless): its open child issues,
-#     else one standing item on the epic.
-# Owner 2026-10-17: with NOTHING launchable (slots idle) stage 2 asks every agent_empty_min with an agent_empty_grace_min
-# grace, so stage 3 still gets its turn (2026-10-17 02:30-04:20Z the slots sat idle ~2 h waiting on the 6 h ask).
-REFILL_DEFAULT = {"enabled": True, "batch": 8, "cooldown_h": 12, "agent_every_h": 6, "agent_grace_h": 1,
-                  "agent_empty_min": 30, "agent_empty_grace_min": 15}
-CALLGRAPH_EPIC = 3772
-CALLGRAPH_TASK = (f"#{CALLGRAPH_EPIC} call-graph function work: pick the language whose call graph agrees least with its "
-                  "compiler reference (callgraph-* skills, .claude/agents/callgraph-triage-scout.md), fix one class of "
-                  "unresolved or wrong calls, and report the agreement before/after; list other classes as sibling gaps")
-SKIP_LABELS = {"epic", "roadmap"}
-PRIO_RANK = {"priority: high": 0, "priority: medium": 1, "priority: low": 3}
-
-
-def refill_cfg(state: dict) -> dict:
-    return {**REFILL_DEFAULT, **{k: v for k, v in (state.get("refill") or {}).items() if k in REFILL_DEFAULT}}
-
-
-def low_water(state: dict) -> int:
-    return 2 * int(state.get("max_workers", 2))
+# ---------------------------------------------------------------- queue generators
+# 2026-10-25: the three-stage refill (rules over all open issues, then a tick asked to file and label work, then the
+# "effectively endless" call-graph filler) is gone. It existed so a slot never sat idle, and that is exactly how the
+# fleet left every focus the owner set: an idle slot was filled with whatever was open. Work now comes only from the
+# focus's own generators (ladder_items, settle_check's next checklist line and requeue_next_slice, both for focus
+# issues), PR fixes and red main. An idle slot under a focus pages the owner (focus_alerts) instead.
 
 
 def launchable(state: dict, snap: dict | None) -> int:
-    """Queue items a slot could take now or soon: not the owner's, not agy, not held frontier, not blocked or waiting."""
+    """Focus items a slot could take now or soon: not the owner's, not agy, not blocked or waiting."""
     return sum(1 for x in state.get("queue", []) if not x.get("needs_owner") and x.get("backend") != "agy"
-               and not scope_held(x) and not blocked_by(x, snap, state) and not waiting(x))
-
-
-def is_callgraph(i: dict) -> bool:
-    text = " ".join([str(i.get("title", "")), *(str(lab.get("name", "")) for lab in i.get("labels") or []),
-                     str((i.get("milestone") or {}).get("title", ""))]).lower()
-    return "call-graph" in text or "call graph" in text
+               and in_focus(state, x) and not blocked_by(x, snap, state) and not waiting(x))
 
 
 def open_issues() -> list[dict]:
@@ -6052,30 +6092,6 @@ def open_issues() -> list[dict]:
     if r.returncode:
         raise RuntimeError(f"gh issue list: {r.stderr.strip()[:160]}")
     return json.loads(r.stdout)
-
-
-def issues_with_open_prs() -> set[int]:
-    r = run(["gh", "pr", "list", "--repo", REPO, "--state", "open", "--limit", "300", "--json", "headRefName,body"],
-            timeout=120)
-    if r.returncode:
-        raise RuntimeError(f"gh pr list: {r.stderr.strip()[:160]}")
-    out: set[int] = set()
-    for p in json.loads(r.stdout):
-        out.update(int(m) for m in re.findall(r"^(?:churn|agy|claude)/(\d+)-", p.get("headRefName") or ""))
-        out.update(int(m) for m in re.findall(r"(?:Fixes|Closes|Part of)\s+#(\d+)", p.get("body") or "", re.I))
-    return out
-
-
-def recently_worked(issue: int, hours: float) -> bool:
-    """A churn run on this issue started within `hours`, or it ever ran in a crucible repo (the tick passes --repo)."""
-    cut = now() - dt.timedelta(hours=hours)
-    for d in RUNS.glob(f"{issue}-*"):
-        m = _run_meta(d.name)
-        if m.get("repo"):
-            return True
-        if (t := parse_iso(m.get("started"))) and t > cut:
-            return True
-    return False
 
 
 # Owner 2026-10-18: an issue's checklist is its parts list, and the boxes were never ticked (156 merged PRs against the
@@ -6132,92 +6148,7 @@ def refill_item(i: dict, task: str | None = None, check: dict | None = None) -> 
                              "burned estates only, list the rest as sibling gaps")}
     if sc := issue_scope(i["number"], meta):
         item["scope"] = sc
-    if tier := issue_tier(i["number"], meta):
-        item["tier"] = tier
     return item
-
-
-def refill_candidates(state: dict, issues: list[dict], in_pr: set[int], callgraph: bool = False) -> list[dict]:
-    cfg = refill_cfg(state)
-    taken = {x.get("issue") for x in state.get("queue", [])} | {r.get("issue") for r in state.get("running", [])}
-    recent = {int(k) for k, t in ((state.get("refill") or {}).get("issued") or {}).items()
-              if (ts := parse_iso(t)) and now() - ts < dt.timedelta(hours=float(cfg["cooldown_h"]))}
-    out = []
-    for i in issues:
-        names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
-        sc = next((x[6:] for x in names if x.startswith("scope:")), None)
-        if is_callgraph(i) != callgraph or names & SKIP_LABELS or i["number"] in taken | in_pr | recent:
-            continue
-        if excluded_issue(state, i):
-            continue
-        if not callgraph and sc not in ("core", "sweep", "infra"):
-            continue  # frontier waits for the owner; unlabelled goes to stage 2
-        if recently_worked(i["number"], float(cfg["cooldown_h"])):
-            continue
-        if foreign_claim(i) or host_skips(i):
-            continue  # a person or another host has it, or it is not this host's kind of work
-        if (items := checklist(i.get("body"))) and all(c["done"] for c in items):
-            continue  # every line ticked: closing it is the tick's followup, not more work
-        out.append(i)
-
-    def rank(i):
-        names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
-        sc = next((x[6:] for x in names if x.startswith("scope:")), None)
-        return (goal_rank(state, {"issue": i["number"]}), not host_prefers(i), SCOPE_RANK.get(sc, 1), "bug" not in names,
-                min((PRIO_RANK[n] for n in names if n in PRIO_RANK), default=2), i["number"])
-    return sorted(out, key=rank)[:int(cfg["batch"])]
-
-
-def refill(state: dict, snap: dict | None, dry_run: bool = False, force: bool = False) -> tuple[str, list[dict]]:
-    """("off" | "full" | "rules" | "callgraph" | "ask" | "wait", items queued). "ask" = give the tick a refill need."""
-    cfg = refill_cfg(state)
-    if not cfg["enabled"] or state.get("workers_paused"):
-        return "off", []
-    if not force and launchable(state, snap) >= low_water(state):
-        return "full", []
-    issues, in_pr = open_issues(), issues_with_open_prs()
-    if not dry_run:
-        expire_claims(state, issues)
-    stage, items = "rules", [refill_item(i, check=next_check(i, state)) for i in refill_candidates(state, issues, in_pr)]
-    if not items:
-        asked = parse_iso((state.get("refill") or {}).get("agent_t"))
-        if launchable(state, snap) == 0:
-            every = dt.timedelta(minutes=float(cfg["agent_empty_min"]))
-            grace = dt.timedelta(minutes=float(cfg["agent_empty_grace_min"]))
-        else:
-            every = dt.timedelta(hours=float(cfg["agent_every_h"]))
-            grace = dt.timedelta(hours=float(cfg["agent_grace_h"]))
-        if not asked or now() - asked >= every:
-            return "ask", []
-        if now() - asked < grace:
-            return "wait", []  # the tick that was asked may still be filing issues
-        stage = "callgraph"
-        items = [refill_item(i) for i in refill_candidates(state, issues, in_pr, callgraph=True)]
-        if not items and not any(x.get("issue") == CALLGRAPH_EPIC for x in state.get("queue", [])) \
-                and not recently_worked(CALLGRAPH_EPIC, 1) and not HOST.get("milestones") and not HOST.get("labels"):
-            items = [refill_item({"number": CALLGRAPH_EPIC, "title": "", "labels": [{"name": "scope:infra"}]},
-                                 CALLGRAPH_TASK)]
-    if items and not dry_run:
-        with edit_state() as st:
-            st.setdefault("queue", []).extend(items)
-            rf = st.setdefault("refill", {})
-            rf["t"] = iso(now())
-            rf["issued"] = {**{k: t for k, t in (rf.get("issued") or {}).items()
-                               if (ts := parse_iso(t)) and now() - ts < dt.timedelta(days=3)},
-                            **{str(x["issue"]): iso(now()) for x in items if x["issue"] != CALLGRAPH_EPIC}}
-        log(f"refill ({stage}): queued " + ", ".join(f"#{x['issue']} [{x.get('scope', '-')}]" for x in items))
-    return stage, items
-
-
-def refill_need(state: dict) -> str:
-    return (f"refill: the queue is below its low-water mark ({low_water(state)} launchable) and the rule-based refill "
-            "found no open core/sweep/infra issue to queue. Refill it, burned estates only, about 8 items at most: "
-            "(1) label unlabelled open issues (type, area, priority, scope:core|sweep|frontier|infra) with "
-            f"`gh api repos/{REPO}/issues/<n>/labels`; (2) for each core/sweep `epic`, file its next concrete step as a "
-            "new issue if none is open; (3) file the 'Sibling gaps' from recent churn-runs/*/report.md that have no "
-            "issue; (4) queue what you labelled or filed with `churn queue add --issue <n> --model sonnet --task ...`. "
-            "Never queue frontier work. If nothing qualifies, say so: the gate falls back to call-graph work "
-            f"(#{CALLGRAPH_EPIC}) in an hour.")
 
 
 def goal_reports() -> list[dict]:
@@ -6300,29 +6231,33 @@ def goal_need(state: dict) -> str:
     lines = "; ".join(f"{p} ({rows.get(p, {}).get('estate', '?')}: {rows.get(p, {}).get('holes')} holes"
                       + (f", refused: {rows[p]['refused']}" if rows.get(p, {}).get("refused") else "")
                       + f", classes: {' | '.join(rows.get(p, {}).get('classes') or [])[:240]})" for p in g.get("ask", []))
-    return (f"goal ({g['stage']}): these programs do not translate whole and no open issue names them: {lines}. "
+    return (f"evidence measure: these programs do not translate whole and no open issue names them: {lines}. "
             "For each hole class (one issue per class, several programs may share it): check closed issues for an owner "
             "decision first; if the program cannot be done here (source the vendor compiler rejects, needs a real "
             "mainframe, a language we do not translate) file it scope:frontier and say why; otherwise file a scope:core "
-            "issue with the holes and source lines, a checklist, and the labels the repo uses, then "
-            f"`churn goal add {g['stage']} <n>` and `churn queue add --issue <n> --tier era-core --front`.")
+            "issue with the holes and source lines, a checklist, and the labels the repo uses. Do NOT queue it: list "
+            "the new issues in your summary, and the owner adds them to the focus (`churn focus add`) or not.")
 
 
 # Owner 2026-10-25: the factory drifted off the L1->L4 ladder. The estate slices were queued by hand once (10-23), merged,
 # and nothing queued the next round: the rule refill skips an issue with an open PR or a run in the last 12 h, so it fell
 # through to infra and call-graph work (~20 of ~240 merges on 10-24 were ladder work), and the checklist's "SPLIT FIRST"
 # kept re-slicing #6072's estate lines (12 partials on one line: estate-sized data PRs are partial by design). Now, with
-# goal.ladder_anchor set, every gate pass queues one slice per estate that has programs below L4 (from the goal measure)
-# and no ladder item queued, running or in an open PR; an estate is queued again only after a newer measure.
+# a focus ladder (`churn focus ladder N`), every gate pass queues one slice per estate that has programs below L4 (from
+# the goal measure) and no ladder item queued, running or in an open PR; an estate is queued again only after a newer
+# measure. It is the focus's own generator: the one refill left while a focus is set.
 LADDER_TAG = "[ladder:{}]"
 
 
+def ladder_anchor(state: dict) -> int | None:
+    return (focus_cfg(state).get("ladder") or {}).get("anchor")
+
+
 def ladder_items(state: dict, snap: dict | None) -> list[dict]:
-    """New ladder slices for the anchor issue, one per estate (also stamps goal.ladder_queued). [] when off."""
+    """New ladder slices for the focus ladder's anchor issue, one per estate (stamps focus.ladder_queued)."""
     g = goal_cfg(state)
-    anchor = g.get("ladder_anchor")
-    if (not anchor or anchor not in set((g.get("issues") or {}).get("ladder") or []) or state.get("workers_paused")
-            or not refill_cfg(state)["enabled"]):
+    anchor = ladder_anchor(state)
+    if not anchor or not in_focus(state, {"issue": anchor}) or state.get("workers_paused"):
         return []
     m = g.get("measure") or {}
     measured = parse_iso(m.get("t"))
@@ -6333,8 +6268,8 @@ def ladder_items(state: dict, snap: dict | None) -> list[dict]:
               if (mt := _run_meta(d.name)) and mt.get("branch") in branches]
     ours = " ".join(t for t in tasks if "[ladder:" in t)
     others = " ".join(t for t in tasks if "[ladder:" not in t)
-    skip = {str(x).lower() for x in g.get("ladder_skip") or []}
-    last = dict(g.get("ladder_queued") or {})
+    skip = {str(x).lower() for x in (focus_cfg(state).get("ladder") or {}).get("skip") or []}
+    last = dict(focus_cfg(state).get("ladder_queued") or {})
     out = []
     for estate, progs in sorted((m.get("below") or {}).items()):
         tag = LADDER_TAG.format(estate)
@@ -6355,114 +6290,31 @@ def ladder_items(state: dict, snap: dict | None) -> list[dict]:
                             f"this PR. Burned estates only; evidence levels, not 'proven'."})
         last[estate] = iso(now())
     if out:
-        state.setdefault("goal", {})["ladder_queued"] = last
+        state.setdefault("focus", {})["ladder_queued"] = last
     return out
 
 
-def excluded_issue(state: dict, i: dict) -> bool:
-    """Owner-excluded work (goal.excluded, e.g. the sunset L5 mutation issues) and the "Siblings of" issues filed from
-    it: the refill never queues them, whatever their scope label says (#6166 came back as scope:sweep on 10-24)."""
-    ex = {int(x) for x in goal_cfg(state).get("excluded") or []}
-    return i.get("number") in ex or any(int(n) in ex for n in re.findall(r"Siblings of #(\d+)", str(i.get("title", ""))))
-
-
 def cmd_goal(a) -> int:
-    """`churn goal` (status), `stage NAME`, `add STAGE N..`, `rm N..`, `order A,B,..`, `measure`; `ladder N|off` (the
-    issue the ladder refill slices by estate), `skip|unskip PROGRAM..` (programs it leaves out), `exclude|include N..`
-    (issues the refill never queues, nor their "Siblings of" issues)."""
-    args = list(a.args or [])
+    """`churn goal` (the last evidence measure), `measure` (measure now). The focus ladder reads it."""
+    state = load_state()
     if a.action == "measure":
-        state = load_state()
         if not GOAL_REPORTS:
             raise SystemExit("no goal_reports in the host config: nothing to measure")
         for note in goal_tick(state, force=True):
             log(note)
             print(note)
-    elif a.action in ("ladder", "skip", "unskip", "exclude", "include"):
-        with edit_state() as st:
-            gs = st.setdefault("goal", {})
-            if a.action == "ladder":
-                if len(args) != 1:
-                    raise SystemExit("goal ladder N|off")
-                gs["ladder_anchor"] = None if args[0] == "off" else _int(args[0])
-                msg = f"goal ladder anchor -> {gs['ladder_anchor'] or 'off'}"
-            elif a.action in ("skip", "unskip"):
-                cur = [x for x in gs.get("ladder_skip") or [] if x.lower() not in {y.lower() for y in args}]
-                gs["ladder_skip"] = sorted(cur + list(args)) if a.action == "skip" else cur
-                msg = f"goal ladder skip: {', '.join(gs['ladder_skip']) or 'none'}"
-            else:
-                nums = {_int(x) for x in args}
-                cur = set(gs.get("excluded") or []) - nums
-                gs["excluded"] = sorted(cur | nums) if a.action == "exclude" else sorted(cur)
-                msg = f"goal excluded: {', '.join(f'#{n}' for n in gs['excluded']) or 'none'}"
-        log(f"{msg} (owner)")
-        print(msg)
-    elif a.action in ("stage", "add", "rm", "order"):
-        with edit_state() as st:
-            gs = st.setdefault("goal", {})
-            g = goal_cfg(st)
-            if a.action == "order":
-                if len(args) != 1 or not all(args[0].split(",")):
-                    raise SystemExit("goal order A,B,C")
-                gs["order"] = args[0].split(",")
-                msg = f"goal order {gs['order']}"
-            elif a.action == "stage":
-                if len(args) != 1 or args[0] not in g["order"]:
-                    raise SystemExit(f"goal stage NAME, one of {g['order']}")
-                gs["stage"] = args[0]
-                msg = f"goal stage -> {args[0]}"
-            elif a.action == "add":
-                if len(args) < 2 or args[0] not in g["order"]:
-                    raise SystemExit(f"goal add STAGE N.., STAGE one of {g['order']}")
-                nums = [_int(x) for x in args[1:]]
-                iss = gs.setdefault("issues", {})
-                for s in iss:
-                    iss[s] = [n for n in iss[s] if n not in nums]  # an issue belongs to one stage
-                iss[args[0]] = sorted(set(iss.get(args[0], [])) | set(nums))
-                msg = f"goal: {args[0]} += {', '.join(f'#{n}' for n in nums)}"
-            else:
-                nums = {_int(x) for x in args}
-                gs["issues"] = {s: [n for n in v if n not in nums] for s, v in (gs.get("issues") or {}).items()}
-                msg = f"goal: removed {', '.join(f'#{n}' for n in sorted(nums))}"
-        log(f"{msg} (owner)")
-        print(msg)
-    else:
-        state = load_state()
-        g = goal_cfg(state)
-        print(f"goal stage: {g['stage']} (order {' > '.join(g['order'])})")
-        for s in g["order"]:
-            print(f"  {s}: " + (", ".join(f"#{n}" for n in (g.get("issues") or {}).get(s, [])) or "-"))
-        if m := g.get("measure"):
-            print(f"measured {m['t']}: {goal_summary(m)}")
-            for u in m.get("untranslated", []):
-                print(f"  {u['estate']} {u['program']}: {u.get('holes')} holes"
-                      + (f" ({u['refused']})" if u.get("refused") else "") + " -> "
-                      + (", ".join(f"#{n}" for n in u["issues"]) or "NO ISSUE"))
-        elif not GOAL_REPORTS:
-            print("not measured: no goal_reports in the host config")
-        if g.get("ladder_anchor"):
-            print(f"ladder refill: #{g['ladder_anchor']}, skip {', '.join(g.get('ladder_skip') or []) or 'none'}; "
-                  + "; ".join(f"{e} {len(ps)}" for e, ps in ((g.get("measure") or {}).get("below") or {}).items()))
-        if g.get("excluded"):
-            print("excluded from the refill: " + ", ".join(f"#{n}" for n in g["excluded"]))
-        queued = [x for x in state.get("queue", []) if goal_rank(state, x) == 0]
-        print(f"queued for the active stage: {', '.join(f'#{x['issue']}' for x in queued) or 'none'}")
-    return 0
-
-
-def cmd_refill(a) -> int:
-    """Run the refill now (owner or debugging); --dry-run lists what it would queue; --on/--off toggles it."""
-    if a.on or a.off:
-        with edit_state() as st:
-            st.setdefault("refill", {})["enabled"] = bool(a.on)
-        log(f"refill {'on' if a.on else 'off'} (owner)")
         return 0
-    state = load_state()
-    snap = json.loads(SNAP.read_text()) if SNAP.exists() else {}
-    stage, items = refill(state, snap, dry_run=a.dry_run, force=a.force)
-    print(f"{stage}: launchable {launchable(state, snap)} / low-water {low_water(state)}")
-    for x in items:
-        print(f"  #{x['issue']} [{x.get('scope', '-')}{', ' + x['tier'] if x.get('tier') else ''}] {x['task'][:110]}")
+    m = goal_cfg(state).get("measure")
+    if not m:
+        print("not measured" + ("" if GOAL_REPORTS else ": no goal_reports in the host config"))
+        return 0
+    print(f"measured {m['t']}: {goal_summary(m)}")
+    for e, ps in (m.get("below") or {}).items():
+        print(f"  below L4, {e}: " + ", ".join(f"{p} ({lv})" for p, lv in ps))
+    for u in m.get("untranslated", []):
+        print(f"  L0 {u['estate']} {u['program']}: {u.get('holes')} holes"
+              + (f" ({u['refused']})" if u.get("refused") else "") + " -> "
+              + (", ".join(f"#{n}" for n in u["issues"]) or "NO ISSUE"))
     return 0
 
 
@@ -6485,8 +6337,8 @@ def claim_label(host: str = HOST_ID) -> str:
 
 
 def claim_exempt(state: dict, issue) -> bool:
-    """Standing issues every host may work at once: the call-graph epic and the weekly retro's issue."""
-    return not issue or int(issue) in {CALLGRAPH_EPIC, retro_cfg(state).get("issue")}
+    """Standing issues every host may work at once: the weekly retro's issue."""
+    return not issue or int(issue) == retro_cfg(state).get("issue")
 
 
 def foreign_claim(i: dict) -> str | None:
@@ -6580,14 +6432,6 @@ def host_skips(i: dict) -> str | None:
     if (want_ms or want_labels) and ms not in want_ms and not names & set(want_labels):
         return "outside this host's lanes"
     return None
-
-
-def host_prefers(i: dict) -> bool:
-    """Issue `i` is in one of host.prefer_milestones or routed here by `lane:<host_id>`: refill takes it first. Unlike
-    host.milestones this never skips anything (owner 2026-10-22: nyx sat idle half the day with its two milestones
-    all frontier, claimed or needing docker, while 55 other open issues were fair game)."""
-    names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
-    return f"lane:{HOST_ID}" in names or str((i.get("milestone") or {}).get("title", "")) in (HOST.get("prefer_milestones") or [])
 
 
 def claim(state: dict, n: int, dry_run: bool = False) -> tuple[bool, str, dict | None]:
@@ -6690,6 +6534,10 @@ def sync_claims(dry_run: bool = False) -> list[str]:
             cur["queue"] = [x for x in cur.get("queue", []) if x.get("issue") != n]
             if len(cur["queue"]) < before:
                 notes.append(f"dropped #{n} from the queue: {why}")
+            if n in set(focus_issues(cur)):
+                notify(f"focus-claimed-{n}", "focus issue held elsewhere",
+                       f"#{n} is in this host's focus but {why}: this host cannot work it. Release the claim there or "
+                       f"change one host's focus.", priority="high", cooldown_h=12)
     return notes
 
 
@@ -6899,12 +6747,7 @@ def cmd_tick(a) -> int:
             for note in throttled:
                 log(note)
             state = load_state()
-        refill_stage = "off"
         if not a.dry_run:
-            try:
-                refill_stage, _ = refill(state, snap)
-            except (RuntimeError, OSError, ValueError) as e:  # GitHub unreadable: try again next tick
-                log(f"refill skipped: {str(e)[:160]}", quiet=True)
             try:
                 for note in (goal_tick(state) if QUOTA_MODE == "ok" else []):
                     log(note)
@@ -6935,6 +6778,11 @@ def cmd_tick(a) -> int:
                 log("lanes: " + ", ".join(did))
             state = load_state()
         if not a.dry_run:
+            with contextlib.suppress(Exception):  # an alert bug must never stop the gate
+                for line in focus_alerts(state, snap, did):
+                    log(line)
+            state = load_state()
+        if not a.dry_run:
             with contextlib.suppress(Exception), edit_state() as st:
                 for line in release_workflow_holds(st, snap):
                     log(line)
@@ -6958,11 +6806,6 @@ def cmd_tick(a) -> int:
                 + ": decide whether the issue's acceptance is now met (close it with a comment if so, then "
                 f"`churn followup done {f['pr']} --closed`); if it stays open, `churn followup done {f['pr']} "
                 "--next \"<the next PR-sized slice>\"` queues that slice")
-        if refill_stage == "ask":
-            wants["refill"] = refill_need(state)
-            with edit_state() as st:
-                st.setdefault("refill", {})["agent_t"] = iso(now())
-            log("refill: no rule-based candidates; asking the tick to label, split epics and file sibling gaps")
         if goal_cfg(state).get("ask"):
             wants["goal"] = goal_need(state)
             if not a.dry_run:
@@ -7632,15 +7475,14 @@ def cmd_queue(a) -> int:
                 item["lane"] = a.lane
             if getattr(a, "repo", None):
                 item["repo"] = a.repo
+            if not in_focus(state, item):
+                msg = park_off_focus(state, a.issue, a.task, "queue add")
+                log(msg)
+                print(msg + " (`churn focus` lists it; only the owner widens the focus)")
+                return 0
             meta = issue_meta(a.issue) if not a.pr else None
-            tier = getattr(a, "tier", None) or (issue_tier(a.issue, meta) if not a.pr and a.lane in (None, "normal") else None)
-            if tier:
-                item["tier"] = tier
             if meta is not None and (sc := issue_scope(a.issue, meta)):
                 item["scope"] = sc
-            if getattr(a, "promote", False):
-                item["promoted"] = True
-                state.setdefault("promoted_issues", {})[str(a.issue)] = iso(now())
             at = next((k for k, x in enumerate(q) if x.get("issue") == a.before_issue), None) if a.before_issue else None
             if a.front:
                 q.insert(0, item)
@@ -7648,8 +7490,8 @@ def cmd_queue(a) -> int:
                 q.insert(at, item)
             else:
                 q.append(item)
-            log(f"queued #{a.issue} ({'agy' if a.backend == 'agy' else a.model}{', front' if a.front else ''}"
-                f"{', ' + item['tier'] if item.get('tier') else ''}): {a.task[:120]}")
+            log(f"queued #{a.issue} ({'agy' if a.backend == 'agy' else a.model}{', front' if a.front else ''}): "
+                f"{a.task[:120]}")
         elif a.action == "rm":
             if a.index is None or not 0 <= a.index < len(q):
                 raise SystemExit("queue rm needs --index N from `churn queue`")
@@ -7690,44 +7532,6 @@ def cmd_queue(a) -> int:
                 x["wait_until"] = iso(now() + dt.timedelta(minutes=a.minutes))
             log(f"#{x['issue']} waits" + (f" for run {a.run}" if a.run else "") + (f" {a.minutes} min" if a.minutes else "")
                 + f" (the gate offers it again when that is over, at most {WAIT_MAX_H} h): {a.note[:120]}")
-        elif a.action == "tier":
-            if a.index is None or not 0 <= a.index < len(q) or not a.tier:
-                raise SystemExit("queue tier needs --index N and --tier " + "|".join(TIERS))
-            q[a.index]["tier"] = a.tier
-            log(f"tier of #{q[a.index]['issue']} -> {a.tier}")
-        elif a.action == "retier":  # tier (normal items) and scope (every non-PR item) from the issues' labels
-            metas: dict[int, dict | None] = {}
-            for x in q:
-                if x.get("pr"):
-                    continue
-                if x["issue"] not in metas:
-                    metas[x["issue"]] = issue_meta(x["issue"])
-                meta = metas[x["issue"]]
-                if meta is None:
-                    continue
-                if x.get("lane") in (None, "normal") and (t := issue_tier(x["issue"], meta)):
-                    x["tier"] = t
-                if sc := issue_scope(x["issue"], meta):
-                    x["scope"] = sc
-                else:
-                    x.pop("scope", None)
-            log("retiered the queue from issue labels: " + ", ".join(
-                f"#{x['issue']} {x.get('tier') or '-'}/{x.get('scope') or '-'}" for x in q if not x.get("pr")))
-        elif a.action == "promote":  # owner: launch this (frontier) item, with core priority
-            if a.index is None or not 0 <= a.index < len(q):
-                raise SystemExit("queue promote needs --index N from `churn queue`")
-            q[a.index]["promoted"] = True
-            state.setdefault("promoted_issues", {})[str(q[a.index]["issue"])] = iso(now())
-            log(f"promoted #{q[a.index]['issue']} (owner): launches with core priority, its later slices too"
-                + (f": {a.note[:120]}" if a.note else ""))
-        elif a.action == "unpromote":  # owner: the issue's items go back to their scope (frontier: held)
-            if a.issue is None:
-                raise SystemExit("queue unpromote needs --issue N")
-            (state.get("promoted_issues") or {}).pop(str(a.issue), None)
-            for x in q:
-                if x.get("issue") == a.issue:
-                    x.pop("promoted", None)
-            log(f"unpromoted #{a.issue} (owner)" + (f": {a.note[:120]}" if a.note else ""))
         elif a.action == "top":
             if a.index is None or not 0 <= a.index < len(q):
                 raise SystemExit("queue top needs --index N from `churn queue`")
@@ -7736,10 +7540,9 @@ def cmd_queue(a) -> int:
         flag = " [needs owner]" if item.get("needs_owner") else ""
         who = "agy" if item.get("backend") == "agy" else item.get("model", "sonnet")
         extra = "".join([f" [PR #{item['pr']}]" if item.get("pr") else "", f" [{item['lane']}]" if item.get("lane") else "",
-                         f" [{item_tier(item)}]" if not item.get("pr") and item.get("lane") in (None, "normal") and item_tier(item) else "",
                          f" [{item['repo']}]" if item.get("repo") else "",
-                         (" [promoted]" if item.get("promoted") else f" [{item['scope']}]" if item.get("scope") else ""),
-                         " [frontier: held]" if scope_held(item) else "",
+                         f" [{item['scope']}]" if item.get("scope") else "",
+                         "" if in_focus(state, item) else " [off focus: parked]",
                          f" [after {','.join('#' + str(n) for n in item['after_prs'])}]" if item.get("after_prs") else "",
                          f" [waits {w}]" if (w := waiting(item)) else ""])
         print(f"{i:2}  #{item['issue']:<5} {who:<6}{flag}{extra} {item['task'][:100]}")
@@ -7810,10 +7613,12 @@ def requeue_next_slice(state: dict, f: dict, nxt: str | None) -> str | None:
     settle_check's checklist lines) a generic continue-after-#pr task. None = nothing queued."""
     issue = f.get("issue")
     if not issue or f.get("kind") != "merged" or (not nxt and (state.get("workers_paused")
-                                                               or not refill_cfg(state)["enabled"])):
+                                                               or not focus_on(state))):
         return None
     if any(x.get("issue") == issue for s in ("queue", "running") for x in state.get(s, [])):
         return None
+    if not in_focus(state, {"issue": issue}):
+        return park_off_focus(state, issue, nxt or f"next slice after #{f.get('pr')}", f"followup #{f.get('pr')}")
     try:
         i = gh_json(f"repos/{REPO}/issues/{issue}")
     except (RuntimeError, ValueError):
@@ -8171,6 +7976,7 @@ def main() -> int:
     w.add_argument("--brief-file")
     w.add_argument("--brief")
     w.add_argument("--force", action="store_true", help="ignore the two-worker cap")
+    w.add_argument("--off-focus", action="store_true", help="owner only: launch an issue outside this host's focus")
     w.add_argument("--worktree", help="work in this existing worktree (a PR fix: a /srv worktree on the PR's branch)")
     w.add_argument("--branch", help="the branch of --worktree")
     w.add_argument("--repo", choices=sorted(CRUCIBLE_REPOS), help="work in a worktree of this crucible repo (backfill steps)")
@@ -8191,18 +7997,14 @@ def main() -> int:
     sub.add_parser("status")
     qp = sub.add_parser("queue", help="list (default) / add / rm / top queue items")
     qp.add_argument("action", nargs="?", default="list", choices=["list", "add", "rm", "top", "route", "park", "lane",
-                                                                                "tier", "retier", "wait", "promote",
-                                                                                "unpromote"])
+                                                                                "wait"])
     qp.add_argument("--run", type=int, help="wait: hold the item until this GitHub Actions run completes")
     qp.add_argument("--minutes", type=int, help="wait: hold the item this long")
     qp.add_argument("--backend", choices=["claude", "agy"], help="agy = run by the agy lane (own quota), Sonnet-checked")
     qp.add_argument("--issue", type=int)
     qp.add_argument("--model", default="sonnet", choices=["haiku", "sonnet", "opus"])
     qp.add_argument("--task", help="what the worker should do (one or two sentences; the tick turns it into a brief)")
-    qp.add_argument("--promote", action="store_true", help="add: owner-promoted (frontier may launch; core priority)")
-    qp.add_argument("--front", action="store_true", help="add at the front of the queue (of its tier: picks go by tier first)")
-    qp.add_argument("--tier", choices=list(TIERS), help="launch order of normal items: era-core, customer, score, followup "
-                    "(default: the issue's tier:<name> label; a 'Siblings of' issue is followup)")
+    qp.add_argument("--front", action="store_true", help="add at the front of the queue")
     qp.add_argument("--needs-owner", action="store_true", help="park it until the owner decides")
     qp.add_argument("--index", type=int, help="position shown by `churn queue` (for rm / top / route / park)")
     qp.add_argument("--pr", type=int, help="a fix item for this existing PR (work on its branch)")
@@ -8260,11 +8062,6 @@ def main() -> int:
     fy.add_argument("--days", type=int, default=1, help="how many past UTC days (default: yesterday)")
     fy.add_argument("--today", action="store_true", help="also today so far")
     fy.add_argument("--push", action="store_true", help="publish factory.json to squid-bot's dashboard branch")
-    rf = sub.add_parser("refill", help="refill the queue below its low-water mark (rules, then a tick, then call-graph)")
-    rf.add_argument("--dry-run", action="store_true", help="list what it would queue; change nothing")
-    rf.add_argument("--force", action="store_true", help="ignore the low-water mark")
-    rf.add_argument("--on", action="store_true")
-    rf.add_argument("--off", action="store_true")
     ck = sub.add_parser("checklist", help="checklist parts per open issue (ticked/total) and the scope's parts left")
     ck.add_argument("--scope", default="core", choices=list(SCOPES))
     ck.add_argument("--next", action="store_true", help="also show each issue's next unclaimed line")
@@ -8298,11 +8095,14 @@ def main() -> int:
     cl.add_argument("action", nargs="?", default="status", choices=["status", "sync", "on", "off", "release"])
     cl.add_argument("issue", nargs="?", type=int)
     cl.add_argument("--dry-run", action="store_true")
-    gl = sub.add_parser("goal", help="the factory's goal: status (default) / stage NAME / add STAGE N.. / rm N.. / "
-                                     "order A,B,.. / measure")
-    gl.add_argument("action", nargs="?", default="status", choices=["status", "stage", "add", "rm", "order", "measure",
-                                                                      "ladder", "skip", "unskip", "exclude", "include"])
+    gl = sub.add_parser("goal", help="the evidence measure the focus ladder reads: status (default) / measure")
+    gl.add_argument("action", nargs="?", default="status", choices=["status", "measure"])
     gl.add_argument("args", nargs="*")
+    fo = sub.add_parser("focus", help="the owner's focus, the only work this host launches: status (default) / "
+                                      "set NAME N.. / add N.. / rm N.. / ladder ANCHOR|off [--skip P..] / off")
+    fo.add_argument("action", nargs="?", default="status", choices=["status", "set", "add", "rm", "ladder", "off"])
+    fo.add_argument("args", nargs="*")
+    fo.add_argument("--skip", nargs="*", help="ladder: programs the ladder leaves out (owner rulings)")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
     sub.add_parser("poll", help="every 2 min: one gh call; start the gate at once when a watched PR changed")
     sub.add_parser("sync", help="sync pulse now: test origin/main and fast-forward this install (the gate does it hourly)")
@@ -8341,6 +8141,8 @@ def main() -> int:
         return cmd_status(a)
     if a.cmd == "goal":
         return cmd_goal(a)
+    if a.cmd == "focus":
+        return cmd_focus(a)
     if a.cmd == "queue":
         return cmd_queue(a)
     if a.cmd == "_run":
@@ -8395,8 +8197,6 @@ def main() -> int:
         return cmd_watchdog(a)
     if a.cmd == "factory":
         return cmd_factory(a)
-    if a.cmd == "refill":
-        return cmd_refill(a)
     if a.cmd == "claims":
         return cmd_claims(a)
     if a.cmd == "scorecard":

@@ -26,8 +26,6 @@ def churn(tmp_path, monkeypatch):
     mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("churn_under_test", loader))
     loader.exec_module(mod)
     monkeypatch.setattr(mod, "pid_alive", lambda pid: bool(pid) and pid > 0)
-    mod.real_issue_tier = mod.issue_tier
-    monkeypatch.setattr(mod, "issue_tier", lambda n, meta=None: None)  # never ask GitHub from a test
     mod.real_issue_meta = mod.issue_meta
     monkeypatch.setattr(mod, "issue_meta", lambda n: None)
     mod.real_worktree_pr = mod.worktree_pr
@@ -42,14 +40,14 @@ def churn(tmp_path, monkeypatch):
     mod.real_checklist_note = mod.checklist_note
     monkeypatch.setattr(mod, "checklist_note", lambda n: "")
     monkeypatch.setattr(mod, "update_branch", lambda n: False)  # a real conflict: queue the Claude fix as before
+    mod.real_in_focus = mod.in_focus
+    monkeypatch.setattr(mod, "in_focus", lambda state, x: True)  # tests of other behaviour run as if all were focus work
     mod.real_behind_main = mod.behind_main
     monkeypatch.setattr(mod, "behind_main", lambda entry, n, head, compare=None: 0)  # not stale, without asking GitHub
     monkeypatch.setattr(mod, "conflict_files", lambda n: None)  # never fetch into the host's checkout
     monkeypatch.setattr(mod, "start_precheck", lambda rid: None)
-    monkeypatch.setitem(mod.REFILL_DEFAULT, "enabled", False)  # refill tests turn it on; it reads GitHub
     monkeypatch.setitem(mod.CLAIMS_DEFAULT, "enabled", False)  # claim tests turn it on with a fake GitHub
     monkeypatch.setattr(mod, "open_issues", lambda: [])
-    monkeypatch.setattr(mod, "issues_with_open_prs", lambda: set())
     monkeypatch.setitem(mod.WT_GC_DEFAULT, "enabled", False)  # gc tests call gc_worktrees directly; it reads GitHub
     mod.real_unreachable = mod.unreachable
     monkeypatch.setattr(mod, "unreachable", lambda hosts=mod.NET_HOSTS: [])  # online, without asking the network
@@ -281,8 +279,8 @@ class TestGateRules:
         assert done(2) == [] and done(3) == [] and done(4) == []  # not core without --next; closed issue; unmerged PR
         assert done(5, closed=True) == []
         q = done(1)  # no --next: an open core issue still gets a generic next slice
-        assert q == []  # ... but only with refill on (the fixture turns it off)
-        put(churn, queue=[], refill={"enabled": True}, followups=[{"pr": 1, "kind": "merged", "issue": 5648}])
+        assert q == []  # ... but only under a focus (2026-10-25: no focus, nothing generic is queued)
+        put(churn, queue=[], focus={"name": "t", "issues": [5648]}, followups=[{"pr": 1, "kind": "merged", "issue": 5648}])
         q = done(1)
         assert len(q) == 1 and "continue after PR #1" in q[0]["task"]
         assert any("queued the next slice of #5648 (generic: no --next)" in ln for ln in churn.LOG.read_text().splitlines())
@@ -498,35 +496,13 @@ class TestCiLoadBalancer:
         st["queue"] = [item(2, lane="backfill")]
         assert churn.pick_item(st, {}, "calm") == (None, None)
 
-    def test_the_core_slot_outranks_the_ci_lane_until_a_core_worker_runs(self, churn):  # owner 2026-10-18
-        st = {"running": [], "queue": [item(1, scope="infra"), item(2, lane="ci"), item(3, scope="core"),
-                                       item(4, pr=44, scope="infra"), item(5, pr=55, scope="core")]}
-        assert churn.pick_item(st, {}, "calm")[1]["issue"] == 5   # PR fixes first, core ones before the rest
-        st["queue"] = st["queue"][:3]
-        assert churn.pick_item(st, {}, "calm")[1]["issue"] == 3   # no core worker: the core slot first
-        assert churn.pick_item(st, {}, "busy")[1]["issue"] == 3   # in busy mode too
-        st["queue"].insert(0, item(6, lane="ci", auto="main-red"))
-        assert churn.pick_item(st, {}, "calm")[1]["issue"] == 6   # a red main still comes first
-        st["queue"].pop(0)
-        st["running"] = [{"run_id": "r", "pid": 5, "issue": 9, "scope": "core"}]
-        assert churn.pick_item(st, {}, "calm")[1]["issue"] == 2   # a core worker runs: the usual order
-        assert churn.pick_item(st, {}, "busy")[1]["issue"] == 2
-        st["core_reserve"] = 0
-        st["running"] = []
-        assert churn.pick_item(st, {}, "calm")[1]["issue"] == 2   # core_reserve 0: off
-
-    def test_budget_picks_counts_a_picked_core_item_toward_the_reserve(self, churn):
-        st = {"running": [], "max_workers": 2, "queue": [item(1, lane="ci"), item(2, scope="core"), item(3, scope="core")]}
-        assert [x["issue"] for _, x in churn.budget_picks(st, {}, "calm", 2, None)] == [2, 1]
-
     def test_stamp_scopes_reads_each_issue_once(self, churn, monkeypatch):
         reads = []
         metas = {7: {"title": "Siblings of #3", "labels": [{"name": "scope:core"}]}, 8: {"title": "x", "labels": []}}
         monkeypatch.setattr(churn, "issue_meta", lambda n: reads.append(n) or metas.get(n))
-        monkeypatch.setattr(churn, "issue_tier", churn.real_issue_tier)
         st = {"queue": [item(7, pr=70), item(8), item(9), item(10, scope="infra")]}
         assert churn.stamp_scopes(st) == ["#7 core"]
-        assert st["queue"][0]["scope"] == "core" and st["queue"][0]["tier"] == "followup"
+        assert st["queue"][0]["scope"] == "core" and "tier" not in st["queue"][0]
         assert st["queue"][1]["scope_checked"] and "scope" not in st["queue"][1]
         assert "scope_checked" not in st["queue"][2]  # #9 unreadable: tried again next tick
         churn.stamp_scopes(st)
@@ -593,7 +569,6 @@ class TestCiLoadBalancer:
         assert "lane" not in st["queue"][0]
 
 
-
 def test_a_declared_flake_stops_the_fix_requeue_until_the_head_moves(churn):
     h = "aaaa11112222"
     st = {"prs": [{"number": 5105, "flake_head": h, "flake_at": churn.iso(churn.now())}], "queue": [], "running": []}
@@ -627,7 +602,6 @@ def test_an_approved_pr_no_longer_blocks_its_after_items(churn):
     assert churn.blocked_by(q, {"5095": pr(head=h, labels=["shepherd:merge", "shepherd:needs-fix"])}, st) == [5095]
     assert churn.blocked_by(q, {"5095": pr(head="bbbb22223333", labels=["shepherd:merge"])}, st) == [5095]
     assert churn.blocked_by(q, {"5095": pr(head=h, labels=["shepherd:merge"])}) == [5095]  # no state: strict
-
 
 
 class TestBackfillPreemption:
@@ -669,7 +643,6 @@ class TestBackfillPreemption:
         st = {"running": [{"run_id": "4628-x", "pid": 0, "issue": 4628, "model": "opus", "lane": "backfill"}]}
         done = churn.reap(st)
         assert done[0]["status"] == "preempted" and not st.get("reports_pending") and st["running"] == []
-
 
 
 class TestBackfillCapAndDwell:
@@ -821,7 +794,6 @@ def test_free_slots_are_filled_in_one_tick(churn, monkeypatch):
     assert "launch 3" in r and "queue[0] #1" in r and "queue[2] #3" in r and "queue[4] #5" in r and "#4 (" not in r
 
 
-
 def test_red_main_with_a_fix_in_flight_is_not_requeued(churn):
     reds = [{"number": 5091, "title": "main is red: Full Suite"}, {"number": 5094, "title": "main is red: Evidence"}]
     st = {"queue": [], "running": [], "prs": [{"number": 5108, "issue": 5091}],
@@ -831,7 +803,6 @@ def test_red_main_with_a_fix_in_flight_is_not_requeued(churn):
     assert churn.queue_main_red(st, reds[:1], {"5110": pr(branch="churn/5091-20261014T1322Z")}) == []
 
 
-
 def test_queue_add_before_an_issue(churn, capsys):
     put(churn, queue=[item(1), item(5117), item(5118)])
     ns = argparse.Namespace(action="add", issue=7, task="cics blocker", model="sonnet", needs_owner=False, backend=None,
@@ -839,7 +810,6 @@ def test_queue_add_before_an_issue(churn, capsys):
                             before_issue=5117, index=None, note=None)
     churn.cmd_queue(ns)
     assert [q["issue"] for q in churn.load_state()["queue"]] == [1, 7, 5117, 5118]
-
 
 
 def test_priority_work_evicts_a_box_hogging_backfill(churn):
@@ -869,54 +839,6 @@ def _picks(churn, st, n):
         out.append((None, x))
         q.remove(x)
     return out
-
-
-def test_normal_items_launch_by_tier_then_position(churn):
-    st = {"queue": [item(1, task="Siblings of #9 (#1): round 2"), item(2, tier="score"), item(3), item(4, tier="customer"),
-                    item(5, tier="era-core"), item(6, tier="era-core")]}
-    assert [x["issue"] for _, x in _picks(churn, st, 6)] == [5, 6, 4, 2, 3, 1]
-    st["queue"].insert(0, item(7, pr=70, task="Siblings of #9: fix PR"))  # PR fixes and the ci lane still come first
-    st["queue"].append(item(8, lane="ci"))
-    assert [x["issue"] for _, x in _picks(churn, st, 3)] == [7, 8, 5]
-
-
-def test_front_only_reorders_within_a_tier(churn):
-    put(churn, queue=[item(1, tier="era-core"), item(2, tier="followup")])
-    ns = argparse.Namespace(action="add", issue=3, task="Siblings of #2 round 3", model="sonnet", needs_owner=False,
-                            backend=None, front=True, pr=None, after_pr=None, allow_workflows=False, agy_step=None,
-                            lane=None, before_issue=None, index=None, note=None, tier="followup")
-    churn.cmd_queue(ns)
-    st = churn.load_state()
-    assert [q["issue"] for q in st["queue"]] == [3, 1, 2]
-    assert churn.pick_item(st, {}, "calm")[1]["issue"] == 1
-
-
-def test_queue_add_takes_the_tier_from_the_issue(churn, monkeypatch):
-    monkeypatch.setattr(churn, "issue_tier", lambda n, meta=None: {11: "customer"}.get(n))
-    put(churn, queue=[])
-    for n in (11, 12):
-        churn.cmd_queue(argparse.Namespace(action="add", issue=n, task=f"do #{n}", model="sonnet", needs_owner=False,
-                                           backend=None, front=False, pr=None, after_pr=None, allow_workflows=False,
-                                           agy_step=None, lane=None, before_issue=None, index=None, note=None, tier=None))
-    assert [q.get("tier") for q in churn.load_state()["queue"]] == ["customer", None]
-
-
-@pytest.mark.parametrize("labels,title,want", [
-    (["enhancement", "tier:era-core"], "det/CICS: BLL cells", "era-core"),
-    (["tier:bogus"], "Siblings of #5079: TD queues", "followup"),
-    ([], "Readiness scanner: report", None),
-])
-def test_issue_tier_reads_the_label(churn, monkeypatch, labels, title, want):
-    out = json.dumps({"title": title, "labels": [{"name": n} for n in labels]})
-    monkeypatch.setattr(churn, "run", lambda cmd, **kw: argparse.Namespace(returncode=0, stdout=out, stderr=""))
-    monkeypatch.setattr(churn, "issue_meta", churn.real_issue_meta)
-    assert churn.real_issue_tier(5) == want
-
-
-def test_bad_tier_is_quarantined(churn):
-    put(churn, queue=[item(1, tier="urgent"), item(2, tier="score")])
-    st = churn.load_state()
-    assert [q["issue"] for q in st["queue"]] == [2] and st["quarantine"]
 
 
 # ---------------------------------------------------------------- rate pace + opus cap (owner 2026-10-16)
@@ -1021,11 +943,6 @@ class TestRatePace:
     def test_surplus_puts_opus_first_and_bursts_to_two(self, churn, monkeypatch):
         st = rated(churn, monkeypatch, T0 + 4 * H1, queue=[item(1), item(2, model="opus"), item(3, model="opus")])
         assert launched(churn.gate(st, self.GREEN, [], {}, {})[0]) == [1, 2]  # two Opus, and no third worker beside them
-
-    def test_surplus_never_jumps_tiers_or_pr_fixes(self, churn, monkeypatch):
-        q = [item(1, model="opus", tier="followup"), item(2, tier="era-core"), item(3, pr=77)]
-        st = rated(churn, monkeypatch, T0 + 4 * H1, queue=q)
-        assert launched(churn.gate(st, self.GREEN, [], {}, {})[0]) == [2, 1]  # the Opus waits: 2 + an Opus is too many
 
     def test_max_workers_still_caps(self, churn, monkeypatch):
         st = rated(churn, monkeypatch, T0 + 4 * H1, queue=[item(1), item(2), item(3)])
@@ -2115,56 +2032,6 @@ def test_an_owner_workflow_ok_on_the_pr_survives_new_heads(churn, monkeypatch):
 
 
 # ---------------------------------------------------------------- scope (owner 2026-10-16, rollout step 3)
-def test_scope_orders_normal_work_and_holds_frontier_unless_promoted(churn):
-    st = {"running": [], "queue": [item(1, scope="infra"), item(2, scope="frontier"), item(3, scope="sweep"),
-                                   item(4, scope="core", tier="score"), item(5)]}
-    assert [x["issue"] for _, x in _picks(churn, st, 9)] == [4, 3, 5, 1]  # frontier never
-    st["queue"][1]["promoted"] = True
-    assert [x["issue"] for _, x in _picks(churn, st, 9)] == [4, 2, 3, 5, 1]  # promoted: core rank, then tier
-    assert churn.idle_causes({"queue": [item(2, scope="frontier")], "running": []}, {}, "calm") == "idle: frontier 1"
-
-
-def test_in_flight_work_is_never_held_by_scope(churn):
-    for x in (item(7, scope="frontier", pr=70), item(7, scope="frontier", lane="ci"),
-              item(7, scope="frontier", lane="backfill", task="RESUME backfill run 7-a (preempted ...)")):
-        assert not churn.scope_held(x)
-    assert churn.scope_held(item(7, scope="frontier", lane="backfill"))
-
-
-def test_queue_add_and_retier_read_the_scope_label(churn, monkeypatch):
-    labels = {11: ["scope:core", "tier:customer"], 12: ["scope:frontier"]}
-    monkeypatch.setattr(churn, "issue_meta", lambda n: {"title": "t", "labels": [{"name": x} for x in labels.get(n, [])]})
-    monkeypatch.setattr(churn, "issue_tier", churn.real_issue_tier)
-    base = dict(action="add", task="do it", model="sonnet", front=False, needs_owner=False, backend=None, pr=None,
-                after_pr=None, allow_workflows=False, agy_step=None, lane=None, repo=None, before_issue=None, tier=None,
-                after_merge=False, index=None, note=None, run=None, minutes=None, promote=False)
-    churn.cmd_queue(argparse.Namespace(**{**base, "issue": 11}))
-    churn.cmd_queue(argparse.Namespace(**{**base, "issue": 12, "promote": True}))
-    q = churn.load_state()["queue"]
-    assert (q[0]["scope"], q[0]["tier"]) == ("core", "customer") and q[1]["scope"] == "frontier" and q[1]["promoted"]
-    labels[11] = ["scope:sweep"]
-    churn.cmd_queue(argparse.Namespace(**{**base, "action": "retier", "issue": None}))
-    assert churn.load_state()["queue"][0]["scope"] == "sweep"
-
-
-def test_a_promotion_sticks_to_the_issue_across_launches(churn, monkeypatch):
-    monkeypatch.setattr(churn, "issue_meta", lambda n: {"title": "t", "labels": [{"name": "scope:frontier"}]})
-    base = dict(action="add", task="slice", model="sonnet", front=False, needs_owner=False, backend=None, pr=None,
-                after_pr=None, allow_workflows=False, agy_step=None, lane=None, repo=None, before_issue=None, tier=None,
-                after_merge=False, index=None, note=None, run=None, minutes=None, promote=False, issue=5620)
-    churn.cmd_queue(argparse.Namespace(**base))
-    assert churn.scope_held(churn.load_state()["queue"][0])
-    churn.cmd_queue(argparse.Namespace(**{**base, "action": "promote", "index": 0}))
-    churn.cmd_queue(argparse.Namespace(**{**base, "action": "rm", "index": 0}))  # launched: the item is gone
-    churn.cmd_queue(argparse.Namespace(**base))  # the followup's next slice, queued without --promote
-    st = churn.load_state()
-    assert st["queue"][0]["promoted"] and not churn.scope_held(st["queue"][0]) and "5620" in st["promoted_issues"]
-    churn.cmd_queue(argparse.Namespace(**{**base, "action": "unpromote"}))
-    st = churn.load_state()
-    assert churn.scope_held(st["queue"][0]) and "promoted_issues" not in st
-    st["promoted_issues"] = {"5620": churn.iso(churn.now() - churn.dt.timedelta(days=churn.PROMOTE_DAYS + 1))}
-    churn.normalize_state(st)  # an old promotion has lapsed
-    assert churn.scope_held(st["queue"][0]) and "promoted_issues" not in st
 
 
 def test_unknown_queue_keys_pass_through_and_quarantine_can_be_restored(churn):
@@ -2216,69 +2083,6 @@ def _iss(n, *labels, title="t"):
     return {"number": n, "title": title, "labels": [{"name": x} for x in labels], "milestone": None}
 
 
-def test_refill_stage1_queues_burned_scopes_in_order_and_skips_the_rest(churn, tmp_path, monkeypatch):
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "batch", 5)
-    issues = [_iss(1, "scope:infra", "bug"), _iss(2, "scope:sweep"), _iss(3, "scope:core", "priority: low"),
-              _iss(4, "scope:core", "bug"), _iss(5, "scope:core", "priority: high"), _iss(6, "scope:frontier"),
-              _iss(7), _iss(8, "scope:core", "epic"), _iss(9, "scope:infra", title="Call-graph reference: Go"),
-              _iss(10, "scope:core"), _iss(11, "scope:core"), _iss(12, "scope:core"), _iss(13, "scope:core")]
-    monkeypatch.setattr(churn, "open_issues", lambda: issues)
-    monkeypatch.setattr(churn, "issues_with_open_prs", lambda: {10})
-    _run(churn, "11-a", issue=11, branch="b", worktree="/x", started=churn.iso(churn.now()))  # worked just now
-    _run(churn, "13-a", issue=13, branch="b", worktree="/x", repo="cics-crucible")  # a crucible step: the tick's job
-    put(churn, queue=[item(12)], max_workers=2)
-    stage, items = churn.refill(churn.load_state(), {})
-    assert stage == "rules" and [x["issue"] for x in items] == [4, 5, 3, 2, 1]
-    st = churn.load_state()
-    assert [x["issue"] for x in st["queue"]] == [12, 4, 5, 3, 2, 1] and st["queue"][1]["auto"] == "refill"
-    assert st["queue"][1]["scope"] == "core" and "next unchecked item" in st["queue"][1]["task"]
-    assert churn.refill(churn.load_state(), {})[0] == "full"  # 6 launchable >= low-water 4
-
-
-def test_refill_asks_the_tick_then_falls_back_to_callgraph(churn, monkeypatch):
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
-    cg = [_iss(3782, "scope:infra", title="Call-graph reference: Go"), _iss(6, "scope:frontier")]
-    monkeypatch.setattr(churn, "open_issues", lambda: cg)
-    put(churn, queue=[], max_workers=2)
-    assert churn.refill(churn.load_state(), {}) == ("ask", [])  # nothing for the rules: stage 2
-    put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now())})
-    assert churn.refill(churn.load_state(), {}) == ("wait", [])  # the asked tick gets its grace hour
-    put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now() - churn.dt.timedelta(minutes=20))})
-    stage, items = churn.refill(churn.load_state(), {})
-    assert stage == "callgraph" and [x["issue"] for x in items] == [3782]
-    monkeypatch.setattr(churn, "open_issues", lambda: [])  # every call-graph child taken: the standing epic item
-    put(churn, queue=[], max_workers=2, refill={"agent_t": churn.iso(churn.now() - churn.dt.timedelta(minutes=20))})
-    stage, items = churn.refill(churn.load_state(), {})
-    assert [x["issue"] for x in items] == [churn.CALLGRAPH_EPIC] and "call-graph function work" in items[0]["task"]
-    assert churn.refill(churn.load_state(), {})[1] == []  # never a second epic item while one is queued
-
-
-def test_refill_asks_every_30_min_only_while_nothing_is_launchable(churn, monkeypatch):  # owner 2026-10-17
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
-    monkeypatch.setattr(churn, "open_issues", lambda: [_iss(3782, "scope:infra", title="Call-graph reference: Go")])
-    ago = lambda **kw: {"agent_t": churn.iso(churn.now() - churn.dt.timedelta(**kw))}  # noqa: E731
-    put(churn, queue=[], max_workers=2, refill=ago(minutes=40))
-    assert churn.refill(churn.load_state(), {}) == ("ask", [])  # idle slots: no 6 h wait
-    put(churn, queue=[], max_workers=2, refill=ago(minutes=10))
-    assert churn.refill(churn.load_state(), {}) == ("wait", [])  # a 15 min grace for the asked tick
-    item = {"issue": 9, "model": "sonnet", "task": "x", "needs_owner": False}
-    put(churn, queue=[item], max_workers=2, refill=ago(minutes=40))
-    assert churn.refill(churn.load_state(), {})[0] == "wait"  # something launchable: the hourly grace as before
-
-
-def test_refill_respects_off_paused_and_the_cooldown_log(churn, monkeypatch):
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
-    monkeypatch.setattr(churn, "open_issues", lambda: [_iss(4, "scope:core")])
-    put(churn, queue=[], workers_paused=True)
-    assert churn.refill(churn.load_state(), {})[0] == "off"
-    put(churn, queue=[], refill={"enabled": False})
-    assert churn.refill(churn.load_state(), {})[0] == "off"
-    put(churn, queue=[], refill={"issued": {"4": churn.iso(churn.now())}, "agent_t": churn.iso(churn.now())})
-    assert churn.refill(churn.load_state(), {}) == ("wait", [])  # #4 was refilled recently: not again
-    assert "label unlabelled" in churn.refill_need({"max_workers": 2})
-
-
 # --- checklists (owner 2026-10-18) ------------------------------------------------------------------------------------
 
 BODY = "## Acceptance criteria\n- [ ] first part\n- [x] already done\n* [ ]  second   part \n\ntext [ ] not a box\n"
@@ -2322,22 +2126,6 @@ def test_checklist_note_lists_unticked_keys(churn, monkeypatch):
     assert churn.real_checklist_note(4) == ""
 
 
-def test_refill_names_the_next_unclaimed_line_and_skips_a_ticked_issue(churn, monkeypatch):
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
-    first = churn.check_key("first part")
-    issues = [{**_iss(4, "scope:core"), "body": BODY}, {**_iss(5, "scope:core"), "body": "- [x] a\n- [x] b\n"},
-              {**_iss(6, "scope:core"), "body": BODY}]
-    monkeypatch.setattr(churn, "open_issues", lambda: issues)
-    monkeypatch.setattr(churn, "issues_with_open_prs", lambda: set())
-    put(churn, queue=[], running=[{"issue": 6, "task": f"#6 t -- checklist item [c:{first}]", "pid": 1}], max_workers=2)
-    assert [i["number"] for i in churn.refill_candidates(churn.load_state(), issues, set())] == [4]  # 5 all ticked, 6 runs
-    st = churn.load_state()
-    assert churn.next_check(issues[2], st)["text"] == "second   part"  # #6's first line is held by its run
-    assert churn.next_check(issues[0], st)["text"] == "first part"  # the same line text on another issue is free
-    stage, items = churn.refill(st, {})
-    assert stage == "rules" and f"[c:{first}]" in items[0]["task"] and f"Checklist: done [c:{first}]" in items[0]["task"]
-
-
 class _Gh:
     """A GitHub stand-in for settle_check: one issue, and the PATCHed body it was sent."""
     def __init__(self, churn, monkeypatch, body, labels=("scope:core",)):
@@ -2349,8 +2137,7 @@ class _Gh:
                             or subprocess.CompletedProcess(cmd, 0, "{}", ""))
 
 
-def test_a_merged_done_pr_ticks_its_line_and_queues_the_core_issues_next(churn, monkeypatch):
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
+def test_a_merged_done_pr_ticks_its_line_and_queues_the_focus_issues_next(churn, monkeypatch):
     gh = _Gh(churn, monkeypatch, BODY)
     k = churn.check_key("first part")
     st = {"prs": [{"number": 9, "issue": 4}], "queue": [], "running": []}
@@ -2362,7 +2149,6 @@ def test_a_merged_done_pr_ticks_its_line_and_queues_the_core_issues_next(churn, 
 
 
 def test_partial_requeues_the_same_line_and_a_finished_list_goes_to_the_tick(churn, monkeypatch):
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
     k = churn.check_key("first part")
     gh = _Gh(churn, monkeypatch, BODY)
     st = {"prs": [{"number": 9, "issue": 4}], "queue": [], "running": []}
@@ -2377,7 +2163,11 @@ def test_partial_requeues_the_same_line_and_a_finished_list_goes_to_the_tick(chu
     gh = _Gh(churn, monkeypatch, BODY, labels=("scope:infra",))
     st = {"prs": [{"number": 9, "issue": 4}], "queue": [], "running": []}
     notes = churn.settle_closed(st, {"9": {**pr(state="closed", merged=True), "check": ["done", k]}})
-    assert gh.sent and "1 left" in notes[0] and st["queue"] == []  # ticked, but only core queues its next line at once
+    assert gh.sent and "1 left" in notes[0] and len(st["queue"]) == 1  # any focus issue queues its next line, any scope
+    monkeypatch.setattr(churn, "in_focus", churn.real_in_focus)
+    st = {"prs": [{"number": 9, "issue": 4}], "queue": [], "running": [], "focus": {"issues": [77]}}
+    notes = churn.settle_closed(st, {"9": {**pr(state="closed", merged=True), "check": ["done", k]}})
+    assert gh.sent and st["queue"] == []  # off the focus: ticked, nothing queued
 
 
 def test_core_parts_counts_lines_and_core_linked_merges(churn):
@@ -3281,7 +3071,8 @@ def test_claim_race_goes_to_the_earliest_label_and_the_loser_backs_off(churn, gh
 
 
 def test_claim_skips_standing_issues_and_disabled_claims(churn, gh, monkeypatch):
-    assert churn.claim(churn.load_state(), churn.CALLGRAPH_EPIC) == (True, "", None)
+    put(churn, retro={"issue": 5399})
+    assert churn.claim(churn.load_state(), 5399) == (True, "", None)  # the retro's standing issue
     monkeypatch.setitem(churn.CLAIMS_DEFAULT, "enabled", False)
     gh.issue(5, assignees=["ann"])
     assert churn.claim(churn.load_state(), 5) == (True, "", None) and not gh.calls
@@ -3338,15 +3129,6 @@ def test_expire_claims_takes_off_only_leases_past_the_ttl(churn, gh, monkeypatch
     assert churn.foreign_claim(issues[0]) is None and churn.foreign_claim(issues[1]) == "claimed by live"
 
 
-def test_refill_skips_issues_people_or_other_hosts_hold(churn, monkeypatch):
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
-    monkeypatch.setattr(churn, "recently_worked", lambda n, h: False)
-    issues = [{"number": n, "title": "t", "labels": [{"name": "scope:core"}, *extra], "assignees": who}
-              for n, extra, who in ((1, [], []), (2, [{"name": "claim:box2"}], []), (3, [], [{"login": "ann"}]),
-                                    (4, [{"name": churn.claim_label()}], []))]
-    assert [i["number"] for i in churn.refill_candidates(churn.load_state(), issues, set())] == [1, 4]
-
-
 def test_worker_will_not_start_on_an_issue_someone_else_holds(churn, gh, monkeypatch):
     gh.issue(50, labels=["claim:box2"])
     monkeypatch.setattr(churn, "make_worktree", lambda *a: pytest.fail("no worktree for a claimed issue"))
@@ -3385,37 +3167,12 @@ def test_host_capabilities_and_excluded_milestones(churn, monkeypatch):
     assert churn.host_skips(gh_issue(4, [f"lane:{churn.HOST_ID}", "needs:db2"])) == "needs db2"  # routing can't add a box
 
 
-def test_preferred_milestones_and_lane_go_first_in_refill_but_skip_nothing(churn, monkeypatch):
-    monkeypatch.setattr(churn, "HOST", {"prefer_milestones": ["DOOM"]})
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "batch", 9)
-    issues = [gh_issue(1, ms="Side Quests"), gh_issue(2, ["scope:infra"], ms="DOOM"), gh_issue(3),
-              gh_issue(4, [f"lane:{churn.HOST_ID}"]), gh_issue(5, ms="DOOM")]
-    for i in issues:
-        i["labels"] = [x for x in i["labels"] if x["name"] != "scope:core" or i["number"] != 2]
-    assert all(churn.host_skips(i) is None for i in issues)
-    st = {"queue": [], "running": []}
-    assert [i["number"] for i in churn.refill_candidates(st, issues, set())] == [4, 5, 2, 1, 3]
-
-
 def test_host_roles_limit_the_one_host_jobs(churn, monkeypatch):
     monkeypatch.setattr(churn, "HOST", {"roles": ["retro"]})
     assert churn.host_role("retro") and not churn.host_role("bot_prs") and not churn.host_role("main_red")
     monkeypatch.setattr(churn, "HOST", {"roles": []})
     monkeypatch.setattr(churn, "retro_due", lambda st: pytest.fail("a host without the retro role never asks"))
     assert churn.retro_lane({"verdict": "GREEN"}, {}) == []
-
-
-def test_refill_queues_only_this_hosts_lanes_and_no_callgraph_fallback(churn, monkeypatch):
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
-    monkeypatch.setattr(churn, "recently_worked", lambda n, h: False)
-    monkeypatch.setattr(churn, "HOST", {"milestones": ["Aerospace"], "capabilities": []})
-    issues = [gh_issue(1, ms="Aerospace"), gh_issue(2, ms="Side Quests"), gh_issue(3, ["needs:db2"], "Aerospace")]
-    assert [i["number"] for i in churn.refill_candidates(churn.load_state(), issues, set())] == [1]
-    monkeypatch.setattr(churn, "open_issues", lambda: [gh_issue(2, ms="Side Quests")])
-    put(churn, refill={"agent_t": "2026-01-01T00:00Z"})
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "agent_every_h", 10 ** 6)
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "agent_empty_min", 10 ** 8)
-    assert churn.refill(churn.load_state(), {}, force=True) == ("callgraph", [])  # not the standing call-graph epic
 
 
 def test_the_tick_prompt_is_the_same_every_tick(churn, monkeypatch):
@@ -3746,42 +3503,6 @@ def test_skills_note_reports_what_it_did(churn, monkeypatch):
 
 
 # ---------------------------------------------------------------- goal (owner 2026-10-21)
-def test_the_goal_stage_launches_first_in_the_core_slot_and_in_normal_work(churn):
-    st = {"running": [], "goal": {"stage": "translate", "issues": {"translate": [3], "l5": [2]}},
-          "queue": [item(1, scope="core", tier="era-core"), item(2, scope="core"), item(3, scope="core", tier="followup")]}
-    assert churn.pick_item(st, {}, "calm")[1]["issue"] == 3  # core slot: the active stage beats position and tier
-    assert churn.pick_item(st, {}, "busy")[1]["issue"] == 3
-    st["running"] = [{"run_id": "r", "pid": 5, "issue": 9, "scope": "core"}]
-    assert [x["issue"] for _, x in _picks(churn, st, 3)] == [3, 2, 1]  # normal: active stage, later stage, the rest
-    st["goal"]["stage"] = "l5"  # a finished stage is no longer goal work
-    assert [x["issue"] for _, x in _picks(churn, st, 3)] == [2, 1, 3]
-    st["queue"] += [item(4, pr=40, scope="core"), item(5, pr=50, scope="core")]
-    st["goal"]["issues"]["l5"] = [5]
-    assert churn.pick_item(st, {}, "calm")[1]["issue"] == 5  # PR fixes: goal work first within a scope
-
-
-def test_no_goal_keeps_the_old_order(churn):
-    st = {"running": [], "queue": [item(1, scope="core"), item(2, scope="core", tier="era-core")]}
-    assert churn.pick_item(st, {}, "calm")[1]["issue"] == 2  # the core slot now honours tier, then position
-    assert churn.goal_rank(st, item(1)) == len(churn.GOAL_DEFAULT["order"])
-
-
-def test_refill_ranks_goal_issues_first(churn, monkeypatch):
-    issues = [_iss(4, "scope:core", "bug"), _iss(5, "scope:core"), _iss(6, "scope:sweep")]
-    put(churn, queue=[], running=[], goal={"issues": {"translate": [6], "l5": [5]}})
-    assert [i["number"] for i in churn.refill_candidates(churn.load_state(), issues, set())] == [6, 5, 4]
-
-
-def test_a_line_partial_too_often_is_split_first(churn, monkeypatch):
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
-    k = churn.check_key("first part")
-    _Gh(churn, monkeypatch, BODY)
-    st = {"prs": [], "queue": [], "running": []}
-    for n in range(3):
-        st["queue"] = []
-        note = churn.settle_check(st, 4, 90 + n, "partial", k, "more")
-    assert st["line_partials"][k] == 3 and "split first: 3 partials" in note
-    assert st["queue"][0]["task"].startswith(f"SPLIT FIRST: [c:{k}] has had 3 partial slices")
 
 
 def test_goal_measure_finds_untracked_programs(churn):
@@ -3813,22 +3534,6 @@ def test_goal_tick_asks_once_a_day_about_untracked_programs(churn, monkeypatch):
     with churn.edit_state() as st:
         st["goal"]["asked"] = {"Z1.cbl": churn.iso(churn.now())}
     assert churn.goal_tick(churn.load_state(), force=True) and churn.load_state()["goal"]["ask"] == []
-
-
-def test_goal_command_sets_stage_and_issues(churn, capsys):
-    ns = lambda action, *args: argparse.Namespace(action=action, args=list(args))
-    put(churn, queue=[item(5)], running=[])
-    churn.cmd_goal(ns("add", "translate", "5", "#6"))
-    churn.cmd_goal(ns("add", "l5", "6"))  # an issue belongs to one stage
-    assert churn.load_state()["goal"]["issues"] == {"translate": [5], "l5": [6]}
-    churn.cmd_goal(ns("stage", "l5"))
-    churn.cmd_goal(ns("rm", "6"))
-    g = churn.load_state()["goal"]
-    assert g["stage"] == "l5" and g["issues"] == {"translate": [5], "l5": []}
-    with pytest.raises(SystemExit):
-        churn.cmd_goal(ns("stage", "nope"))
-    churn.cmd_goal(ns("status"))
-    assert "goal stage: l5" in capsys.readouterr().out
 
 
 def test_scratch_watch_reaps_stale_proof_containers_and_pages_over_the_limit(churn, monkeypatch):
@@ -4199,61 +3904,6 @@ def test_goal_measure_lists_programs_below_l4_by_estate(churn):
     assert m["below"] == {"cics-genapp": [["lgstsq", "L3"], ["lgtestp1", "L2"]]}
 
 
-def test_the_ladder_refill_queues_one_slice_per_estate_minus_skips_and_programs_in_hand(churn, monkeypatch):
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
-    st = _ladder_state(ladder_skip=["CRECUST"])
-    st["queue"] = [item(5252, task="slice 3 of 3: lgapvs01/lgupvs01 fix Lgapvs01Service")]
-    out = churn.ladder_items(st, {})
-    tags = [x["task"].split("]")[0] + "]" for x in out]
-    assert tags == ["[ladder:cics-banking-sample-application-cbsa]", "[ladder:cics-genapp]", "[ladder:zecs]"]
-    cbsa, genapp, _ = out
-    assert "INQACC (L2)" in cbsa["task"] and "CRECUST" not in cbsa["task"]
-    assert "lgtestp1 (L2)" in genapp["task"] and "lgapvs01" not in genapp["task"]  # #5252 has it
-    assert all(x["issue"] == 6072 and x["scope"] == "core" and x["auto"] == "ladder" for x in out)
-    st["queue"] += out
-    assert churn.ladder_items(st, {}) == []  # queued: not again
-    st["queue"] = st["queue"][:1]
-    assert churn.ladder_items(st, {}) == []  # launched or merged since: waits for a newer measure
-    st["goal"]["measure"]["t"] = churn.iso(churn.now() + churn.dt.timedelta(minutes=1))
-    assert len(churn.ladder_items(st, {})) == 3
-
-
-def test_a_ladder_slice_in_an_open_pr_is_not_queued_again_and_the_refill_can_be_off(churn, monkeypatch):
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", True)
-    st = _ladder_state()
-    _run(churn, "6072-a", issue=6072, branch="churn/6072-a", task="[ladder:zecs] ladder slice of #6072, estate zecs")
-    out = churn.ladder_items(st, {"7000": pr(branch="churn/6072-a")})
-    assert "[ladder:zecs]" not in " ".join(x["task"] for x in out) and len(out) == 2
-    assert churn.ladder_items(_ladder_state(ladder_anchor=None), {}) == []
-    assert churn.ladder_items(_ladder_state(issues={"ladder": []}), {}) == []  # anchor not a ladder-stage issue
-    monkeypatch.setitem(churn.REFILL_DEFAULT, "enabled", False)
-    assert churn.ladder_items(_ladder_state(), {}) == []
-
-
-def test_excluded_issues_and_their_siblings_never_refill(churn):
-    st = {"goal": {"excluded": [4049, 5863]}}
-    assert churn.excluded_issue(st, {"number": 4049, "title": "x"})
-    assert churn.excluded_issue(st, {"number": 6166, "title": "Siblings of #4049: COUSR00C userlist failed-XCTL"})
-    assert not churn.excluded_issue(st, {"number": 6271, "title": "Equivalence harness gaps"})
-    issues = [{"number": 6166, "title": "Siblings of #4049: x", "labels": [{"name": "scope:sweep"}], "body": ""},
-              {"number": 5003, "title": "LE date services", "labels": [{"name": "scope:sweep"}], "body": ""}]
-    got = churn.refill_candidates({**st, "queue": [], "running": []}, issues, set())
-    assert [i["number"] for i in got] == [5003]
-
-
-def test_goal_subcommands_set_the_ladder_anchor_skips_and_exclusions(churn, capsys):
-    ns = lambda action, *args: churn.argparse.Namespace(action=action, args=list(args))
-    churn.cmd_goal(ns("ladder", "6072"))
-    churn.cmd_goal(ns("skip", "CRECUST", "BANKDATA"))
-    churn.cmd_goal(ns("unskip", "bankdata"))
-    churn.cmd_goal(ns("exclude", "4049", "4443"))
-    churn.cmd_goal(ns("include", "4443"))
-    g = churn.load_state()["goal"]
-    assert g["ladder_anchor"] == 6072 and g["ladder_skip"] == ["CRECUST"] and g["excluded"] == [4049]
-    churn.cmd_goal(ns("ladder", "off"))
-    assert churn.load_state()["goal"]["ladder_anchor"] is None
-
-
 # ---------------------------------------------------------------- red main: no requeue loop (2026-10-25, #6593)
 def test_a_red_main_issue_waits_for_a_new_failure_after_a_finished_run(churn):
     red = [{"number": 6593, "title": "main is red: Evidence Refresh"}]
@@ -4282,3 +3932,117 @@ def test_a_red_main_issue_retries_after_the_window_or_a_crashed_run(churn):
     _run(churn, "6593-c", issue=6593, status="done", started=churn.iso(churn.now()))
     st = {"queue": [], "running": [], "prs": []}
     assert churn.queue_main_red(st, red, runs=down) == []  # unreadable: the fresh run's verdict stands
+
+
+# ---------------------------------------------------------------- focus (owner 2026-10-25)
+def _focus(churn, monkeypatch, **f):
+    monkeypatch.setattr(churn, "in_focus", churn.real_in_focus)
+    return {"name": "L1-L4 ladder", "issues": [6072, 6271], "set": churn.iso(churn.now() - churn.dt.timedelta(days=1)), **f}
+
+
+def test_only_focus_issues_red_main_and_the_owner_lanes_may_run(churn, monkeypatch):
+    f = _focus(churn, monkeypatch)
+    st = {"focus": f}
+    assert churn.in_focus(st, {"issue": 6072}) and churn.in_focus(st, item(6271, pr=7000))
+    assert not churn.in_focus(st, {"issue": 3799}) and not churn.in_focus(st, {"issue": None})
+    assert churn.in_focus(st, {"issue": 6593, "auto": "main-red"}) and churn.in_focus(st, {"issue": 5399, "lane": "retro"})
+    assert not churn.in_focus({}, {"issue": 6072})  # no focus: nothing roams free
+    assert churn.in_focus({}, {"issue": 6593, "task": "Main is red: Evidence Refresh (#6593)."})
+
+
+def test_pick_skips_off_focus_work_and_says_why(churn, monkeypatch):
+    st = {"focus": _focus(churn, monkeypatch), "running": [],
+          "queue": [item(3799, pr=6600), item(3798), item(6072, task="[ladder:zecs] slice")]}
+    i, x = churn.pick_item(st, {}, "calm")
+    assert x["issue"] == 6072  # an off-focus PR fix does not jump the line either
+    st["queue"] = st["queue"][:2]
+    assert churn.pick_item(st, {}, "calm") == (None, None)
+    assert "off-focus 2" in churn.idle_causes(st, {}, "calm")
+
+
+def test_every_launch_path_refuses_off_focus_work(churn, monkeypatch):
+    put(churn, focus=_focus(churn, monkeypatch))
+    ns = lambda **kw: argparse.Namespace(**{"resume_run": None, "issue": 3799, "model": "sonnet", "task": "graph ledger",
+                                            "brief": "b", "brief_file": None, "force": True, "plan": False,
+                                            "worktree": None, "branch": None, "check_of": None, "repo": None,
+                                            "lane": None, **kw})
+    with pytest.raises(SystemExit, match="off the focus"):
+        churn.cmd_worker(ns())  # --force overrides caps, never the focus
+    monkeypatch.setenv("CHURN_RUN", "1")
+    with pytest.raises(SystemExit, match="owner only"):
+        churn.cmd_worker(ns(off_focus=True))  # a tick cannot use the owner's override
+
+
+def test_queue_add_and_followups_park_off_focus_work_instead_of_queueing_it(churn, monkeypatch, capsys):
+    put(churn, focus=_focus(churn, monkeypatch))
+    a = argparse.Namespace(action="add", issue=3799, model="sonnet", task="next ledger slice", needs_owner=False,
+                           backend=None, pr=None, after_pr=None, after_merge=False, allow_workflows=False, agy_step=None,
+                           lane=None, repo=None, before_issue=None, front=True, index=None, note=None)
+    churn.cmd_queue(a)
+    st = churn.load_state()
+    assert st["queue"] == [] and st["focus"]["parked"][0]["issue"] == 3799 and "parked" in capsys.readouterr().out
+    note = churn.requeue_next_slice(st, {"pr": 6634, "kind": "merged", "issue": 3799}, "validate more shapes")
+    assert note.startswith("off focus") and st["queue"] == [] and len(st["focus"]["parked"]) == 1  # one row per issue
+
+
+def test_only_the_owner_edits_the_focus(churn, monkeypatch, capsys):
+    ns = lambda action, *args, skip=None: argparse.Namespace(action=action, args=list(args), skip=skip)
+    churn.cmd_focus(ns("set", "L1-L4", "6271", "5252"))
+    churn.cmd_focus(ns("ladder", "6072", skip=["CRECUST", "BANKDATA"]))
+    churn.cmd_focus(ns("add", "5042"))
+    churn.cmd_focus(ns("rm", "5252"))
+    f = churn.load_state()["focus"]
+    assert f["name"] == "L1-L4" and f["issues"] == [5042, 6072, 6271] and f["ladder"] == {
+        "anchor": 6072, "skip": ["BANKDATA", "CRECUST"]}
+    monkeypatch.setenv("CHURN_RUN", "1")
+    with pytest.raises(SystemExit, match="owner only"):
+        churn.cmd_focus(ns("add", "3799"))
+    monkeypatch.delenv("CHURN_RUN")
+    churn.cmd_focus(ns("off"))
+    assert not churn.focus_on(churn.load_state())
+
+
+def test_the_ladder_generator_slices_each_estate_of_the_focus_ladder(churn, monkeypatch):
+    f = _focus(churn, monkeypatch, ladder={"anchor": 6072, "skip": ["CRECUST"]})
+    st = {"queue": [item(5252, task="slice 3 of 3: lgapvs01/lgupvs01 fix")], "running": [], "prs": [], "focus": f,
+          "goal": {"measure": {"t": "2026-10-25T07:33Z", "below": {
+              "cics-genapp": [["lgapvs01", "L3"], ["lgtestp1", "L2"]],
+              "cics-banking-sample-application-cbsa": [["CRECUST", "L3"], ["INQACC", "L2"]],
+              "cics-crucible": [["CRUC001", "L1"]]}}}}
+    out = churn.ladder_items(st, {})
+    tags = sorted(x["task"].split("]")[0] + "]" for x in out)
+    assert tags == ["[ladder:cics-banking-sample-application-cbsa]", "[ladder:cics-crucible]", "[ladder:cics-genapp]"]
+    text = " ".join(x["task"] for x in out)
+    assert "CRECUST" not in text and "lgapvs01" not in text and "INQACC (L2)" in text  # owner skip; #5252 has it
+    st["queue"] += out
+    assert churn.ladder_items(st, {}) == []  # queued: not again
+    st["queue"] = st["queue"][:1]
+    assert churn.ladder_items(st, {}) == []  # launched or merged: wait for a newer measure
+    st["goal"]["measure"]["t"] = churn.iso(churn.now() + churn.dt.timedelta(minutes=1))
+    assert len(churn.ladder_items(st, {})) == 3
+    _run(churn, "6072-a", issue=6072, branch="churn/6072-a", task="[ladder:cics-crucible] ladder slice")
+    st["queue"], st["goal"]["measure"]["t"] = st["queue"][:1], churn.iso(churn.now() + churn.dt.timedelta(minutes=2))
+    assert len(churn.ladder_items(st, {"7000": pr(branch="churn/6072-a")})) == 2  # in an open PR
+    st["focus"] = {**f, "issues": [6271]}
+    assert churn.ladder_items(st, {}) == []  # the anchor left the focus
+
+
+def test_a_starved_focus_pages_once_and_drift_pages_when_launches_leave_it(churn, monkeypatch):
+    pages = []
+    monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: pages.append((key, msg)) or True)
+    f = _focus(churn, monkeypatch)
+    put(churn, focus=f, max_workers=1, queue=[item(3799)])
+    for _ in range(3):
+        churn.focus_alerts(churn.load_state(), {}, [])
+    starved = [m for k, m in pages if k == "focus-starved"]
+    assert len(starved) == 1 and "Focus items queued: 0" in starved[0]  # paged at the 2nd idle pass only
+    for k, issue in enumerate([3799, 3798, 3784, 6072]):
+        _run(churn, f"{issue}-{k}", issue=issue, started=churn.iso(churn.now() - churn.dt.timedelta(hours=1)))
+    assert churn.focus_share(churn.load_state()) == (1, 4)
+    with churn.edit_state() as st:
+        st["focus"]["drift_checked"] = churn.iso(churn.now() - churn.dt.timedelta(hours=7))
+    churn.focus_alerts(churn.load_state(), {}, ["#6072 (launched)"])
+    assert any(k == "focus-drift" and "1 of 4" in m for k, m in pages)
+    put(churn)  # no focus at all: page that, launch nothing
+    churn.focus_alerts(churn.load_state(), {}, [])
+    assert pages[-1][0] == "focus-none"
