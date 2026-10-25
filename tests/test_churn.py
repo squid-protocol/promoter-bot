@@ -2710,14 +2710,16 @@ def test_self_wait_hook_blocks_only_loops_that_match_themselves(cmd, blocked):
 class _BotGH:
     """A fake GitHub for tend_bot_prs: one bot PR, its merge state, its workflow runs."""
 
-    def __init__(self, state="blocked", age_h=2, runs=(), busy=False, head="aaa111"):
+    def __init__(self, state="blocked", age_h=2, runs=(), busy=False, head="aaa111", labels=()):
         self.state, self.runs, self.busy, self.head = state, list(runs), busy, head
+        self.labels = [{"name": lb} for lb in labels]
         self.created = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=age_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.calls = []
 
     def gh(self, path):
         if path.startswith("repos/o/r/pulls?"):
-            return [{"number": 5317, "head": {"ref": "auto/evidence-refresh-full", "sha": self.head}, "created_at": self.created},
+            return [{"number": 5317, "head": {"ref": "auto/evidence-refresh-full", "sha": self.head},
+                     "created_at": self.created, "labels": self.labels},
                     {"number": 9, "head": {"ref": "churn/1-x", "sha": "b"}, "created_at": self.created}]
         if path == "repos/o/r/pulls/5317":
             return {"mergeable_state": self.state}
@@ -2787,6 +2789,16 @@ def test_bot_pr_with_an_uncomputed_merge_state_waits_a_tick(bot):
     churn, _ = bot
     g = _BotGH(state="unknown", runs=[{"id": 7, "name": "ground-truth", "conclusion": "failure", "run_attempt": 1}])
     assert churn.tend_bot_prs(g.gh, g.sh) == [] and g.calls == []  # no rerun of a PR that may conflict
+    g.state = "dirty"
+    [line] = churn.tend_bot_prs(g.gh, g.sh)
+    assert "conflicts with main" in line and g.calls == [["gh", "workflow", "run"]]
+
+
+def test_bot_pr_with_shepherd_merge_defers_reruns_to_shepherd_but_still_rebuilds_conflicts(bot):
+    churn, pages = bot
+    g = _BotGH(labels=("shepherd:merge",),
+               runs=[{"id": 7, "name": "ground-truth", "conclusion": "failure", "run_attempt": 1}])
+    assert churn.tend_bot_prs(g.gh, g.sh) == [] and g.calls == [] and pages == []
     g.state = "dirty"
     [line] = churn.tend_bot_prs(g.gh, g.sh)
     assert "conflicts with main" in line and g.calls == [["gh", "workflow", "run"]]
