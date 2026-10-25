@@ -5156,7 +5156,34 @@ def flaked(state: dict, n: str, v: dict) -> bool:
                 and at and now() - at < dt.timedelta(hours=FLAKE_HOURS))
 
 
-def queue_main_red(state: dict, issues: list[dict], snap: dict | None = None) -> list[str]:
+# 2026-10-25: #6593 (Evidence Refresh red on main) got 21 Sonnet runs in 96 min. #6583 had fixed main at 04:59Z, but
+# the issue stays open until the workflow next passes, and that run took ~1.5 h: each worker found nothing to do, ended,
+# and the next gate pass queued another. A red-main issue whose last fix run finished under MAIN_RED_RETRY_H ago is now
+# queued again only when the workflow has failed on main since that run started (new evidence), read at most every
+# MAIN_RED_CHECK_MIN.
+MAIN_RED_RETRY_H = 6
+MAIN_RED_CHECK_MIN = 10
+
+
+def last_main_red_run(issue: int) -> dict | None:
+    """The newest finished (status done) churn run on red-main issue `issue`, or None."""
+    done = [m for d in RUNS.glob(f"{issue}-*") if (m := _run_meta(d.name)) and m.get("status") == "done"]
+    return max(done, key=lambda m: m.get("started", "")) if done else None
+
+
+def failed_on_main_since(title: str, since: dt.datetime, runs=None) -> bool | None:
+    """Did the issue's workflow ("main is red: <workflow>") fail on main, a run last updated after `since`? None =
+    unreadable."""
+    wf = re.sub(r"(?i)^\s*main is red:\s*", "", title).strip()
+    try:
+        data = (runs or gh_json)(f"repos/{REPO}/actions/runs?branch=main&status=failure&per_page=30") or {}
+    except (RuntimeError, ValueError):
+        return None
+    return any(r.get("name") == wf and (t := parse_iso(r.get("updated_at"))) and t > since
+               for r in data.get("workflow_runs") or [])
+
+
+def queue_main_red(state: dict, issues: list[dict], snap: dict | None = None, runs=None) -> list[str]:
     """Owner 2026-10-14: main sat red for hours (#5091 Full Suite since 05:36Z, #5094 Evidence Refresh) while churn only
     watched PRs. Each open `ci-red-main` issue with no live worker and no queue item becomes a `ci`-lane item."""
     live = [r for r in state.get("running", []) if pid_alive(r.get("pid"))]
@@ -5168,10 +5195,20 @@ def queue_main_red(state: dict, issues: list[dict], snap: dict | None = None) ->
     have |= {int(m.group(1)) for v in (snap or {}).values() if v.get("state") == "open"
              if (m := re.match(r"churn/(\d+)-", v.get("branch", "")))}
     added = []
+    checked = state.setdefault("main_red_checked", {})
     for i in issues:
         n = int(i["number"])
         if n in have:
             continue
+        last = last_main_red_run(n)
+        if last and (t := parse_iso(last.get("started"))) and now() - t < dt.timedelta(hours=MAIN_RED_RETRY_H):
+            seen = parse_iso(checked.get(str(n)))
+            if seen and now() - seen < dt.timedelta(minutes=MAIN_RED_CHECK_MIN):
+                continue  # read GitHub at most every MAIN_RED_CHECK_MIN while it waits
+            checked[str(n)] = iso(now())
+            if not failed_on_main_since(i.get("title", ""), t, runs):
+                continue  # no failure since its last run started: that run's verdict stands
+        checked.pop(str(n), None)
         state.setdefault("queue", []).insert(0, {
             "issue": n, "model": "sonnet", "needs_owner": False, "lane": "ci", "allow_workflows": True, "auto": "main-red",
             "task": (f"Main is red: {i.get('title', '')} (#{n}). Read the failing runs named in the issue (latest first, "

@@ -4252,3 +4252,33 @@ def test_goal_subcommands_set_the_ladder_anchor_skips_and_exclusions(churn, caps
     assert g["ladder_anchor"] == 6072 and g["ladder_skip"] == ["CRECUST"] and g["excluded"] == [4049]
     churn.cmd_goal(ns("ladder", "off"))
     assert churn.load_state()["goal"]["ladder_anchor"] is None
+
+
+# ---------------------------------------------------------------- red main: no requeue loop (2026-10-25, #6593)
+def test_a_red_main_issue_waits_for_a_new_failure_after_a_finished_run(churn):
+    red = [{"number": 6593, "title": "main is red: Evidence Refresh"}]
+    _run(churn, "6593-a", issue=6593, status="done", started=churn.iso(churn.now() - churn.dt.timedelta(minutes=30)))
+    calls = []
+    old = churn.iso(churn.now() - churn.dt.timedelta(hours=2))
+    runs = lambda path: calls.append(path) or {"workflow_runs": [
+        {"name": "Evidence Refresh", "updated_at": old}, {"name": "Full Suite Gate", "updated_at": churn.iso(churn.now())}]}
+    st = {"queue": [], "running": [], "prs": []}
+    assert churn.queue_main_red(st, red, runs=runs) == []  # only an old failure, or another workflow's
+    assert churn.queue_main_red(st, red, runs=runs) == [] and len(calls) == 1  # re-read at most every 10 min
+    st["main_red_checked"]["6593"] = churn.iso(churn.now() - churn.dt.timedelta(minutes=11))
+    fresh = lambda path: {"workflow_runs": [{"name": "Evidence Refresh", "updated_at": churn.iso(churn.now())}]}
+    assert churn.queue_main_red(st, red, runs=fresh) == ["#6593"] and "6593" not in st["main_red_checked"]
+
+
+def test_a_red_main_issue_retries_after_the_window_or_a_crashed_run(churn):
+    red = [{"number": 6593, "title": "main is red: Evidence Refresh"}]
+    never = lambda path: 1 / 0
+    _run(churn, "6593-a", issue=6593, status="done", started=churn.iso(churn.now() - churn.dt.timedelta(hours=7)))
+    _run(churn, "6593-b", issue=6593, status="crashed", started=churn.iso(churn.now()))
+    st = {"queue": [], "running": [], "prs": []}
+    assert churn.queue_main_red(st, red, runs=never) == ["#6593"]  # last finished run is 7 h old: no GitHub read
+    def down(path):
+        raise RuntimeError("gh: 502")
+    _run(churn, "6593-c", issue=6593, status="done", started=churn.iso(churn.now()))
+    st = {"queue": [], "running": [], "prs": []}
+    assert churn.queue_main_red(st, red, runs=down) == []  # unreadable: the fresh run's verdict stands
