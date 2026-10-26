@@ -343,6 +343,30 @@ def test_scorecard_counts_the_day(churn):
     assert "1 reported checklist slices, 1 lines done" in md
 
 
+def test_scorecard_pages_back_to_an_older_day(churn):
+    """2026-10-26: a backfill day sits under many pages of PRs updated since; the page cap of 5 lost it."""
+    day = dt.date(2026, 10, 13)
+    seen = []
+
+    def gh(path):
+        if path.startswith(f"repos/{churn.REPO}/pulls"):
+            page = int(path.rsplit("page=", 1)[1])
+            seen.append(page)
+            if page < 7:  # 6 pages of PRs updated after the day
+                return [{"number": 100 * page + i, "head": {"ref": "x"}, "merged_at": None, "created_at": "2026-10-20T00:00:00Z",
+                         "updated_at": "2026-10-20T00:00:00Z"} for i in range(100)]
+            if page == 7:
+                return [{"number": 7, "head": {"ref": "churn/7-a"}, "merged_at": "2026-10-13T05:00:00Z",
+                         "created_at": "2026-10-13T01:00:00Z", "updated_at": "2026-10-12T05:00:00Z"}]
+            return [{"number": 8}]  # never fetched: page 7 already reached past the day
+        if path.startswith("search/issues"):
+            return {"total_count": 0}
+        return []
+
+    c = churn.scorecard(day, {"usage": {"log": []}, "queue": []}, gh=gh, log_text="")
+    assert c["churn_merged"] == [7] and seen == list(range(1, 8))
+
+
 def test_scorecard_is_written_once_a_day_on_top_of_the_log(churn, monkeypatch):
     monkeypatch.setattr(churn, "scorecard", lambda day, state: {
         "day": str(day), "merged": [], "churn_merged": [], "opened": 0, "churn_opened": 0,
