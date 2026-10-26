@@ -7537,6 +7537,7 @@ def scorecard_md(c: dict) -> str:
 IDLE_TICK_CAP_S = 30 * 60  # an idle tick stands for the time to the next logged event, at most one timer period
 FACTORY = H / "factory-metrics.json"
 DASH_REPO, DASH_BRANCH, DASH_FILE = _CFG.get("dashboard_repo", f"{ORG}/squid-bot"), "dashboard", "factory.json"
+FACTORY_PACE_S, FACTORY_RETRY_S = 60, 90  # `churn factory --days N`: GitHub search allows 30 calls a minute
 FACTORY_DAYS = 120  # 2026-10-26: weekly quality lines (quality.svg) want months, not one
 
 
@@ -7692,7 +7693,16 @@ def cmd_factory(a) -> int:
     state, today = load_state(), now().date()
     days = [today - dt.timedelta(days=i) for i in range(a.days, 0, -1)] + ([today] if a.today else [])
     for i, day in enumerate(days):
-        c = scorecard(day, state)
+        if i:  # 2026-10-26: a 16-day backfill ran ~6 search counts a day back to back and hit search's 30/min limit
+            time.sleep(FACTORY_PACE_S)
+        try:
+            c = scorecard(day, state)
+        except RuntimeError as e:
+            if "rate limit" not in str(e):
+                raise
+            print(f"{day}: {str(e)[:100]}; waiting {FACTORY_RETRY_S} s", file=sys.stderr)
+            time.sleep(FACTORY_RETRY_S)
+            c = scorecard(day, state)
         record_factory(c, push=a.push and i == len(days) - 1)
         print(f"{day}: " + next((x[2:] for x in scorecard_md(c).splitlines() if x.startswith("- Factory:")), "no data"))
     return 0

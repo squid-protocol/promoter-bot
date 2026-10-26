@@ -4273,3 +4273,23 @@ def test_classify_causes_drops_unknown_labels_and_survives_a_bad_reply(churn, mo
     monkeypatch.setattr(churn, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, next(replies), ""))
     items = [{"id": x, "sendback": "", "report": ""} for x in ("a", "b", "c")]
     assert churn.classify_causes(items) == {"a": "env"}
+
+
+def test_factory_backfill_paces_days_and_retries_a_rate_limit_once(churn, monkeypatch, capsys):
+    calls, sleeps = [], []
+    monkeypatch.setattr(churn, "load_state", lambda: {})
+    monkeypatch.setattr(churn.time, "sleep", sleeps.append)
+    monkeypatch.setattr(churn, "record_factory", lambda c, push=False: calls.append(("rec", c["day"], push)))
+    monkeypatch.setattr(churn, "scorecard_md", lambda c: "")
+    seen = []
+
+    def card(day, state):
+        seen.append(day)
+        if len(seen) == 2:
+            raise RuntimeError("gh api search/issues: API rate limit exceeded")
+        return {"day": str(day)}
+
+    monkeypatch.setattr(churn, "scorecard", card)
+    assert churn.cmd_factory(argparse.Namespace(days=2, today=False, push=True)) == 0
+    assert sleeps == [churn.FACTORY_PACE_S, churn.FACTORY_RETRY_S]
+    assert [c[2] for c in calls] == [False, True] and len(seen) == 3
