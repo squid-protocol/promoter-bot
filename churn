@@ -7364,11 +7364,16 @@ def quality(day: dt.date, merged_prs: list[dict], runs_dir: Path | None = None, 
     for m in sorted(rd.glob("*/meta.json")):
         with contextlib.suppress(OSError, ValueError):
             meta = json.loads(m.read_text())
-            if meta.get("pr") and not meta.get("repo") and not str(meta.get("run_id", "")).endswith("-agy"):
+            if not meta.get("repo") and not str(meta.get("run_id", "")).endswith("-agy"):
                 metas.append((m.parent, meta))
-    by_pr: dict[int, list[tuple[Path, dict]]] = {}
+    # A run is the PR's by its `pr`, else by its branch: runs before 2026-10-16 recorded no `pr`, and their fix runs
+    # would read as first-pass merges (melek Oct 12-15: 0 fixes on 118 PRs).
+    branch = lambda d, meta: meta.get("branch") or f"churn/{d.name}"  # noqa: E731
+    br_pr = {branch(d, meta): int(meta["pr"]) for d, meta in metas if meta.get("pr")}
+    by_pr: dict[int | str, list[tuple[Path, dict]]] = {}
     for d, meta in sorted(metas, key=lambda x: x[1].get("started") or ""):
-        by_pr.setdefault(int(meta["pr"]), []).append((d, meta))
+        key = int(meta["pr"]) if meta.get("pr") else br_pr.get(branch(d, meta), branch(d, meta))
+        by_pr.setdefault(key, []).append((d, meta))
     fixes = [(d, meta) for runs in by_pr.values() for d, meta in runs[1:]
              if run_kind(meta, rd) in ("pr_fix", "send_back")]  # fmt: skip
     by_size = {name: {"merged": 0, "fixed": 0} for name, _ in SIZE_BUCKETS}
@@ -7377,7 +7382,8 @@ def quality(day: dt.date, merged_prs: list[dict], runs_dir: Path | None = None, 
         paths = (files or pr_files)(int(p["number"]))
         if paths is None:
             continue
-        runs = by_pr.get(int(p["number"]), [])
+        ref = str((p.get("head") or {}).get("ref") or p.get("headRefName") or "")
+        runs = by_pr.get(int(p["number"])) or by_pr.get(ref, [])
         b = by_size[size_bucket(len(hand_written(paths)))]
         b["merged"] += 1
         b["fixed"] += any(run_kind(meta, rd) in ("pr_fix", "send_back") for _, meta in runs[1:])

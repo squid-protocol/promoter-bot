@@ -4281,6 +4281,23 @@ def test_quality_counts_merged_prs_by_size_first_pass_and_the_days_fix_causes(ch
     assert again["quality"]["causes"] == {"env": 1}
 
 
+def test_quality_finds_runs_without_a_pr_by_branch(churn, tmp_path):
+    """Runs before 2026-10-16 recorded no `pr`: their fixes are found by the PR's branch, so they are not first pass."""
+    runs = tmp_path / "runs"
+    for rid, start, kw in (("e1", "2026-10-14T01:00Z", {}), ("e2", "2026-10-14T04:00Z", {"task": "Fix PR #5: dirty"}),
+                           ("f1", "2026-10-14T01:00Z", {}),
+                           ("g1", "2026-10-14T01:00Z", {}), ("g2", "2026-10-14T06:00Z", {"resume_of": "g1", "pr": 7})):
+        (runs / rid).mkdir(parents=True)
+        branch = {"e": "churn/e1", "f": "churn/f1", "g": "churn/g1"}[rid[0]]
+        (runs / rid / "meta.json").write_text(json.dumps({"run_id": rid, "started": start, "branch": branch, "task": "t", **kw}))
+    prs = [{"number": 5, "head": {"ref": "churn/e1"}}, {"number": 6, "headRefName": "churn/f1"},
+           {"number": 7, "head": {"ref": "churn/g1"}}]
+    out = churn.quality(churn.dt.date(2026, 10, 14), prs, runs_dir=runs, files=lambda n: ["a.py"], classify=lambda items: {})
+    assert out["first_pass"] == {"merged": 3, "first_pass": 1}  # only PR 6
+    assert out["quality"]["by_size"]["1-2"] == {"merged": 3, "fixed": 2}  # g1 (no pr) and g2 (pr 7) are one PR
+    assert out["quality"]["fix_runs"] == 2  # e2 and g2
+
+
 def test_quality_of_two_hosts_adds_up(churn):
     a = {"quality": {"by_size": {"5": {"merged": 2, "fixed": 1}}, "causes": {"env": 1}, "fix_runs": 1},
          "first_pass": {"merged": 2, "first_pass": 1}, "churn_merged": 2}
