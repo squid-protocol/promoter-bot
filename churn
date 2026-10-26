@@ -734,6 +734,19 @@ def internal_name_problems(diff: str, body: str, names: list[str]) -> tuple[list
 
 
 NO_CLASS_TABLE = "the PR body is missing or has no class table / Sibling gaps (gitgalaxy-pr-worker.md): write it"
+# The night-shift 5-file rule (owner 2026-10-17; re-measured 2026-10-26: send-backs 24% at 3-4 hand-written files, 50% at
+# 5, 62% at 6-7, and 52 of 64 PRs over 5 stated no exception). Regenerated files don't count: goldens, baselines,
+# ledgers, evidence / coverage records, generated docs, lock / pin files, data. 0 turns the check off.
+FILE_CAP = int(_CFG.get("file_cap", 5))
+REGENERATED_RE = re.compile(r"golden_master|refraction_snapshot|scan_output|/evidence/|evidence_report|det_sweep_coverage"
+                            r"|provenance|ledger|baseline|_scores|survivors|infeasible_outcomes|register/|\.lock$"
+                            r"|(^|/)pins?\.|\.test_durations$|\.(json|jsonl|txt|csv|dat|snap|svg)$")
+FILE_CAP_EXCEPTION = re.compile(r"(?im)^[*_ ]*File-cap exception[*_ ]*:\s*\S")
+
+
+def hand_written(files: list[str]) -> list[str]:
+    """The files a PR's 5-file rule counts: everything but the regenerated ones."""
+    return [f for f in files if not REGENERATED_RE.search(f)]
 
 
 def body_has_class_section(body: str) -> bool:
@@ -796,7 +809,7 @@ def fill_class_section(meta: dict, body: str, report: str, names: list[str] | No
 def precheck_problems(meta: dict, body: str, gates=None) -> list[str]:
     """The mechanical problems a reviewer would otherwise send back (2026-10-16: about half of 22 send-backs were
     these): conflicts with main, a workflow edited without an allow_workflows item, a PR body without its class table,
-    red fast gates. Each is checked in the run's worktree with git and pr_gates; no model."""
+    more hand-written files than FILE_CAP with no stated exception (2026-10-26), red fast gates. Each is checked in the run's worktree with git and pr_gates; no model."""
     wt, out = meta["worktree"], []
     run(["git", "-C", wt, "fetch", "-q", "origin", "main"], timeout=300)
     mt = run(["git", "-C", wt, "merge-tree", "--write-tree", "--name-only", "origin/main", "HEAD"], timeout=300)
@@ -814,6 +827,13 @@ def precheck_problems(meta: dict, body: str, gates=None) -> list[str]:
                        "(night-shift Never rule) or say in the report that it needs the owner")
     if not body_has_class_section(body):
         out.append(NO_CLASS_TABLE)
+    if FILE_CAP and not FILE_CAP_EXCEPTION.search(body):
+        changed = run(["git", "-C", wt, "diff", "--name-only", "origin/main...HEAD"], timeout=300).stdout.split()
+        if len(hand := hand_written(changed)) > FILE_CAP:
+            out.append(f"touches {len(hand)} hand-written files, over the {FILE_CAP}-file rule ({', '.join(hand[:10])}"
+                       f"{', ...' if len(hand) > 10 else ''}): keep the first self-contained slice of {FILE_CAP} or fewer "
+                       "and list the rest under Remaining slices, or, for an atomic rename or a mechanical one-line "
+                       "change, add a line `File-cap exception: <why>` to the PR body")
     if names := internal_names():
         diff = run(["git", "-C", wt, "diff", "-U0", "--no-color", "--no-ext-diff", "origin/main...HEAD"], timeout=300).stdout
         probs, detail = internal_name_problems(diff, body, names)

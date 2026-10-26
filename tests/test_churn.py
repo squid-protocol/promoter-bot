@@ -1204,6 +1204,27 @@ def test_precheck_finds_the_mechanical_send_back_reasons(churn, tmp_path):
     assert churn.precheck_problems({"worktree": str(clean)}, GOOD_BODY, gates=ok) == []  # launched before the flag: unknown
 
 
+def test_precheck_holds_the_file_cap_unless_the_body_states_an_exception(churn, tmp_path):
+    ok = lambda: subprocess.CompletedProcess([], 0, "6/6 gates pass", "")  # noqa: E731
+    wt = _repo_with_conflict(tmp_path, conflict=False)  # h.txt is data: regenerated, not counted
+    for name in ("a.py", "b.py", "c.py", "d.py", "tests/test_a.py", "docs/a.md"):
+        (wt / name).parent.mkdir(parents=True, exist_ok=True)
+        (wt / name).write_text("x\n")
+    for name in ("tests/golden_master_audit/x.py", "tests/equivalence/det_sweep_coverage/c.json", "ledger.md"):
+        (wt / name).parent.mkdir(parents=True, exist_ok=True)
+        (wt / name).write_text("generated\n")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-q", "-m", "six hand-written files")
+    probs = churn.precheck_problems({"worktree": str(wt)}, GOOD_BODY, gates=ok)
+    assert len(probs) == 1 and "touches 6 hand-written files, over the 5-file rule" in probs[0]
+    assert "golden_master" not in probs[0] and "ledger" not in probs[0]
+    assert churn.precheck_problems({"worktree": str(wt)}, GOOD_BODY + "\n\n**File-cap exception:** atomic rename",
+                                   gates=ok) == []
+    (wt / "docs/a.md").unlink()
+    _git(wt, "commit", "-qam", "five")
+    assert churn.precheck_problems({"worktree": str(wt)}, GOOD_BODY, gates=ok) == []
+
+
 def test_precheck_fails_an_internal_only_name_without_echoing_it(churn, tmp_path, monkeypatch, capsys):
     # promoter-bot-private#2. Made-up names only: the real list lives in the private repo and never in this one.
     lst = tmp_path / "names.txt"
