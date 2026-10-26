@@ -1414,8 +1414,9 @@ def test_factory_splits_worker_hours_and_reads_holds_pauses_and_latency(churn, t
     assert "Factory: 7.0 worker-hours, 57% new work" in md and "1 idle ticks" in md
 
 
-def test_factory_history_keeps_30_days_and_publishes_one_file(churn, monkeypatch):
+def test_factory_history_keeps_its_days_and_publishes_one_file(churn, monkeypatch):
     puts = []
+    monkeypatch.setattr(churn, "FACTORY_DAYS", 30)
     monkeypatch.setattr(churn, "gh_json", lambda path: {"sha": "abc"})
     monkeypatch.setattr(churn, "run", lambda cmd, **kw: puts.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
     fa = {"worker_hours": {"new_work": 1.0}, "new_work_share": 1.0}
@@ -4220,3 +4221,55 @@ def test_the_launch_mix_tells_filler_from_leaks(churn, monkeypatch):
     put(churn)  # no focus at all: page that, launch nothing
     churn.focus_alerts(churn.load_state(), {}, [])
     assert pages[-1][0] == "focus-none"
+
+
+# ---------------------------------------------------------------- PR quality by size and fix causes (2026-10-26)
+def test_quality_counts_merged_prs_by_size_first_pass_and_the_days_fix_causes(churn, tmp_path):
+    runs = tmp_path / "runs"
+
+    def meta(rid, start, pr, report="## Worker's final report\nmain was red", **kw):
+        (runs / rid).mkdir(parents=True)
+        (runs / rid / "meta.json").write_text(json.dumps({"run_id": rid, "started": start, "pr": pr, "task": "t", **kw}))
+        (runs / rid / "report.md").write_text(report)
+
+    meta("a1", "2026-10-15T01:00Z", 1)                                    # PR 1: first pass
+    meta("b1", "2026-10-15T01:00Z", 2)                                    # PR 2: one review send-back
+    meta("b2", "2026-10-15T03:00Z", 2, resume_of="b1")
+    meta("c1", "2026-10-15T01:00Z", 3)                                    # PR 3: precheck retry only
+    meta("c2", "2026-10-15T02:00Z", 3, resume_of="c1", precheck_of="c1")
+    meta("d1", "2026-10-14T01:00Z", 4)                                    # PR 4: a PR fix the day before
+    meta("d2", "2026-10-14T05:00Z", 4, task="Fix PR #4: conflicts with main")
+    (runs / "d2" / "cause.json").write_text(json.dumps({"cause": "conflict"}))
+    files = {1: ["a.py", "tests/golden_master_audit/x.json"], 2: ["a.py", "b.py", "c.py", "d.py", "e.py"],
+             3: ["a.py"], 4: [f"m{i}.py" for i in range(7)]}
+    asked = []
+    out = churn.quality(churn.dt.date(2026, 10, 15), [{"number": n} for n in (1, 2, 3, 4)], runs_dir=runs,
+                        files=files.get, classify=lambda items: asked.extend(items) or {"b2": "env"})
+    assert out["first_pass"] == {"merged": 4, "first_pass": 1}
+    q = out["quality"]
+    assert q["by_size"]["1-2"] == {"merged": 2, "fixed": 0}  # the golden file does not count; a precheck retry is not a fix
+    assert q["by_size"]["5"] == {"merged": 1, "fixed": 1} and q["by_size"]["6+"] == {"merged": 1, "fixed": 1}
+    assert q["causes"] == {"env": 1} and q["fix_runs"] == 1  # d2 started the day before
+    assert [i["id"] for i in asked] == ["b2"] and "main was red" in asked[0]["report"]
+    assert json.loads((runs / "b2" / "cause.json").read_text())["cause"] == "env"  # cached: never asked twice
+    again = churn.quality(churn.dt.date(2026, 10, 15), [], runs_dir=runs, files=files.get,
+                          classify=lambda items: pytest.fail("asked again"))
+    assert again["quality"]["causes"] == {"env": 1}
+
+
+def test_quality_of_two_hosts_adds_up(churn):
+    a = {"quality": {"by_size": {"5": {"merged": 2, "fixed": 1}}, "causes": {"env": 1}, "fix_runs": 1},
+         "first_pass": {"merged": 2, "first_pass": 1}, "churn_merged": 2}
+    b = {"quality": {"by_size": {"5": {"merged": 1, "fixed": 1}}, "causes": {"env": 2, "stale": 1}, "fix_runs": 3},
+         "first_pass": {"merged": 1, "first_pass": 0}, "churn_merged": 1}
+    day = churn.combine_factory_days({"h1": {"d": a}, "h2": {"d": b}})["d"]
+    assert day["quality"]["by_size"]["5"] == {"merged": 3, "fixed": 2}
+    assert day["quality"]["causes"] == {"env": 3, "stale": 1} and day["first_pass"] == {"merged": 3, "first_pass": 1}
+
+
+def test_classify_causes_drops_unknown_labels_and_survives_a_bad_reply(churn, monkeypatch):
+    replies = iter(['{"result": "here: {\\"a\\": \\"env\\", \\"b\\": \\"cosmic rays\\"}"}', "not json"])
+    monkeypatch.setattr(churn, "CAUSE_BATCH", 2)
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, next(replies), ""))
+    items = [{"id": x, "sendback": "", "report": ""} for x in ("a", "b", "c")]
+    assert churn.classify_causes(items) == {"a": "env"}
