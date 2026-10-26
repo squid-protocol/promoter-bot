@@ -7412,8 +7412,8 @@ def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, q
         x = parse_iso(t) if isinstance(t, str) else t
         return bool(x and lo <= x < hi)
 
-    prs = []
-    for page in range(1, 6):
+    prs = []  # newest-updated first, until a page reaches before the day (2026-10-26: 5 pages covered only ~2 days at
+    for page in range(1, SCORECARD_PAGES + 1):  # ~200 PRs/day, so a backfill read past days as 0 merged)
         batch = gh(f"repos/{REPO}/pulls?state=all&sort=updated&direction=desc&per_page=100&page={page}")
         prs += batch
         if not batch or not (u := parse_iso(batch[-1].get("updated_at"))) or u < lo:
@@ -7537,6 +7537,7 @@ def scorecard_md(c: dict) -> str:
 IDLE_TICK_CAP_S = 30 * 60  # an idle tick stands for the time to the next logged event, at most one timer period
 FACTORY = H / "factory-metrics.json"
 DASH_REPO, DASH_BRANCH, DASH_FILE = _CFG.get("dashboard_repo", f"{ORG}/squid-bot"), "dashboard", "factory.json"
+SCORECARD_PAGES = 60  # pulls pages of 100 a scorecard may read; a recent day stops after 2-3
 FACTORY_PACE_S, FACTORY_RETRY_S = 60, 90  # `churn factory --days N`: GitHub search allows 30 calls a minute
 FACTORY_DAYS = 120  # 2026-10-26: weekly quality lines (quality.svg) want months, not one
 

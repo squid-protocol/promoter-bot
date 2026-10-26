@@ -6,6 +6,7 @@ Every test loads a fresh copy of the script with CHURN_HOME pointing at a tmp di
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import importlib.machinery
 import importlib.util
@@ -4293,3 +4294,20 @@ def test_factory_backfill_paces_days_and_retries_a_rate_limit_once(churn, monkey
     assert churn.cmd_factory(argparse.Namespace(days=2, today=False, push=True)) == 0
     assert sleeps == [churn.FACTORY_PACE_S, churn.FACTORY_RETRY_S]
     assert [c[2] for c in calls] == [False, True] and len(seen) == 3
+
+
+def test_scorecard_pages_back_until_the_day_however_far(churn, monkeypatch):
+    pages = []
+
+    def gh(path):
+        if "pulls?" not in path:
+            return {"total_count": 0} if path.startswith("search/") else []
+        n = int(path.rsplit("page=", 1)[1])
+        pages.append(n)
+        day = churn.dt.datetime(2026, 10, 25, tzinfo=churn.dt.timezone.utc) - churn.dt.timedelta(hours=6 * n)
+        return [{"number": n, "updated_at": day.strftime("%Y-%m-%dT%H:%M:%SZ"), "merged_at": None, "created_at": None}]
+
+    monkeypatch.setattr(churn, "_quality_or_empty", lambda day, merged: {})
+    with contextlib.suppress(Exception):  # only the paging is under test here
+        churn.scorecard(churn.dt.date(2026, 10, 22), {}, gh=gh, log_text="", quiet_text="")
+    assert max(pages) >= 13  # 6 h a page: 3+ days back is past the old 5-page cap
