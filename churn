@@ -7292,6 +7292,117 @@ def core_parts(gh, merged: list[dict], lo: dt.datetime, hi: dt.datetime) -> dict
             "core_per_hour": round(rate, 2) if rate else None, "eta_hours": round(left / rate) if rate else None}
 
 
+# ---------------------------------------------------------------- PR quality by size and fix causes (2026-10-26)
+# Owner 2026-10-26: a routine weekly score of what the 5-file rule rests on -- how often a merged PR needed a fix, by its
+# hand-written file count, and what broke when it did -- drawn on squid-bot's dashboard (quality.svg) from factory.json.
+SIZE_BUCKETS = (("1-2", 2), ("3-4", 4), ("5", 5), ("6+", 10**9))
+FIX_CAUSES = ("env", "conflict", "stale", "collateral", "own_test", "review", "other")
+CAUSE_PROMPT = """Classify why each automated pull request needed a fix run. Judge from what the worker found, not the request
+wording. One cause per item:
+env: CI red because main was broken, a flaky test, or infrastructure (timeouts, downloads, runners); nothing wrong in the PR
+conflict: merge conflict with main, or the PR was stale against main (including regenerating generated files after merging main)
+stale: a derived or recorded file the PR should have refreshed: ledgers, golden masters, baselines, evidence or coverage
+records, mutation records, generated lists, time ratchets, count pins
+collateral: the PR's change broke OTHER existing tests, audits, or another language's or program's output
+own_test: the PR's own new or changed tests failed in CI
+review: the reviewer asked for more work, a different approach, or PR text changes
+other: none of these, or no failure was found
+Reply with ONLY a JSON object mapping id to cause, e.g. {"12":"env"}.
+
+ITEMS:
+"""
+CAUSE_MODEL = _CFG.get("cause_model", "haiku")  # 82% agreement with Sonnet's labels on 60 runs (2026-10-26), ~$0.01/batch
+CAUSE_BATCH = 40
+
+
+def size_bucket(n: int) -> str:
+    return next(name for name, top in SIZE_BUCKETS if n <= top)
+
+
+def pr_files(n: int) -> list[str] | None:
+    """PR n's changed paths (all pages), or None when GitHub cannot say."""
+    r = run(["gh", "api", "--paginate", f"repos/{REPO}/pulls/{n}/files?per_page=100", "-q", ".[].filename"])
+    return r.stdout.split() if r.returncode == 0 else None
+
+
+def classify_causes(items: list[dict], model: str = CAUSE_MODEL) -> dict[str, str]:
+    """{id: cause} for [{"id", "sendback", "report"}], one `claude -p` per CAUSE_BATCH; {} on any failure (a missing
+    label is counted as unlabelled, never guessed)."""
+    out: dict[str, str] = {}
+    for i in range(0, len(items), CAUSE_BATCH):
+        r = run([CLAUDE, "-p", "--model", model, "--output-format", "json"],
+                input=CAUSE_PROMPT + json.dumps(items[i:i + CAUSE_BATCH]), timeout=600)
+        try:
+            text = json.loads(r.stdout)["result"]
+            got = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        out.update({str(k): v for k, v in got.items() if v in FIX_CAUSES})
+    return out
+
+
+def run_cause(rd: Path, meta: dict, labels: dict[str, str]) -> str | None:
+    """A fix run's cause: cached in its run dir (cause.json), else from this batch's labels (and then cached)."""
+    f = rd / "cause.json"
+    with contextlib.suppress(OSError, ValueError):
+        return json.loads(f.read_text())["cause"]
+    if (c := labels.get(meta.get("run_id", ""))) is not None:
+        with contextlib.suppress(OSError):
+            f.write_text(json.dumps({"cause": c, "model": CAUSE_MODEL, "at": iso(now())}))
+        return c
+    return None
+
+
+def quality(day: dt.date, merged_prs: list[dict], runs_dir: Path | None = None, files=None, classify=None) -> dict:
+    """This host's numbers for one UTC day: its churn PRs merged that day by hand-written file count, with how many
+    needed a review / CI fix run (send-back or PR fix; the precheck's own retry is the mechanical one and is not
+    counted) and how many merged first pass (no further run at all); and its fix runs started that day by cause."""
+    lo = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
+    hi = lo + dt.timedelta(days=1)
+    rd = runs_dir or RUNS
+    metas = []
+    for m in sorted(rd.glob("*/meta.json")):
+        with contextlib.suppress(OSError, ValueError):
+            meta = json.loads(m.read_text())
+            if meta.get("pr") and not meta.get("repo") and not str(meta.get("run_id", "")).endswith("-agy"):
+                metas.append((m.parent, meta))
+    by_pr: dict[int, list[tuple[Path, dict]]] = {}
+    for d, meta in sorted(metas, key=lambda x: x[1].get("started") or ""):
+        by_pr.setdefault(int(meta["pr"]), []).append((d, meta))
+    fixes = [(d, meta) for runs in by_pr.values() for d, meta in runs[1:]
+             if run_kind(meta, rd) in ("pr_fix", "send_back")]  # fmt: skip
+    by_size = {name: {"merged": 0, "fixed": 0} for name, _ in SIZE_BUCKETS}
+    fp = {"merged": 0, "first_pass": 0}
+    for p in merged_prs:
+        paths = (files or pr_files)(int(p["number"]))
+        if paths is None:
+            continue
+        runs = by_pr.get(int(p["number"]), [])
+        b = by_size[size_bucket(len(hand_written(paths)))]
+        b["merged"] += 1
+        b["fixed"] += any(run_kind(meta, rd) in ("pr_fix", "send_back") for _, meta in runs[1:])
+        fp["merged"] += 1
+        fp["first_pass"] += len(runs) <= 1
+    todays = [(d, meta) for d, meta in fixes if lo <= (parse_iso(meta.get("started")) or hi) < hi]
+    todo = [{"id": meta["run_id"], "sendback": str(meta.get("task") or "")[:400],
+             "report": (d / "report.md").read_text(errors="replace").split("## Worker's final report", 1)[-1][:1200]}
+            for d, meta in todays if not (d / "cause.json").exists() and (d / "report.md").exists()]  # fmt: skip
+    labels = (classify or classify_causes)(todo) if todo else {}
+    causes = collections.Counter(run_cause(d, meta, labels) or "unlabelled" for d, meta in todays)
+    return {"first_pass": fp, "quality": {"by_size": by_size, "causes": dict(causes), "fix_runs": len(todays)}}
+
+
+def _quality_or_empty(day: dt.date, merged_prs: list[dict]) -> dict:
+    """quality() that never stops a scorecard (GitHub or the model down: the day just has no quality numbers)."""
+    if not _CFG.get("features", {}).get("quality", True):
+        return {}
+    try:
+        return quality(day, merged_prs)
+    except Exception as e:  # noqa: BLE001
+        log(f"quality numbers for {day} failed: {str(e)[:200]}")
+        return {}
+
+
 def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, quiet_text: str | None = None) -> dict:
     gh = gh or gh_json
     lo = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
@@ -7355,7 +7466,7 @@ def scorecard(day: dt.date, state: dict, gh=None, log_text: str | None = None, q
     slices = [pr_checks(p.get("body") or "").get("checks", []) for p in churn_merged]
     quiet = quiet_text if quiet_text is not None else (QUIET_LOG.read_text() if QUIET_LOG.exists() else "")
     return {
-        "factory": factory(day, state, text, quiet, churn_merged),
+        "factory": {**factory(day, state, text, quiet, churn_merged), **_quality_or_empty(day, churn_merged)},
         "day": str(day), "merged": [p["number"] for p in merged], "churn_merged": [p["number"] for p in churn_merged],
         "opened": len(opened), "churn_opened": sum(1 for p in opened if is_churn(p)),
         "spend": {k: round(v, 2) for k, v in spend.items()}, "runs": runs_n, "total_usd": round(total, 2),
@@ -7426,7 +7537,7 @@ def scorecard_md(c: dict) -> str:
 IDLE_TICK_CAP_S = 30 * 60  # an idle tick stands for the time to the next logged event, at most one timer period
 FACTORY = H / "factory-metrics.json"
 DASH_REPO, DASH_BRANCH, DASH_FILE = _CFG.get("dashboard_repo", f"{ORG}/squid-bot"), "dashboard", "factory.json"
-FACTORY_DAYS = 30
+FACTORY_DAYS = 120  # 2026-10-26: weekly quality lines (quality.svg) want months, not one
 
 
 def record_factory(c: dict, push: bool = True) -> bool:
@@ -7449,7 +7560,7 @@ def record_factory(c: dict, push: bool = True) -> bool:
 # Fields of a factory day that add up across hosts (counts, hours, dollars, worker slots); the ratios are recomputed
 # from these sums, so a combined day is exact. ci_busy_hours is each host's view of the same CI queue: the max.
 FACTORY_SUM = ("churn_merged", "slices_merged", "items_done", "usd", "loop_runs", "idle_ticks", "idle_hours", "paused_hours", "max_workers",
-               "worker_hours", "precheck", "holds", "idle_causes", "idle_blockers")
+               "worker_hours", "precheck", "holds", "idle_causes", "idle_blockers", "first_pass", "quality")
 
 
 def _add(a, b):
