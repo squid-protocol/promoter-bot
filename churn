@@ -1724,7 +1724,8 @@ def cmd_worker(a) -> int:
         if getattr(a, "off_focus", False):
             owner_only("churn worker --off-focus")
         elif not getattr(a, "check_of", None) and not filler_branch(getattr(a, "branch", None)) \
-                and not main_red_branch(getattr(a, "branch", None)) and not in_focus(
+                and not main_red_branch(getattr(a, "branch", None) or (getattr(a, "worktree", None) and run(
+                    ["git", "-C", str(a.worktree), "branch", "--show-current"]).stdout.strip())) and not in_focus(
                 cur := load_state(), {"issue": issue, "task": task, "lane": getattr(a, "lane", None)}):
             f = focus_cfg(cur)
             if not filler_open(cur):
