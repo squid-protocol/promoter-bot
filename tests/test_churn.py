@@ -208,8 +208,23 @@ class TestGateRules:
         assert churn.worker_slots(self.GREEN, 1, 2) == 1
         assert churn.worker_slots({"verdict": "YELLOW", "free_slots": 3}, 0, 2) == 0
         assert churn.worker_slots({"verdict": "GREEN", "free_slots": 2}, 2, 3) == 1  # the third worker
-        assert churn.worker_slots({"verdict": "GREEN", "free_slots": 0}, 2, 3) == 0  # the box says no
+        assert churn.worker_slots({"verdict": "GREEN", "free_slots": 0}, 2, 3) == 1  # slots are not pressure (2026-10-27)
         assert churn.worker_slots({"verdict": "GREEN", "free_slots": 1}, 0, 3) == 1
+
+    def test_held_heavy_slots_alone_do_not_hold_a_launch(self, churn):
+        """Owner 2026-10-27: heavy steps queue for the slot in heavy-run.sh; the launch gate judges measured pressure."""
+        held = {"verdict": "YELLOW", "free_slots": 0, "reasons": ["all 1 heavy slots held"]}
+        assert churn.worker_slots(held, 1, 3) == 1  # one per gate pass: the next pass re-measures
+        assert churn.worker_slots(held, 3, 3) == 0  # max_workers still caps
+        noted = {"verdict": "YELLOW", "free_slots": 0, "reasons": [
+            "load1 4.2 not judged: no CPU or I/O pressure behind it", "all 1 heavy slots held",
+            "probable stray (kill it if nobody owns it): pid 9, 50 min, find /"]}
+        assert churn.worker_slots(noted, 0, 3) == 1
+        for real in ("load1 4.5 >= 70% of 6 cores", "CPU pressure 31%", "memory pressure 12% (swap 2.0 GB)",
+                     "disk I/O pressure 22% (tasks stalled on disk)", "free space low on /: 40 GB"):
+            assert churn.worker_slots({"verdict": "YELLOW", "free_slots": 0,
+                                       "reasons": [real, "all 1 heavy slots held"]}, 0, 3) == 0, real
+        assert churn.worker_slots({"verdict": "RED", "free_slots": 0, "reasons": ["all 1 heavy slots held"]}, 0, 3) == 0
 
     def test_unapplied_owner_answers_wake_the_model(self, churn):
         st = {"queue": [], "running": []}
