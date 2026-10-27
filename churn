@@ -740,7 +740,9 @@ NO_CLASS_TABLE = "the PR body is missing or has no class table / Sibling gaps (g
 FILE_CAP = int(_CFG.get("file_cap", 5))
 REGENERATED_RE = re.compile(r"golden_master|refraction_snapshot|scan_output|/evidence/|evidence_report|det_sweep_coverage"
                             r"|provenance|ledger|baseline|_scores|survivors|infeasible_outcomes|register/|\.lock$"
-                            r"|(^|/)pins?\.|\.test_durations$|\.(json|jsonl|txt|csv|dat|snap|svg)$")
+                            r"|(^|/)pins?\.|\.test_durations$|\.(json|jsonl|txt|csv|dat|snap|svg)(\.gz)?$")
+# (\.gz)? (2026-10-27): DOOM-rosetta re-blesses write tests/golden_doom_rosetta/<port>.json.gz; read as hand-written,
+# they sent pure re-bless PRs back over the 5-file rule (#6751 with 7, #6799 with 6: ~1.5 h of worker re-runs)
 FILE_CAP_EXCEPTION = re.compile(r"(?im)^[*_ ]*File-cap exception[*_ ]*:\s*\S")
 
 
@@ -1554,13 +1556,31 @@ def box(state: dict | None = None) -> dict:
     return out
 
 
+# Owner 2026-10-27: launch on measured pressure, not on heavy-slot bookkeeping. A worker's heavy steps already queue for
+# the slot through heavy-run.sh, so the slot gating the LAUNCH as well counted heavy work twice: on nyx (6 cores, 1 slot)
+# max_workers 3 never applied, and 110 of 172 quiet gate passes on 2026-10-27 (64%) were YELLOW for "all 1 heavy slots
+# held" alone, at load ~3 of 6 and CPU pressure ~1%. Real load, CPU / memory / I/O pressure and disk still hold launches.
+SLOT_ONLY_RE = re.compile(r"heavy slots? held|probable stray|not judged")  # box_status reasons that are not pressure
+
+
+def slots_only(b: dict) -> bool:
+    """box_status says YELLOW only because every heavy slot is held (strays and an unjudged load are notes, not limits)."""
+    why = [r for r in b.get("reasons") or [] if r != "headroom"]
+    return (b.get("verdict") == "YELLOW" and any("heavy slot" in r for r in why)
+            and all(SLOT_ONLY_RE.search(r) for r in why))
+
+
 def worker_slots(b: dict, running: int, max_workers: int = 2) -> int:
-    """How many MORE Claude workers may start: GREEN only, never more than the box's free heavy slots (box_status
-    already counts the load of the running ones), never past state.max_workers (owner 2026-10-14: 2). YELLOW only
-    allows a light item when nothing runs, which needs judgment, so it counts as 0 here."""
-    if b.get("verdict") != "GREEN":
+    """How many MORE Claude workers may start: never past state.max_workers. GREEN: up to the free heavy slots (box_status
+    counts the running ones' load), at least one. YELLOW for held heavy slots alone: one, so each gate pass re-measures
+    before the next launch. Any other YELLOW, or RED: none."""
+    if b.get("verdict") == "GREEN":
+        free = int(b.get("free_slots", 0))
+    elif slots_only(b):
+        free = 1
+    else:
         return 0
-    return max(0, min(max_workers - running, int(b.get("free_slots", 0))))
+    return max(0, min(max_workers - running, max(free, 1)))
 
 
 # ---------------------------------------------------------------- workers
