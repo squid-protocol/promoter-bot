@@ -2317,7 +2317,7 @@ def retro_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
 #   -> running (arms) -> scoring (blind) -> logging (temporal-crucible result PR) -> closed (cleanup done) | dropped
 # Owner defaults 2026-10-24: Opus designs every experiment, one owner OK per design, $40 an experiment, one a month,
 # spare capacity only. Tuning (CI knobs, caps) is not an experiment: dashboard markers, no lifecycle.
-EXP_DEFAULT = {"enabled": True, "budget_usd": 40.0, "per_30d": 1, "design_model": "opus", "design_usd": 8.0,
+EXP_DEFAULT = {"enabled": True, "budget_usd": 40.0, "per_30d": 1, "design_model": "opus", "design_usd": 8.0, "slot_hour_usd": 10.0, "payoff_x": 3.0,
                "arm_model": "sonnet", "score_model": "sonnet", "score_usd": 5.0, "log_model": "sonnet", "log_usd": 3.0,
                "max_attempts": 2, "max_live": 1}
 EXP_ACTIVE = ("proposed", "designing", "designed", "approved", "registering", "running", "scoring", "logging")
@@ -2342,12 +2342,19 @@ it is what the last experiment got wrong). Then write two files and nothing else
                "reference": "<replay: the merged fix's sha>", "brief": "<the task as the arm sees it>"}}, ...],
     "replicates": <runs per arm per task, at least 2>,
     "per_run_usd": <cap for one arm run>,
+    "value": {{"payoff_usd_per_month": <best case: what the change saves or earns a month if the hypothesis wins>,
+              "slot_hours": <worker slot-hours the arms hold, all runs together>,
+              "basis": "<one sentence: the counts and rates the payoff comes from>"}},
     "rubric": ["R1 ...", "R2 ..."]}}
 
 Rules: replay is the default (a merged fix is the ground truth; arms start at its parent and open no PR). Use live only
 when the question needs open work, and say why in design.md. The task brief must not leak the fix (no PR numbers,
 commit messages or file names the issue itself does not name). Total cost (arms x tasks x replicates x per_run_usd)
-must fit {room} USD; churn refuses a design that does not fit. Report the two paths when done.
+must fit {room} USD; churn refuses a design that does not fit. Cost versus reward (owner 2026-10-27, after E1 held a
+slot most of a day for a payoff its own design capped at cents per conflict): an arm's slot-hour is ladder/focus work not
+done, priced at {slot_hour_usd} USD. Six months of the best-case payoff must be at least {payoff_x}x the cost
+(arm USD + slot_hours x {slot_hour_usd}); churn refuses a design under that bar. If the honest numbers miss it, say so in
+design.md and write design.json anyway: a refused design is the right outcome. Report the two paths when done.
 """
 EXP_REGISTER_BRIEF = """# Register experiment {id} (Part of gitgalaxy#{issue})
 
@@ -2457,9 +2464,26 @@ def exp_run_state(rid: str | None) -> str:
     return str(meta.get("status")) if meta.get("finished") else "live"
 
 
-def exp_design_problems(d: dict, room: float) -> list[str]:
+def exp_value(d: dict, cfg: dict) -> tuple[float, float] | None:
+    """(six-month best-case payoff, cost incl. displaced slot-hours) in USD, or None if design.json states no value."""
+    v = d.get("value") or {}
+    try:
+        pay, hrs = float(v["payoff_usd_per_month"]), float(v["slot_hours"])
+        usd = len(d.get("arms") or {}) * len(d.get("tasks") or []) * int(d.get("replicates") or 0) * float(d["per_run_usd"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return 6 * pay, usd + cfg["score_usd"] + cfg["log_usd"] + hrs * float(cfg["slot_hour_usd"])
+
+
+def exp_design_problems(d: dict, room: float, cfg: dict | None = None) -> list[str]:
     """What makes design.json unrunnable (churn refuses it with no model)."""
     out = []
+    cfg = {**EXP_DEFAULT, **(cfg or {})}
+    if (val := exp_value(d, cfg)) is None:
+        out.append("value missing (payoff_usd_per_month, slot_hours, basis)")
+    elif val[0] < float(cfg["payoff_x"]) * val[1]:
+        out.append(f"not worth running: six months of best-case payoff ${val[0]:.0f} is under {cfg['payoff_x']:g}x the "
+                   f"cost ${val[1]:.0f} (USD plus slot-hours at ${cfg['slot_hour_usd']:g})")
     if d.get("mode") not in ("replay", "live"):
         out.append("mode must be replay or live")
     arms, tasks = d.get("arms") or {}, d.get("tasks") or []
@@ -2485,6 +2509,14 @@ def exp_design_problems(d: dict, room: float) -> list[str]:
     return out
 
 
+def exp_value_line(d: dict) -> str:
+    cfg = exp_cfg(load_state())
+    pay, cost = exp_value(d, cfg) or (0.0, 0.0)
+    v = d.get("value") or {}
+    return (f"best case ${pay:.0f} over six months vs ${cost:.0f} cost ({v.get('slot_hours')} slot-hours of focus work "
+            f"displaced at ${cfg['slot_hour_usd']:g}); basis: {v.get('basis', '?')}")
+
+
 def exp_owner_question(e: dict, d: dict) -> Path:
     q = H / "owner-questions" / f"experiment-{e['id']}.md"
     q.parent.mkdir(parents=True, exist_ok=True)
@@ -2493,6 +2525,7 @@ def exp_owner_question(e: dict, d: dict) -> Path:
                  f"Context: {e['question']} (would change: {e['change']}). Design: {exp_dir(e) / 'design.md'}. "
                  f"{d['mode']} mode, {len(d['arms'])} arms ({', '.join(d['arms'])}), {len(d['tasks'])} tasks x "
                  f"{d['replicates']} replicates = {runs} runs, est ${runs * float(d['per_run_usd']):.0f} plus scoring.\n"
+                 f"Cost vs reward: {exp_value_line(d)}\n"
                  f"Facts checked: design.json passed churn's checks (arms, replicates, budget, rubric).\n"
                  f"yes: Run it -- I register it in temporal-crucible, then run the arms on spare capacity.\n"
                  f"no: Drop it -- I close the experiment and its issue.\n"
@@ -2662,7 +2695,8 @@ def experiment_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
         tpl = tc_clone() / "docs" / "_agent_experiment_template.md"
         brief = EXP_DESIGN_BRIEF.format(id=e["id"], issue=issue, question=e["question"], change=e["change"], dir=d,
                                         template=tpl, room=cfg["budget_usd"] - cfg["design_usd"] - cfg["score_usd"]
-                                        - 2 * cfg["log_usd"] - exp_spent(e))
+                                        - 2 * cfg["log_usd"] - exp_spent(e),
+                                        slot_hour_usd=cfg["slot_hour_usd"], payoff_x=cfg["payoff_x"])
         if rid := exp_launch(e, "design", cfg["design_model"], cfg["design_usd"], brief, issue):
             save(stage="designing", issue=issue, design_run=rid, add_run=rid)
             did.append(f"experiment {e['id']} design ({cfg['design_model']})")
@@ -2675,7 +2709,7 @@ def experiment_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
         except (OSError, ValueError):
             return retry_or_drop("proposed", f"design run {rs}: no readable design.json")
         room = cfg["budget_usd"] - exp_spent(e) - cfg["score_usd"] - 2 * cfg["log_usd"]
-        if probs := exp_design_problems(design, room):
+        if probs := exp_design_problems(design, room, cfg):
             return retry_or_drop("proposed", "design refused: " + "; ".join(probs))
         q = exp_owner_question(e, design)
         save(stage="designed", mode=design["mode"], question_file=str(q))

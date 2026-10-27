@@ -3733,7 +3733,8 @@ def exp_world(churn, monkeypatch):
 
 GOOD_DESIGN = {"mode": "replay", "arms": {"db": "query the self-scan DB first", "grep": "grep and Read only"},
                "tasks": [{"issue": 77, "base": "aaa", "reference": "bbb", "brief": "Scans include untracked files"}],
-               "replicates": 2, "per_run_usd": 3.0, "rubric": ["R1 reference tests pass", "R2 gates green"]}
+               "replicates": 2, "per_run_usd": 3.0, "rubric": ["R1 reference tests pass", "R2 gates green"],
+               "value": {"payoff_usd_per_month": 100, "slot_hours": 4, "basis": "10 PRs a month x $10 saved"}}
 
 
 def test_experiment_walks_every_stage_blind_logged_and_cleaned(churn, exp_world, capsys):
@@ -3805,6 +3806,14 @@ def test_experiment_design_checks_refuse_then_drop(churn, exp_world):
     churn.experiment_lane(green, {})  # redesign
     assert "dropped" in churn.experiment_lane(green, {})[0]  # second bad design: max_attempts 2
     assert churn.active_experiment(churn.load_state()) is None
+
+
+def test_experiment_design_worth_less_than_its_cost_is_refused(churn):
+    # E1 (2026-10-27): ~12 slot-hours of arms for cents per conflict. The owner: cost versus reward first.
+    e1 = {**GOOD_DESIGN, "value": {"payoff_usd_per_month": 2, "slot_hours": 12, "basis": "7 conflicts/wk x 28% x $0.2"}}
+    assert any("not worth running" in p for p in churn.exp_design_problems(e1, 40))
+    assert any("value missing" in p for p in churn.exp_design_problems({**GOOD_DESIGN, "value": None}, 40))
+    assert not churn.exp_design_problems(GOOD_DESIGN, 40)
 
 
 def test_experiment_live_mode_keeps_the_best_arm_and_closes_the_rest(churn, exp_world, monkeypatch):
