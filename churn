@@ -740,7 +740,9 @@ NO_CLASS_TABLE = "the PR body is missing or has no class table / Sibling gaps (g
 FILE_CAP = int(_CFG.get("file_cap", 5))
 REGENERATED_RE = re.compile(r"golden_master|refraction_snapshot|scan_output|/evidence/|evidence_report|det_sweep_coverage"
                             r"|provenance|ledger|baseline|_scores|survivors|infeasible_outcomes|register/|\.lock$"
-                            r"|(^|/)pins?\.|\.test_durations$|\.(json|jsonl|txt|csv|dat|snap|svg)$")
+                            r"|(^|/)pins?\.|\.test_durations$|\.(json|jsonl|txt|csv|dat|snap|svg)(\.gz)?$")
+# (\.gz)? (2026-10-27): DOOM-rosetta re-blesses write tests/golden_doom_rosetta/<port>.json.gz; read as hand-written,
+# they sent pure re-bless PRs back over the 5-file rule (#6751 with 7, #6799 with 6: ~1.5 h of worker re-runs)
 FILE_CAP_EXCEPTION = re.compile(r"(?im)^[*_ ]*File-cap exception[*_ ]*:\s*\S")
 
 
