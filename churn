@@ -5134,7 +5134,9 @@ def focus_alerts(state: dict, snap: dict | None, launched: list[str]) -> list[st
     live = claude_slot_holders(state)
     free = len(live) < int(state.get("max_workers", 1))
     held = (t := parse_iso(state.get("paused_until"))) and t > now()  # a limit / offline pause: not starvation
-    focus_live = [r for r in live if in_focus(state, r)]
+    # an exempt-lane run (an experiment arm, the retro) is not focus work: 2026-10-27 an E1 arm kept the ladder from
+    # ever starving, so two slots sat idle with nothing queued
+    focus_live = [r for r in live if in_focus(state, r) and r.get("lane") not in FOCUS_EXEMPT_LANES]
     # focus work that exists but waits on CI admission, the box or the pace is not starvation: filler would wait too
     ready = focus_pick(state, snap, "calm", True)[1] is not None
     starved = free and not launched and not focus_live and not ready and not state.get("workers_paused") and not held

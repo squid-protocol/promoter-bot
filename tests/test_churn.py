@@ -4153,6 +4153,15 @@ def test_starvation_asks_the_tick_first_and_pages_only_if_it_stays_unresolved(ch
     assert [k for k, _ in pages] == ["focus-starved"]  # unresolved for STARVE_PAGE passes: now the owner
 
 
+def test_an_experiment_arm_does_not_hide_starvation(churn, monkeypatch):
+    monkeypatch.setattr(churn, "pid_alive", lambda pid: True)
+    put(churn, focus=_focus(churn, monkeypatch), max_workers=3,
+        running=[{"run_id": "3189-20261027T1837Z", "issue": 3189, "lane": "experiment", "pid": 1}])
+    for _ in range(2):
+        churn.focus_alerts(churn.load_state(), {}, [])
+    assert churn.load_state()["focus"]["idle_passes"] == 2 and churn.focus_need(churn.load_state(), {})
+
+
 def test_focus_work_held_by_ci_or_the_box_is_not_starvation(churn, monkeypatch):
     put(churn, focus=_focus(churn, monkeypatch), max_workers=1, queue=[item(6072, task="[ladder:zecs] slice")])
     for _ in range(3):
