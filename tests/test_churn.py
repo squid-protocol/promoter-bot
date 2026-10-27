@@ -4138,6 +4138,32 @@ def test_only_the_owner_edits_the_focus(churn, monkeypatch, capsys):
     assert not churn.focus_on(churn.load_state())
 
 
+def test_a_wait_on_a_worker_ends_with_the_worker_and_focus_timers_are_capped(churn, monkeypatch):
+    # 2026-10-27: ticks held ladder items 180 min "until worker X reports"; X ended in 20 and the slots sat empty
+    f = _focus(churn, monkeypatch)
+    _run(churn, "6072-20261027T1901Z", issue=6072, branch="churn/6072-x", task="[ladder:x] slice")
+    put(churn, focus=f, queue=[item(6072, task="[ladder:y] slice"), item(6072, task="[ladder:z] slice")])
+    churn.cmd_queue(argparse.Namespace(action="wait", index=0, run=None, minutes=180, worker=None,
+                                       note="worker 6072-20261027T1901Z is on this estate; relaunch after its report"))
+    q = churn.load_state()["queue"]
+    assert q[0]["wait_worker"] == "6072-20261027T1901Z" and "wait_until" not in q[0]
+    assert churn.waiting(q[0]) == "worker 6072-20261027T1901Z"
+    meta = churn.RUNS / "6072-20261027T1901Z" / "meta.json"
+    meta.write_text(json.dumps({**json.loads(meta.read_text()), "finished": churn.iso(churn.now())}))
+    assert churn.waiting(q[0]) is None  # the run ended: released at once
+    churn.cmd_queue(argparse.Namespace(action="wait", index=1, run=None, minutes=120, worker=None,
+                                       note="last two workers hit blocks"))
+    until = churn.parse_iso(churn.load_state()["queue"][1]["wait_until"])
+    assert until - churn.now() <= churn.dt.timedelta(minutes=churn.FOCUS_WAIT_MAX_MIN)
+
+
+def test_a_skipped_estate_gets_no_ladder_slice(churn, monkeypatch):
+    f = _focus(churn, monkeypatch, ladder={"anchor": 6072, "skip": ["cics-crucible"]})
+    st = {"queue": [], "running": [], "prs": [], "focus": f, "goal": {"measure": {"t": "2026-10-25T07:33Z", "below": {
+        "zecs": [["ZECS001", "L2"]], "cics-crucible": [["CRUC001", "L1"]]}}}}
+    assert [x["task"].split("]")[0] for x in churn.ladder_items(st, {})] == ["[ladder:zecs"]
+
+
 def test_the_ladder_generator_slices_each_estate_of_the_focus_ladder(churn, monkeypatch):
     f = _focus(churn, monkeypatch, ladder={"anchor": 6072, "skip": ["CRECUST"]})
     st = {"queue": [item(5252, task="slice 3 of 3: lgapvs01/lgupvs01 fix")], "running": [], "prs": [], "focus": f,

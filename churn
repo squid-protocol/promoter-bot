@@ -221,7 +221,7 @@ LANES = ("normal", "ci", "backfill")
 # their PRs add ~nothing to the shared 20-job runner pool. Only the batched tag + gitgalaxy pin bump touches gitgalaxy CI.
 CRUCIBLE_REPOS = {"estate-crucible", "cics-crucible"}
 QUEUE_KEYS = {"issue", "model", "task", "needs_owner", "backend", "pr", "after_prs", "allow_workflows", "agy_step", "lane", "repo", "after_merge",
-              "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "scope", "promoted", "rescue",
+              "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "wait_worker", "scope", "promoted", "rescue",
               "regraft", "also_prs"}
 # Scope labels (scope:core|sweep|frontier|infra) are kept on items for the scorecard; they no longer order or hold work.
 # Tiers, promotion and scope ranks were retired 2026-10-25: the owner's focus decides what launches.
@@ -3293,6 +3293,9 @@ WAIT_MAX_H = 6  # a wait never strands an item: after this the gate offers it ag
 _RUN_DONE: dict[int, bool] = {}
 
 
+FOCUS_WAIT_MAX_MIN = 30
+
+
 def waiting(q: dict) -> str | None:
     """Why item q is still waiting (`churn queue wait`), or None. 2026-10-16: the gate named #5133's fix every tick
     while it waited on a main ground-truth run; each Sonnet tick declined it again (~$0.13 a time). A tick now records
@@ -3303,6 +3306,8 @@ def waiting(q: dict) -> str | None:
     until = parse_iso(q.get("wait_until"))
     if until and now() < until:
         return f"until {iso(until)}"
+    if (wk := q.get("wait_worker")) and not _run_meta(str(wk)).get("finished") and (RUNS / str(wk)).is_dir():
+        return f"worker {wk}"
     rid = q.get("wait_run")
     if rid:
         if rid not in _RUN_DONE:
@@ -3362,6 +3367,8 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
         elif n not in have:
             kind = "merged" if v.get("merged") else "closed"
             state.setdefault("followups", []).append({"pr": n, "kind": kind, "issue": issue, "since": iso(now())})
+            if kind == "merged" and issue and int(issue) == int((focus_cfg(state).get("ladder") or {}).get("anchor") or 0):
+                state.setdefault("goal", {})["measure_due"] = True  # a ladder PR moved the levels: slice from fresh numbers
             notes.append(f"{kind} #{n} -> followup" + (f" (issue #{issue})" if issue else ""))
     state["prs"] = keep
     return notes
@@ -6312,8 +6319,11 @@ TICK_CLI = """NEVER edit churn-state.json yourself (not with Edit/Write, python 
    without it an open core issue gets a generic next slice)
 - `churn pr flake <n> --head <sha> --note ...`  after you rerun a red that is a CI flake: the gate queues no fix for
    that PR until its head changes or 2 h pass (then drop the PR-fix item with `churn queue rm`)
-- `churn queue wait --index <k> --run <actions run id> | --minutes <m> --note ...`  when the gate names a launch you
-   decline because it waits on something (a CI run, a time): record it ONCE; the gate skips the item until then (max 6 h)
+- `churn queue wait --index <k> --worker <churn run id> | --run <actions run id> | --minutes <m> --note ...`  when the
+   gate names a launch you decline because it waits on something: record it ONCE. Waiting on a live worker (same estate,
+   same files) is `--worker <its run id>`: it releases the moment that run ends, never a guessed timer. A focus item's
+   bare `--minutes` is capped at 30. Hold only the item that collides: a block in one estate never holds another
+   estate's slice (owner 2026-10-27: "all we do is stop work")
 - `churn queue add --issue <i> --task ... [--front] [--model m] [--backend agy] [--pr <n>] [--after-pr <n> ...]
    [--allow-workflows] [--agy-step <s>] [--needs-owner]`;  `churn queue park --index <k> --note ...`;  `churn queue rm --index <k>`
 - `churn agy result --issue <i> --step <s> --verdict PASS|FIXED|REJECT [--pr <n>] [--denials k] [--notes ...]`
@@ -6508,7 +6518,9 @@ def goal_tick(state: dict, force: bool = False) -> list[str]:
     programs not asked about in the last day. Returns log notes."""
     g = goal_cfg(state)
     last = parse_iso((g.get("measure") or {}).get("t"))
-    if not GOAL_REPORTS or (not force and last and now() - last < dt.timedelta(hours=float(g["measure_every_h"]))):
+    due = (state.get("goal") or {}).get("measure_due")
+    if not GOAL_REPORTS or (not force and not due and last and
+                            now() - last < dt.timedelta(hours=float(g["measure_every_h"]))):
         return []
     m = goal_measure(goal_reports(), open_issues())
     snaps = H / "progress-snapshots"
@@ -6517,6 +6529,7 @@ def goal_tick(state: dict, force: bool = False) -> list[str]:
     with edit_state() as st:
         gs = st.setdefault("goal", {})
         gs["measure"] = m
+        gs.pop("measure_due", None)
         asked = {k: t for k, t in (gs.get("asked") or {}).items()
                  if (ts := parse_iso(t)) and now() - ts < dt.timedelta(days=1)}
         gs["asked"] = asked
@@ -6571,6 +6584,8 @@ def ladder_items(state: dict, snap: dict | None) -> list[dict]:
     last = dict(focus_cfg(state).get("ladder_queued") or {})
     out = []
     for estate, progs in sorted((m.get("below") or {}).items()):
+        if estate.lower() in skip:
+            continue  # a whole estate dropped from the ladder (owner 2026-10-27: cics-crucible)
         tag = LADDER_TAG.format(estate)
         if tag in ours or ((t := parse_iso(last.get(estate))) and (not measured or measured <= t)):
             continue  # in hand, or this measure was already sliced: wait for a newer one
@@ -7954,17 +7969,31 @@ def cmd_queue(a) -> int:
             q[a.index].update(needs_owner=True, note=a.note[:300])
             log(f"parked #{q[a.index]['issue']} for the owner: {a.note[:120]}")
         elif a.action == "wait":
-            if a.index is None or not 0 <= a.index < len(q) or not (a.run or a.minutes) or not a.note:
-                raise SystemExit("queue wait needs --index N, --run RUN_ID and/or --minutes M, and --note")
+            a.worker = getattr(a, "worker", None)
+            if a.index is None or not 0 <= a.index < len(q) or not (a.run or a.minutes or a.worker) or not a.note:
+                raise SystemExit("queue wait needs --index N, --worker CHURN_RUN, --run RUN_ID and/or --minutes M, "
+                                 "and --note")
             x = q[a.index]
+            # 2026-10-27 (owner: "all we do is stop work"): ticks wrote "wait for worker X" as a 180-min timer; X ended in
+            # 20 min and the ladder slot sat empty for hours. A named churn run is now waited on until it ends, and a
+            # focus item's bare timer is capped: a hold on focus work must name what it waits for.
+            if not a.worker and (m := re.search(r"\b(\d+-\d{8}T\d{4}Z)\b", a.note)) and (RUNS / m.group(1)).is_dir():
+                a.worker = m.group(1)
+            minutes = a.minutes
+            if minutes and in_focus(state, x) and not (a.worker or a.run) and minutes > FOCUS_WAIT_MAX_MIN:
+                minutes = FOCUS_WAIT_MAX_MIN
             x.update(wait_set=iso(now()), note=a.note[:300])
-            x.pop("wait_run", None)
-            x.pop("wait_until", None)
+            for k in ("wait_run", "wait_until", "wait_worker"):
+                x.pop(k, None)
+            if a.worker:
+                x["wait_worker"] = a.worker
+                minutes = None  # the run's end releases it, not a guess
             if a.run:
                 x["wait_run"] = a.run
-            if a.minutes:
-                x["wait_until"] = iso(now() + dt.timedelta(minutes=a.minutes))
-            log(f"#{x['issue']} waits" + (f" for run {a.run}" if a.run else "") + (f" {a.minutes} min" if a.minutes else "")
+            if minutes:
+                x["wait_until"] = iso(now() + dt.timedelta(minutes=minutes))
+            log(f"#{x['issue']} waits" + (f" for worker {a.worker}" if a.worker else "")
+                + (f" for run {a.run}" if a.run else "") + (f" {minutes} min" if minutes else "")
                 + f" (the gate offers it again when that is over, at most {WAIT_MAX_H} h): {a.note[:120]}")
         elif a.action == "top":
             if a.index is None or not 0 <= a.index < len(q):
@@ -8433,7 +8462,9 @@ def main() -> int:
     qp.add_argument("action", nargs="?", default="list", choices=["list", "add", "rm", "top", "route", "park", "lane",
                                                                                 "wait"])
     qp.add_argument("--run", type=int, help="wait: hold the item until this GitHub Actions run completes")
-    qp.add_argument("--minutes", type=int, help="wait: hold the item this long")
+    qp.add_argument("--minutes", type=int, help="wait: hold the item this long (focus items: at most "
+                    "FOCUS_WAIT_MAX_MIN unless it also names --worker/--run)")
+    qp.add_argument("--worker", help="wait: hold the item until this churn run (RUN_ID) finishes")
     qp.add_argument("--backend", choices=["claude", "agy"], help="agy = run by the agy lane (own quota), Sonnet-checked")
     qp.add_argument("--issue", type=int)
     qp.add_argument("--model", default="sonnet", choices=["haiku", "sonnet", "opus"])
