@@ -4248,6 +4248,12 @@ def test_the_launch_mix_tells_filler_from_leaks(churn, monkeypatch):
 
 
 # ---------------------------------------------------------------- PR quality by size and fix causes (2026-10-26)
+def test_gzipped_goldens_are_regenerated_not_hand_written(churn):
+    """2026-10-27: a DOOM-rosetta re-bless (6 port goldens, .json.gz) was sent back four times over the 5-file rule."""
+    files = [f"tests/golden_doom_rosetta/{p}.json.gz" for p in ("doomsday", "gzdoom", "odamex", "eternity", "srb2", "doom3-bfg")]
+    assert churn.hand_written(files + ["gitgalaxy/core/calls_out.py", "data/raw.gz"]) == ["gitgalaxy/core/calls_out.py", "data/raw.gz"]
+
+
 def test_quality_counts_merged_prs_by_size_first_pass_and_the_days_fix_causes(churn, tmp_path):
     runs = tmp_path / "runs"
 
