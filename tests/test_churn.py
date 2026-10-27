@@ -3758,7 +3758,12 @@ def test_experiment_walks_every_stage_blind_logged_and_cleaned(churn, exp_world,
     assert "4 arm runs" in churn.experiment_lane(green, {})[0]
     labels = json.loads((d / ".labels.json").read_text())
     assert sorted(labels.values()) == ["db", "db", "grep", "grep"]
-    for _ in range(4):  # replay: one run a tick, each in a worktree at the task's base
+    assert churn.experiment_lane(green, {})[0].startswith("experiment E1 run ")  # replay: one run a tick
+    real_state = churn.exp_run_state
+    churn.exp_run_state = lambda rid: "live"
+    assert churn.experiment_lane(green, {}) == []  # max_live 1: no second arm while one runs (owner 2026-10-27)
+    churn.exp_run_state = real_state
+    for _ in range(3):  # each in a worktree at the task's base
         assert churn.experiment_lane(green, {})[0].startswith("experiment E1 run ")
     arm_briefs = [c["brief"] for c in calls if c["step"].startswith("run ")]
     assert all("open NO PR" in x and "[c:-]" in x and "pr_gates.py` (not --fast)" in x for x in arm_briefs)

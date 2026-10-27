@@ -2319,7 +2319,7 @@ def retro_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
 # spare capacity only. Tuning (CI knobs, caps) is not an experiment: dashboard markers, no lifecycle.
 EXP_DEFAULT = {"enabled": True, "budget_usd": 40.0, "per_30d": 1, "design_model": "opus", "design_usd": 8.0,
                "arm_model": "sonnet", "score_model": "sonnet", "score_usd": 5.0, "log_model": "sonnet", "log_usd": 3.0,
-               "max_attempts": 2}
+               "max_attempts": 2, "max_live": 1}
 EXP_ACTIVE = ("proposed", "designing", "designed", "approved", "registering", "running", "scoring", "logging")
 TC_REPO = "temporal-crucible"
 EXP_LABEL = "experiment"
@@ -2713,8 +2713,9 @@ def experiment_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
                 did.append(f"experiment {e['id']}: budget reached at ${spent}, {len(todo)} runs skipped")
         pending = [a for a in arms if not a.get("run") and not a.get("status")]
         live = [a for a in arms if a.get("run") and exp_run_state(a["run"]) == "live"]
-        if pending and not live or (pending and design["mode"] == "replay"):
-            # live mode launches one task-replicate's arms together on the same main; replay runs them one at a time
+        if pending and not live or (pending and design["mode"] == "replay" and len(live) < int(cfg["max_live"])):
+            # live mode launches one task-replicate's arms together on the same main; replay runs them one at a time,
+            # at most max_live at once (owner 2026-10-27: E1 arms held 2 of 3 slots while ladder work queued)
             group = ([a for a in pending if (a["task_index"], a["rep"]) == (pending[0]["task_index"], pending[0]["rep"])]
                      if design["mode"] == "live" else pending[:1])
             if exp_capacity(state, b, len(group)):
