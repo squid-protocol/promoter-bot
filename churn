@@ -1723,7 +1723,8 @@ def cmd_worker(a) -> int:
         issue, model, task = a.issue, a.model, a.task or ""
         if getattr(a, "off_focus", False):
             owner_only("churn worker --off-focus")
-        elif not getattr(a, "check_of", None) and not filler_branch(getattr(a, "branch", None)) and not in_focus(
+        elif not getattr(a, "check_of", None) and not filler_branch(getattr(a, "branch", None)) \
+                and not main_red_branch(getattr(a, "branch", None)) and not in_focus(
                 cur := load_state(), {"issue": issue, "task": task, "lane": getattr(a, "lane", None)}):
             f = focus_cfg(cur)
             if not filler_open(cur):
@@ -5026,6 +5027,8 @@ def in_focus(state: dict, x: dict) -> bool:
         return True
     if x.get("filler_pr"):
         return True  # fixing a filler PR finishes work in hand; a PR left to rot is the stale-PR problem again
+    if x.get("main_red_pr"):
+        return True  # 2026-10-27: #6785's fix item sat "off focus" while main stayed red
     return x.get("issue") is not None and int(x["issue"]) in set(focus_issues(state))
 
 
@@ -5035,6 +5038,14 @@ def filler_branch(branch: str | None) -> bool:
         return False
     return any(mt.get("filler") and mt.get("branch") == branch for d in RUNS.glob(f"{m.group(1)}-*")
                if (mt := _run_meta(d.name)))
+
+
+def main_red_branch(branch: str | None) -> bool:
+    """A red-main run opened this branch, so its PR's fixes are red-main work too (the fix item's task is "Fix PR")."""
+    if not branch or not (m := re.match(r"churn/(\d+)-", branch)):
+        return False
+    return any(str(mt.get("task", "")).startswith("Main is red:") and mt.get("branch") == branch
+               for d in RUNS.glob(f"{m.group(1)}-*") if (mt := _run_meta(d.name)))
 
 
 def filler_window(state: dict) -> dict:
@@ -5078,7 +5089,9 @@ def focus_share(state: dict, hours: float = 24) -> dict:
         if not t or t < cut or m.get("check_of") or m.get("precheck_of") or m.get("resume_of"):
             continue
         out["total"] += 1
-        kind = ("focus" if in_focus(state, {"issue": m.get("issue"), "task": m.get("task"), "lane": m.get("lane")})
+        # experiment runs record no lane, only an exp/ branch (2026-10-27: 13 E1 runs paged as "drift")
+        lane = m.get("lane") or ("experiment" if str(m.get("branch") or "").startswith("exp/") else None)
+        kind = ("focus" if in_focus(state, {"issue": m.get("issue"), "task": m.get("task"), "lane": lane})
                 else "filler" if m.get("filler") else "leak")
         out[kind] += 1
     return out
@@ -5893,6 +5906,7 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
         state.setdefault("queue", []).insert(0, {"issue": issue, "pr": int(n), "model": "opus" if rescue else "sonnet",
                                                  "task": task, "needs_owner": False, "auto": "pr-fix",
                                                  **({"filler_pr": True} if filler_branch(v.get("branch")) else {}),
+                                                 **({"main_red_pr": True} if main_red_branch(v.get("branch")) else {}),
                                                  **({"rescue": True} if rescue else {}),
                                                  **({"head": v["head"]} if v.get("head") else {})})
         added.append(f"#{n}")

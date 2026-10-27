@@ -4242,9 +4242,27 @@ def test_the_launch_mix_tells_filler_from_leaks(churn, monkeypatch):
     keys = [k for k, _ in pages]
     assert "focus-drift" in keys and "focus-filler-share" in keys
     assert any("1 of 5 launches" in m for k, m in pages if k == "focus-drift")
+    _run(churn, "3798-9", issue=3798, started=started, task="experiment E1 run x", branch="exp/E1-x")
+    assert churn.focus_share(churn.load_state()) == {"focus": 2, "filler": 3, "leak": 1, "total": 6}  # exempt lane
     put(churn)  # no focus at all: page that, launch nothing
     churn.focus_alerts(churn.load_state(), {}, [])
     assert pages[-1][0] == "focus-none"
+
+
+def test_a_red_main_prs_fix_items_run_under_the_focus(churn, monkeypatch):
+    st = {"focus": _focus(churn, monkeypatch)}
+    _run(churn, "6782-1", issue=6782, task="Main is red: main is red: Det Sweep (#6782). Read", branch="churn/6782-1")
+    _run(churn, "3799-1", issue=3799, task="graph ledger", branch="churn/3799-1")
+    assert churn.main_red_branch("churn/6782-1") and not churn.main_red_branch("churn/3799-1")
+    assert churn.in_focus(st, {"issue": 6782, "pr": 6785, "main_red_pr": True})
+    assert not churn.in_focus(st, {"issue": 6782, "pr": 6785})
+    monkeypatch.setattr(churn, "spawn_detached", lambda *a, **k: 4242)
+    monkeypatch.setattr(churn, "crucible_repo_of", lambda i: None)
+    put(churn, focus=st["focus"], max_workers=1)
+    ns = argparse.Namespace(resume_run=None, issue=6782, model="sonnet", task="Fix PR #6785 (churn/6782-1): red",
+                            brief="b", brief_file=None, worktree=str(churn.RUNS), branch="churn/6782-1", repo=None,
+                            force=False, lane=None, plan=False, check_of=None)
+    assert churn.cmd_worker(ns) == 0  # the launch check agrees with the queue: not refused as off the focus
 
 
 # ---------------------------------------------------------------- PR quality by size and fix causes (2026-10-26)
