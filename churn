@@ -221,7 +221,7 @@ LANES = ("normal", "ci", "backfill")
 # their PRs add ~nothing to the shared 20-job runner pool. Only the batched tag + gitgalaxy pin bump touches gitgalaxy CI.
 CRUCIBLE_REPOS = {"estate-crucible", "cics-crucible"}
 QUEUE_KEYS = {"issue", "model", "task", "needs_owner", "backend", "pr", "after_prs", "allow_workflows", "agy_step", "lane", "repo", "after_merge",
-              "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "scope", "promoted", "rescue",
+              "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "wait_worker", "scope", "promoted", "rescue",
               "regraft", "also_prs"}
 # Scope labels (scope:core|sweep|frontier|infra) are kept on items for the scorecard; they no longer order or hold work.
 # Tiers, promotion and scope ranks were retired 2026-10-25: the owner's focus decides what launches.
@@ -1750,7 +1750,9 @@ def cmd_worker(a) -> int:
         issue, model, task = a.issue, a.model, a.task or ""
         if getattr(a, "off_focus", False):
             owner_only("churn worker --off-focus")
-        elif not getattr(a, "check_of", None) and not filler_branch(getattr(a, "branch", None)) and not in_focus(
+        elif not getattr(a, "check_of", None) and not filler_branch(getattr(a, "branch", None)) \
+                and not main_red_branch(getattr(a, "branch", None) or (getattr(a, "worktree", None) and run(
+                    ["git", "-C", str(a.worktree), "branch", "--show-current"]).stdout.strip())) and not in_focus(
                 cur := load_state(), {"issue": issue, "task": task, "lane": getattr(a, "lane", None)}):
             f = focus_cfg(cur)
             if not filler_open(cur):
@@ -2342,9 +2344,9 @@ def retro_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
 #   -> running (arms) -> scoring (blind) -> logging (temporal-crucible result PR) -> closed (cleanup done) | dropped
 # Owner defaults 2026-10-24: Opus designs every experiment, one owner OK per design, $40 an experiment, one a month,
 # spare capacity only. Tuning (CI knobs, caps) is not an experiment: dashboard markers, no lifecycle.
-EXP_DEFAULT = {"enabled": True, "budget_usd": 40.0, "per_30d": 1, "design_model": "opus", "design_usd": 8.0,
+EXP_DEFAULT = {"enabled": True, "budget_usd": 40.0, "per_30d": 1, "design_model": "opus", "design_usd": 8.0, "slot_hour_usd": 10.0, "payoff_x": 3.0,
                "arm_model": "sonnet", "score_model": "sonnet", "score_usd": 5.0, "log_model": "sonnet", "log_usd": 3.0,
-               "max_attempts": 2}
+               "max_attempts": 2, "max_live": 1}
 EXP_ACTIVE = ("proposed", "designing", "designed", "approved", "registering", "running", "scoring", "logging")
 TC_REPO = "temporal-crucible"
 EXP_LABEL = "experiment"
@@ -2367,12 +2369,19 @@ it is what the last experiment got wrong). Then write two files and nothing else
                "reference": "<replay: the merged fix's sha>", "brief": "<the task as the arm sees it>"}}, ...],
     "replicates": <runs per arm per task, at least 2>,
     "per_run_usd": <cap for one arm run>,
+    "value": {{"payoff_usd_per_month": <best case: what the change saves or earns a month if the hypothesis wins>,
+              "slot_hours": <worker slot-hours the arms hold, all runs together>,
+              "basis": "<one sentence: the counts and rates the payoff comes from>"}},
     "rubric": ["R1 ...", "R2 ..."]}}
 
 Rules: replay is the default (a merged fix is the ground truth; arms start at its parent and open no PR). Use live only
 when the question needs open work, and say why in design.md. The task brief must not leak the fix (no PR numbers,
 commit messages or file names the issue itself does not name). Total cost (arms x tasks x replicates x per_run_usd)
-must fit {room} USD; churn refuses a design that does not fit. Report the two paths when done.
+must fit {room} USD; churn refuses a design that does not fit. Cost versus reward (owner 2026-10-27, after E1 held a
+slot most of a day for a payoff its own design capped at cents per conflict): an arm's slot-hour is ladder/focus work not
+done, priced at {slot_hour_usd} USD. Six months of the best-case payoff must be at least {payoff_x}x the cost
+(arm USD + slot_hours x {slot_hour_usd}); churn refuses a design under that bar. If the honest numbers miss it, say so in
+design.md and write design.json anyway: a refused design is the right outcome. Report the two paths when done.
 """
 EXP_REGISTER_BRIEF = """# Register experiment {id} (Part of gitgalaxy#{issue})
 
@@ -2482,9 +2491,26 @@ def exp_run_state(rid: str | None) -> str:
     return str(meta.get("status")) if meta.get("finished") else "live"
 
 
-def exp_design_problems(d: dict, room: float) -> list[str]:
+def exp_value(d: dict, cfg: dict) -> tuple[float, float] | None:
+    """(six-month best-case payoff, cost incl. displaced slot-hours) in USD, or None if design.json states no value."""
+    v = d.get("value") or {}
+    try:
+        pay, hrs = float(v["payoff_usd_per_month"]), float(v["slot_hours"])
+        usd = len(d.get("arms") or {}) * len(d.get("tasks") or []) * int(d.get("replicates") or 0) * float(d["per_run_usd"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return 6 * pay, usd + cfg["score_usd"] + cfg["log_usd"] + hrs * float(cfg["slot_hour_usd"])
+
+
+def exp_design_problems(d: dict, room: float, cfg: dict | None = None) -> list[str]:
     """What makes design.json unrunnable (churn refuses it with no model)."""
     out = []
+    cfg = {**EXP_DEFAULT, **(cfg or {})}
+    if (val := exp_value(d, cfg)) is None:
+        out.append("value missing (payoff_usd_per_month, slot_hours, basis)")
+    elif val[0] < float(cfg["payoff_x"]) * val[1]:
+        out.append(f"not worth running: six months of best-case payoff ${val[0]:.0f} is under {cfg['payoff_x']:g}x the "
+                   f"cost ${val[1]:.0f} (USD plus slot-hours at ${cfg['slot_hour_usd']:g})")
     if d.get("mode") not in ("replay", "live"):
         out.append("mode must be replay or live")
     arms, tasks = d.get("arms") or {}, d.get("tasks") or []
@@ -2510,6 +2536,14 @@ def exp_design_problems(d: dict, room: float) -> list[str]:
     return out
 
 
+def exp_value_line(d: dict) -> str:
+    cfg = exp_cfg(load_state())
+    pay, cost = exp_value(d, cfg) or (0.0, 0.0)
+    v = d.get("value") or {}
+    return (f"best case ${pay:.0f} over six months vs ${cost:.0f} cost ({v.get('slot_hours')} slot-hours of focus work "
+            f"displaced at ${cfg['slot_hour_usd']:g}); basis: {v.get('basis', '?')}")
+
+
 def exp_owner_question(e: dict, d: dict) -> Path:
     q = H / "owner-questions" / f"experiment-{e['id']}.md"
     q.parent.mkdir(parents=True, exist_ok=True)
@@ -2518,6 +2552,7 @@ def exp_owner_question(e: dict, d: dict) -> Path:
                  f"Context: {e['question']} (would change: {e['change']}). Design: {exp_dir(e) / 'design.md'}. "
                  f"{d['mode']} mode, {len(d['arms'])} arms ({', '.join(d['arms'])}), {len(d['tasks'])} tasks x "
                  f"{d['replicates']} replicates = {runs} runs, est ${runs * float(d['per_run_usd']):.0f} plus scoring.\n"
+                 f"Cost vs reward: {exp_value_line(d)}\n"
                  f"Facts checked: design.json passed churn's checks (arms, replicates, budget, rubric).\n"
                  f"yes: Run it -- I register it in temporal-crucible, then run the arms on spare capacity.\n"
                  f"no: Drop it -- I close the experiment and its issue.\n"
@@ -2687,7 +2722,8 @@ def experiment_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
         tpl = tc_clone() / "docs" / "_agent_experiment_template.md"
         brief = EXP_DESIGN_BRIEF.format(id=e["id"], issue=issue, question=e["question"], change=e["change"], dir=d,
                                         template=tpl, room=cfg["budget_usd"] - cfg["design_usd"] - cfg["score_usd"]
-                                        - 2 * cfg["log_usd"] - exp_spent(e))
+                                        - 2 * cfg["log_usd"] - exp_spent(e),
+                                        slot_hour_usd=cfg["slot_hour_usd"], payoff_x=cfg["payoff_x"])
         if rid := exp_launch(e, "design", cfg["design_model"], cfg["design_usd"], brief, issue):
             save(stage="designing", issue=issue, design_run=rid, add_run=rid)
             did.append(f"experiment {e['id']} design ({cfg['design_model']})")
@@ -2700,7 +2736,7 @@ def experiment_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
         except (OSError, ValueError):
             return retry_or_drop("proposed", f"design run {rs}: no readable design.json")
         room = cfg["budget_usd"] - exp_spent(e) - cfg["score_usd"] - 2 * cfg["log_usd"]
-        if probs := exp_design_problems(design, room):
+        if probs := exp_design_problems(design, room, cfg):
             return retry_or_drop("proposed", "design refused: " + "; ".join(probs))
         q = exp_owner_question(e, design)
         save(stage="designed", mode=design["mode"], question_file=str(q))
@@ -2738,8 +2774,9 @@ def experiment_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
                 did.append(f"experiment {e['id']}: budget reached at ${spent}, {len(todo)} runs skipped")
         pending = [a for a in arms if not a.get("run") and not a.get("status")]
         live = [a for a in arms if a.get("run") and exp_run_state(a["run"]) == "live"]
-        if pending and not live or (pending and design["mode"] == "replay"):
-            # live mode launches one task-replicate's arms together on the same main; replay runs them one at a time
+        if pending and not live or (pending and design["mode"] == "replay" and len(live) < int(cfg["max_live"])):
+            # live mode launches one task-replicate's arms together on the same main; replay runs them one at a time,
+            # at most max_live at once (owner 2026-10-27: E1 arms held 2 of 3 slots while ladder work queued)
             group = ([a for a in pending if (a["task_index"], a["rep"]) == (pending[0]["task_index"], pending[0]["rep"])]
                      if design["mode"] == "live" else pending[:1])
             if exp_capacity(state, b, len(group)):
@@ -3263,6 +3300,9 @@ WAIT_MAX_H = 6  # a wait never strands an item: after this the gate offers it ag
 _RUN_DONE: dict[int, bool] = {}
 
 
+FOCUS_WAIT_MAX_MIN = 30
+
+
 def waiting(q: dict) -> str | None:
     """Why item q is still waiting (`churn queue wait`), or None. 2026-10-16: the gate named #5133's fix every tick
     while it waited on a main ground-truth run; each Sonnet tick declined it again (~$0.13 a time). A tick now records
@@ -3273,6 +3313,8 @@ def waiting(q: dict) -> str | None:
     until = parse_iso(q.get("wait_until"))
     if until and now() < until:
         return f"until {iso(until)}"
+    if (wk := q.get("wait_worker")) and not _run_meta(str(wk)).get("finished") and (RUNS / str(wk)).is_dir():
+        return f"worker {wk}"
     rid = q.get("wait_run")
     if rid:
         if rid not in _RUN_DONE:
@@ -3332,6 +3374,8 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
         elif n not in have:
             kind = "merged" if v.get("merged") else "closed"
             state.setdefault("followups", []).append({"pr": n, "kind": kind, "issue": issue, "since": iso(now())})
+            if kind == "merged" and issue and int(issue) == int((focus_cfg(state).get("ladder") or {}).get("anchor") or 0):
+                state.setdefault("goal", {})["measure_due"] = True  # a ladder PR moved the levels: slice from fresh numbers
             notes.append(f"{kind} #{n} -> followup" + (f" (issue #{issue})" if issue else ""))
     state["prs"] = keep
     return notes
@@ -5053,6 +5097,8 @@ def in_focus(state: dict, x: dict) -> bool:
         return True
     if x.get("filler_pr"):
         return True  # fixing a filler PR finishes work in hand; a PR left to rot is the stale-PR problem again
+    if x.get("main_red_pr"):
+        return True  # 2026-10-27: #6785's fix item sat "off focus" while main stayed red
     return x.get("issue") is not None and int(x["issue"]) in set(focus_issues(state))
 
 
@@ -5062,6 +5108,14 @@ def filler_branch(branch: str | None) -> bool:
         return False
     return any(mt.get("filler") and mt.get("branch") == branch for d in RUNS.glob(f"{m.group(1)}-*")
                if (mt := _run_meta(d.name)))
+
+
+def main_red_branch(branch: str | None) -> bool:
+    """A red-main run opened this branch, so its PR's fixes are red-main work too (the fix item's task is "Fix PR")."""
+    if not branch or not (m := re.match(r"churn/(\d+)-", branch)):
+        return False
+    return any(str(mt.get("task", "")).startswith("Main is red:") and mt.get("branch") == branch
+               for d in RUNS.glob(f"{m.group(1)}-*") if (mt := _run_meta(d.name)))
 
 
 def filler_window(state: dict) -> dict:
@@ -5105,15 +5159,23 @@ def focus_share(state: dict, hours: float = 24) -> dict:
         if not t or t < cut or m.get("check_of") or m.get("precheck_of") or m.get("resume_of"):
             continue
         out["total"] += 1
-        kind = ("focus" if in_focus(state, {"issue": m.get("issue"), "task": m.get("task"), "lane": m.get("lane")})
+        # experiment runs record no lane, only an exp/ branch (2026-10-27: 13 E1 runs paged as "drift")
+        lane = m.get("lane") or ("experiment" if str(m.get("branch") or "").startswith("exp/") else None)
+        kind = ("focus" if in_focus(state, {"issue": m.get("issue"), "task": m.get("task"), "lane": lane})
                 else "filler" if m.get("filler") else "leak")
         out[kind] += 1
     return out
 
 
+def filler_live(state: dict, snap: dict | None) -> bool:
+    """An open filler window that has an off-focus item it can launch. 2026-10-28 04:13-08:13 a window opened over a
+    queue of owner-parked items only: nothing launched, and an open window muted starvation, so the box sat empty 4 h."""
+    return filler_open(state) and focus_pick(state, snap, "calm", False)[1] is not None
+
+
 def focus_need(state: dict, snap: dict | None) -> str | None:
     """The tick's "focus starved" need: find a trivial blocker first, open filler only if the focus is really out."""
-    if not focus_on(state) or not starving(state) or filler_open(state):
+    if not focus_on(state) or not starving(state) or filler_live(state, snap):
         return None
     f = focus_cfg(state)
     why = idle_causes(state, snap, state.get("ci_mode", "calm"))
@@ -5149,11 +5211,12 @@ def focus_alerts(state: dict, snap: dict | None, launched: list[str]) -> list[st
     # focus work that exists but waits on CI admission, the box or the pace is not starvation: filler would wait too.
     # 2026-10-28: a free slot beside live focus workers starves too. Requiring no live focus work kept nyx at 2 of 3
     # workers for hours with focus issue #6278 unqueued: the tick was never asked to queue its next step.
+    # It also covers 2026-10-27, when a live E1 experiment arm kept the ladder from ever starving.
     ready = focus_pick(state, snap, "calm", True)[1] is not None
     starved = free and not launched and not ready and not state.get("workers_paused") and not held
     with edit_state() as st:
         fs = st.setdefault("focus", {})
-        fs["idle_passes"] = int(fs.get("idle_passes", 0)) + 1 if starved and not filler_open(st) else 0
+        fs["idle_passes"] = int(fs.get("idle_passes", 0)) + 1 if starved and not filler_live(st, snap) else 0
         idle = fs["idle_passes"]
         last = parse_iso(fs.get("drift_checked"))
         drift_due = not last or now() - last >= dt.timedelta(hours=DRIFT_EVERY_H)
@@ -5921,6 +5984,7 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
         state.setdefault("queue", []).insert(0, {"issue": issue, "pr": int(n), "model": "opus" if rescue else "sonnet",
                                                  "task": task, "needs_owner": False, "auto": "pr-fix",
                                                  **({"filler_pr": True} if filler_branch(v.get("branch")) else {}),
+                                                 **({"main_red_pr": True} if main_red_branch(v.get("branch")) else {}),
                                                  **({"rescue": True} if rescue else {}),
                                                  **({"head": v["head"]} if v.get("head") else {})})
         added.append(f"#{n}")
@@ -6268,8 +6332,11 @@ TICK_CLI = """NEVER edit churn-state.json yourself (not with Edit/Write, python 
    without it an open core issue gets a generic next slice)
 - `churn pr flake <n> --head <sha> --note ...`  after you rerun a red that is a CI flake: the gate queues no fix for
    that PR until its head changes or 2 h pass (then drop the PR-fix item with `churn queue rm`)
-- `churn queue wait --index <k> --run <actions run id> | --minutes <m> --note ...`  when the gate names a launch you
-   decline because it waits on something (a CI run, a time): record it ONCE; the gate skips the item until then (max 6 h)
+- `churn queue wait --index <k> --worker <churn run id> | --run <actions run id> | --minutes <m> --note ...`  when the
+   gate names a launch you decline because it waits on something: record it ONCE. Waiting on a live worker (same estate,
+   same files) is `--worker <its run id>`: it releases the moment that run ends, never a guessed timer. A focus item's
+   bare `--minutes` is capped at 30. Hold only the item that collides: a block in one estate never holds another
+   estate's slice (owner 2026-10-27: "all we do is stop work")
 - `churn queue add --issue <i> --task ... [--front] [--model m] [--backend agy] [--pr <n>] [--after-pr <n> ...]
    [--allow-workflows] [--agy-step <s>] [--needs-owner]`;  `churn queue park --index <k> --note ...`;  `churn queue rm --index <k>`
 - `churn agy result --issue <i> --step <s> --verdict PASS|FIXED|REJECT [--pr <n>] [--denials k] [--notes ...]`
@@ -6464,7 +6531,9 @@ def goal_tick(state: dict, force: bool = False) -> list[str]:
     programs not asked about in the last day. Returns log notes."""
     g = goal_cfg(state)
     last = parse_iso((g.get("measure") or {}).get("t"))
-    if not GOAL_REPORTS or (not force and last and now() - last < dt.timedelta(hours=float(g["measure_every_h"]))):
+    due = (state.get("goal") or {}).get("measure_due")
+    if not GOAL_REPORTS or (not force and not due and last and
+                            now() - last < dt.timedelta(hours=float(g["measure_every_h"]))):
         return []
     m = goal_measure(goal_reports(), open_issues())
     snaps = H / "progress-snapshots"
@@ -6473,6 +6542,7 @@ def goal_tick(state: dict, force: bool = False) -> list[str]:
     with edit_state() as st:
         gs = st.setdefault("goal", {})
         gs["measure"] = m
+        gs.pop("measure_due", None)
         asked = {k: t for k, t in (gs.get("asked") or {}).items()
                  if (ts := parse_iso(t)) and now() - ts < dt.timedelta(days=1)}
         gs["asked"] = asked
@@ -6527,6 +6597,8 @@ def ladder_items(state: dict, snap: dict | None) -> list[dict]:
     last = dict(focus_cfg(state).get("ladder_queued") or {})
     out = []
     for estate, progs in sorted((m.get("below") or {}).items()):
+        if estate.lower() in skip:
+            continue  # a whole estate dropped from the ladder (owner 2026-10-27: cics-crucible)
         tag = LADDER_TAG.format(estate)
         if tag in ours or ((t := parse_iso(last.get(estate))) and (not measured or measured <= t)):
             continue  # in hand, or this measure was already sliced: wait for a newer one
@@ -7909,17 +7981,31 @@ def cmd_queue(a) -> int:
             q[a.index].update(needs_owner=True, note=a.note[:300])
             log(f"parked #{q[a.index]['issue']} for the owner: {a.note[:120]}")
         elif a.action == "wait":
-            if a.index is None or not 0 <= a.index < len(q) or not (a.run or a.minutes) or not a.note:
-                raise SystemExit("queue wait needs --index N, --run RUN_ID and/or --minutes M, and --note")
+            a.worker = getattr(a, "worker", None)
+            if a.index is None or not 0 <= a.index < len(q) or not (a.run or a.minutes or a.worker) or not a.note:
+                raise SystemExit("queue wait needs --index N, --worker CHURN_RUN, --run RUN_ID and/or --minutes M, "
+                                 "and --note")
             x = q[a.index]
+            # 2026-10-27 (owner: "all we do is stop work"): ticks wrote "wait for worker X" as a 180-min timer; X ended in
+            # 20 min and the ladder slot sat empty for hours. A named churn run is now waited on until it ends, and a
+            # focus item's bare timer is capped: a hold on focus work must name what it waits for.
+            if not a.worker and (m := re.search(r"\b(\d+-\d{8}T\d{4}Z)\b", a.note)) and (RUNS / m.group(1)).is_dir():
+                a.worker = m.group(1)
+            minutes = a.minutes
+            if minutes and in_focus(state, x) and not (a.worker or a.run) and minutes > FOCUS_WAIT_MAX_MIN:
+                minutes = FOCUS_WAIT_MAX_MIN
             x.update(wait_set=iso(now()), note=a.note[:300])
-            x.pop("wait_run", None)
-            x.pop("wait_until", None)
+            for k in ("wait_run", "wait_until", "wait_worker"):
+                x.pop(k, None)
+            if a.worker:
+                x["wait_worker"] = a.worker
+                minutes = None  # the run's end releases it, not a guess
             if a.run:
                 x["wait_run"] = a.run
-            if a.minutes:
-                x["wait_until"] = iso(now() + dt.timedelta(minutes=a.minutes))
-            log(f"#{x['issue']} waits" + (f" for run {a.run}" if a.run else "") + (f" {a.minutes} min" if a.minutes else "")
+            if minutes:
+                x["wait_until"] = iso(now() + dt.timedelta(minutes=minutes))
+            log(f"#{x['issue']} waits" + (f" for worker {a.worker}" if a.worker else "")
+                + (f" for run {a.run}" if a.run else "") + (f" {minutes} min" if minutes else "")
                 + f" (the gate offers it again when that is over, at most {WAIT_MAX_H} h): {a.note[:120]}")
         elif a.action == "top":
             if a.index is None or not 0 <= a.index < len(q):
@@ -8388,7 +8474,9 @@ def main() -> int:
     qp.add_argument("action", nargs="?", default="list", choices=["list", "add", "rm", "top", "route", "park", "lane",
                                                                                 "wait"])
     qp.add_argument("--run", type=int, help="wait: hold the item until this GitHub Actions run completes")
-    qp.add_argument("--minutes", type=int, help="wait: hold the item this long")
+    qp.add_argument("--minutes", type=int, help="wait: hold the item this long (focus items: at most "
+                    "FOCUS_WAIT_MAX_MIN unless it also names --worker/--run)")
+    qp.add_argument("--worker", help="wait: hold the item until this churn run (RUN_ID) finishes")
     qp.add_argument("--backend", choices=["claude", "agy"], help="agy = run by the agy lane (own quota), Sonnet-checked")
     qp.add_argument("--issue", type=int)
     qp.add_argument("--model", default="sonnet", choices=["haiku", "sonnet", "opus"])

@@ -3756,7 +3756,8 @@ def exp_world(churn, monkeypatch):
 
 GOOD_DESIGN = {"mode": "replay", "arms": {"db": "query the self-scan DB first", "grep": "grep and Read only"},
                "tasks": [{"issue": 77, "base": "aaa", "reference": "bbb", "brief": "Scans include untracked files"}],
-               "replicates": 2, "per_run_usd": 3.0, "rubric": ["R1 reference tests pass", "R2 gates green"]}
+               "replicates": 2, "per_run_usd": 3.0, "rubric": ["R1 reference tests pass", "R2 gates green"],
+               "value": {"payoff_usd_per_month": 100, "slot_hours": 4, "basis": "10 PRs a month x $10 saved"}}
 
 
 def test_experiment_walks_every_stage_blind_logged_and_cleaned(churn, exp_world, capsys):
@@ -3781,7 +3782,12 @@ def test_experiment_walks_every_stage_blind_logged_and_cleaned(churn, exp_world,
     assert "4 arm runs" in churn.experiment_lane(green, {})[0]
     labels = json.loads((d / ".labels.json").read_text())
     assert sorted(labels.values()) == ["db", "db", "grep", "grep"]
-    for _ in range(4):  # replay: one run a tick, each in a worktree at the task's base
+    assert churn.experiment_lane(green, {})[0].startswith("experiment E1 run ")  # replay: one run a tick
+    real_state = churn.exp_run_state
+    churn.exp_run_state = lambda rid: "live"
+    assert churn.experiment_lane(green, {}) == []  # max_live 1: no second arm while one runs (owner 2026-10-27)
+    churn.exp_run_state = real_state
+    for _ in range(3):  # each in a worktree at the task's base
         assert churn.experiment_lane(green, {})[0].startswith("experiment E1 run ")
     arm_briefs = [c["brief"] for c in calls if c["step"].startswith("run ")]
     assert all("open NO PR" in x and "[c:-]" in x and "pr_gates.py` (not --fast)" in x for x in arm_briefs)
@@ -3823,6 +3829,14 @@ def test_experiment_design_checks_refuse_then_drop(churn, exp_world):
     churn.experiment_lane(green, {})  # redesign
     assert "dropped" in churn.experiment_lane(green, {})[0]  # second bad design: max_attempts 2
     assert churn.active_experiment(churn.load_state()) is None
+
+
+def test_experiment_design_worth_less_than_its_cost_is_refused(churn):
+    # E1 (2026-10-27): ~12 slot-hours of arms for cents per conflict. The owner: cost versus reward first.
+    e1 = {**GOOD_DESIGN, "value": {"payoff_usd_per_month": 2, "slot_hours": 12, "basis": "7 conflicts/wk x 28% x $0.2"}}
+    assert any("not worth running" in p for p in churn.exp_design_problems(e1, 40))
+    assert any("value missing" in p for p in churn.exp_design_problems({**GOOD_DESIGN, "value": None}, 40))
+    assert not churn.exp_design_problems(GOOD_DESIGN, 40)
 
 
 def test_experiment_live_mode_keeps_the_best_arm_and_closes_the_rest(churn, exp_world, monkeypatch):
@@ -4132,6 +4146,32 @@ def test_only_the_owner_edits_the_focus(churn, monkeypatch, capsys):
     assert not churn.focus_on(churn.load_state())
 
 
+def test_a_wait_on_a_worker_ends_with_the_worker_and_focus_timers_are_capped(churn, monkeypatch):
+    # 2026-10-27: ticks held ladder items 180 min "until worker X reports"; X ended in 20 and the slots sat empty
+    f = _focus(churn, monkeypatch)
+    _run(churn, "6072-20261027T1901Z", issue=6072, branch="churn/6072-x", task="[ladder:x] slice")
+    put(churn, focus=f, queue=[item(6072, task="[ladder:y] slice"), item(6072, task="[ladder:z] slice")])
+    churn.cmd_queue(argparse.Namespace(action="wait", index=0, run=None, minutes=180, worker=None,
+                                       note="worker 6072-20261027T1901Z is on this estate; relaunch after its report"))
+    q = churn.load_state()["queue"]
+    assert q[0]["wait_worker"] == "6072-20261027T1901Z" and "wait_until" not in q[0]
+    assert churn.waiting(q[0]) == "worker 6072-20261027T1901Z"
+    meta = churn.RUNS / "6072-20261027T1901Z" / "meta.json"
+    meta.write_text(json.dumps({**json.loads(meta.read_text()), "finished": churn.iso(churn.now())}))
+    assert churn.waiting(q[0]) is None  # the run ended: released at once
+    churn.cmd_queue(argparse.Namespace(action="wait", index=1, run=None, minutes=120, worker=None,
+                                       note="last two workers hit blocks"))
+    until = churn.parse_iso(churn.load_state()["queue"][1]["wait_until"])
+    assert until - churn.now() <= churn.dt.timedelta(minutes=churn.FOCUS_WAIT_MAX_MIN)
+
+
+def test_a_skipped_estate_gets_no_ladder_slice(churn, monkeypatch):
+    f = _focus(churn, monkeypatch, ladder={"anchor": 6072, "skip": ["cics-crucible"]})
+    st = {"queue": [], "running": [], "prs": [], "focus": f, "goal": {"measure": {"t": "2026-10-25T07:33Z", "below": {
+        "zecs": [["ZECS001", "L2"]], "cics-crucible": [["CRUC001", "L1"]]}}}}
+    assert [x["task"].split("]")[0] for x in churn.ladder_items(st, {})] == ["[ladder:zecs"]
+
+
 def test_the_ladder_generator_slices_each_estate_of_the_focus_ladder(churn, monkeypatch):
     f = _focus(churn, monkeypatch, ladder={"anchor": 6072, "skip": ["CRECUST"]})
     st = {"queue": [item(5252, task="slice 3 of 3: lgapvs01/lgupvs01 fix")], "running": [], "prs": [], "focus": f,
@@ -4169,6 +4209,24 @@ def test_starvation_asks_the_tick_first_and_pages_only_if_it_stays_unresolved(ch
     for _ in range(4):
         churn.focus_alerts(churn.load_state(), {}, [])
     assert [k for k, _ in pages] == ["focus-starved"]  # unresolved for STARVE_PAGE passes: now the owner
+
+
+def test_an_experiment_arm_does_not_hide_starvation(churn, monkeypatch):
+    monkeypatch.setattr(churn, "pid_alive", lambda pid: True)
+    put(churn, focus=_focus(churn, monkeypatch), max_workers=3,
+        running=[{"run_id": "3189-20261027T1837Z", "issue": 3189, "lane": "experiment", "pid": 1}])
+    for _ in range(2):
+        churn.focus_alerts(churn.load_state(), {}, [])
+    assert churn.load_state()["focus"]["idle_passes"] == 2 and churn.focus_need(churn.load_state(), {})
+
+
+def test_an_empty_filler_window_does_not_mute_starvation(churn, monkeypatch):
+    f = _focus(churn, monkeypatch, filler={"until": churn.iso(churn.now() + churn.dt.timedelta(hours=4)), "launched": 0,
+                                           "max": 4})
+    put(churn, focus=f, max_workers=1, queue=[item(4125, needs_owner=True)])  # 2026-10-28: owner-parked items only
+    for _ in range(2):
+        churn.focus_alerts(churn.load_state(), {}, [])
+    assert churn.load_state()["focus"]["idle_passes"] == 2 and churn.focus_need(churn.load_state(), {})
 
 
 def test_a_free_slot_beside_live_focus_workers_still_starves(churn, monkeypatch):
@@ -4211,6 +4269,12 @@ def test_the_tick_opens_filler_only_while_the_focus_starves(churn, monkeypatch):
     assert w["by"] == "tick" and w["max"] == churn.FILLER_MAX and pages == ["focus-filler"]  # the owner hears why
     assert churn.parse_iso(w["until"]) <= churn.now() + churn.dt.timedelta(hours=churn.FILLER_HOURS_MAX, minutes=1)
     assert churn.filler_open(churn.load_state()) and churn.focus_need(churn.load_state(), {}) is None
+    with churn.edit_state() as st:
+        st["focus"]["idle_passes"] = churn.STARVE_PASSES  # the window opened, nothing launched: starving again
+    assert churn.focus_need(churn.load_state(), {})  # an empty window does not answer it
+    with churn.edit_state() as st:
+        st["queue"] = [item(3799)]
+    assert churn.focus_need(churn.load_state(), {}) is None  # a window with work to launch: starvation answered
     monkeypatch.delenv("CHURN_RUN")
     churn.cmd_focus(_filler_ns(args=["off"]))
     assert not churn.filler_open(churn.load_state())
@@ -4279,9 +4343,27 @@ def test_the_launch_mix_tells_filler_from_leaks(churn, monkeypatch):
     keys = [k for k, _ in pages]
     assert "focus-drift" in keys and "focus-filler-share" in keys
     assert any("1 of 5 launches" in m for k, m in pages if k == "focus-drift")
+    _run(churn, "3798-9", issue=3798, started=started, task="experiment E1 run x", branch="exp/E1-x")
+    assert churn.focus_share(churn.load_state()) == {"focus": 2, "filler": 3, "leak": 1, "total": 6}  # exempt lane
     put(churn)  # no focus at all: page that, launch nothing
     churn.focus_alerts(churn.load_state(), {}, [])
     assert pages[-1][0] == "focus-none"
+
+
+def test_a_red_main_prs_fix_items_run_under_the_focus(churn, monkeypatch):
+    st = {"focus": _focus(churn, monkeypatch)}
+    _run(churn, "6782-1", issue=6782, task="Main is red: main is red: Det Sweep (#6782). Read", branch="churn/6782-1")
+    _run(churn, "3799-1", issue=3799, task="graph ledger", branch="churn/3799-1")
+    assert churn.main_red_branch("churn/6782-1") and not churn.main_red_branch("churn/3799-1")
+    assert churn.in_focus(st, {"issue": 6782, "pr": 6785, "main_red_pr": True})
+    assert not churn.in_focus(st, {"issue": 6782, "pr": 6785})
+    monkeypatch.setattr(churn, "spawn_detached", lambda *a, **k: 4242)
+    monkeypatch.setattr(churn, "crucible_repo_of", lambda i: None)
+    put(churn, focus=st["focus"], max_workers=1)
+    ns = argparse.Namespace(resume_run=None, issue=6782, model="sonnet", task="Fix PR #6785 (churn/6782-1): red",
+                            brief="b", brief_file=None, worktree=str(churn.RUNS), branch="churn/6782-1", repo=None,
+                            force=False, lane=None, plan=False, check_of=None)
+    assert churn.cmd_worker(ns) == 0  # the launch check agrees with the queue: not refused as off the focus
 
 
 # ---------------------------------------------------------------- PR quality by size and fix causes (2026-10-26)
