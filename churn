@@ -1246,7 +1246,13 @@ def limit_reset(text: str) -> dt.datetime | None:
     Oct 21, 9pm", "resets Monday 9am": the weekly limit) -> that day."""
     if not re.search(r"limit", text, re.I):
         return None
-    local = dt.datetime.now().astimezone()
+    # Wall-clock arithmetic stays naive and takes its UTC offset last, from the target day: a reset across a DST change
+    # ("resets Nov 1, 9pm" read on Oct 28) stays 9pm instead of keeping today's offset and landing an hour off.
+    local = dt.datetime.now()
+
+    def utc(wall: dt.datetime) -> dt.datetime:
+        return wall.astimezone().astimezone(dt.timezone.utc) + dt.timedelta(minutes=5)
+
     if d := _DATED_RE.search(text):
         at = local.replace(hour=_hour24(d["h"], d["ap"]), minute=int(d["m"] or 0), second=0, microsecond=0)
         if d["mon"]:
@@ -1254,12 +1260,12 @@ def limit_reset(text: str) -> dt.datetime | None:
                 cand = at.replace(month=_MONTHS.index(d["mon"].lower()[:3]) + 1, day=int(d["day"]))
                 if cand < local - dt.timedelta(days=1):  # December's "resets Jan 2"
                     cand = cand.replace(year=cand.year + 1)
-                return cand.astimezone(dt.timezone.utc) + dt.timedelta(minutes=5)
+                return utc(cand)
         else:
             cand = at + dt.timedelta(days=(_WEEKDAYS.index(d["wd"].lower()[:3]) - local.weekday()) % 7)
             if cand <= local:
                 cand += dt.timedelta(days=7)
-            return cand.astimezone(dt.timezone.utc) + dt.timedelta(minutes=5)
+            return utc(cand)
     m = _RESET_RE.search(text)
     if not m:
         return now() + dt.timedelta(hours=1)
@@ -1268,11 +1274,10 @@ def limit_reset(text: str) -> dt.datetime | None:
         hour += 12
     if ampm == "am" and hour == 12:
         hour = 0
-    local = dt.datetime.now().astimezone()
     cand = local.replace(hour=hour % 24, minute=minute, second=0, microsecond=0)
     if cand <= local:
         cand += dt.timedelta(days=1)
-    return cand.astimezone(dt.timezone.utc) + dt.timedelta(minutes=5)
+    return utc(cand)
 
 
 LONG_PAUSE_H = 6  # a limit pause longer than a 5-hour window is the weekly limit (or a misread reset): page
