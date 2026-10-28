@@ -4212,6 +4212,15 @@ def test_an_experiment_arm_does_not_hide_starvation(churn, monkeypatch):
     assert churn.load_state()["focus"]["idle_passes"] == 2 and churn.focus_need(churn.load_state(), {})
 
 
+def test_an_empty_filler_window_does_not_mute_starvation(churn, monkeypatch):
+    f = _focus(churn, monkeypatch, filler={"until": churn.iso(churn.now() + churn.dt.timedelta(hours=4)), "launched": 0,
+                                           "max": 4})
+    put(churn, focus=f, max_workers=1, queue=[item(4125, needs_owner=True)])  # 2026-10-28: owner-parked items only
+    for _ in range(2):
+        churn.focus_alerts(churn.load_state(), {}, [])
+    assert churn.load_state()["focus"]["idle_passes"] == 2 and churn.focus_need(churn.load_state(), {})
+
+
 def test_focus_work_held_by_ci_or_the_box_is_not_starvation(churn, monkeypatch):
     put(churn, focus=_focus(churn, monkeypatch), max_workers=1, queue=[item(6072, task="[ladder:zecs] slice")])
     for _ in range(3):
@@ -4238,6 +4247,12 @@ def test_the_tick_opens_filler_only_while_the_focus_starves(churn, monkeypatch):
     assert w["by"] == "tick" and w["max"] == churn.FILLER_MAX and pages == ["focus-filler"]  # the owner hears why
     assert churn.parse_iso(w["until"]) <= churn.now() + churn.dt.timedelta(hours=churn.FILLER_HOURS_MAX, minutes=1)
     assert churn.filler_open(churn.load_state()) and churn.focus_need(churn.load_state(), {}) is None
+    with churn.edit_state() as st:
+        st["focus"]["idle_passes"] = churn.STARVE_PASSES  # the window opened, nothing launched: starving again
+    assert churn.focus_need(churn.load_state(), {})  # an empty window does not answer it
+    with churn.edit_state() as st:
+        st["queue"] = [item(3799)]
+    assert churn.focus_need(churn.load_state(), {}) is None  # a window with work to launch: starvation answered
     monkeypatch.delenv("CHURN_RUN")
     churn.cmd_focus(_filler_ns(args=["off"]))
     assert not churn.filler_open(churn.load_state())

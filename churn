@@ -5160,9 +5160,15 @@ def focus_share(state: dict, hours: float = 24) -> dict:
     return out
 
 
+def filler_live(state: dict, snap: dict | None) -> bool:
+    """An open filler window that has an off-focus item it can launch. 2026-10-28 04:13-08:13 a window opened over a
+    queue of owner-parked items only: nothing launched, and an open window muted starvation, so the box sat empty 4 h."""
+    return filler_open(state) and focus_pick(state, snap, "calm", False)[1] is not None
+
+
 def focus_need(state: dict, snap: dict | None) -> str | None:
     """The tick's "focus starved" need: find a trivial blocker first, open filler only if the focus is really out."""
-    if not focus_on(state) or not starving(state) or filler_open(state):
+    if not focus_on(state) or not starving(state) or filler_live(state, snap):
         return None
     f = focus_cfg(state)
     why = idle_causes(state, snap, state.get("ci_mode", "calm"))
@@ -5203,7 +5209,7 @@ def focus_alerts(state: dict, snap: dict | None, launched: list[str]) -> list[st
     starved = free and not launched and not focus_live and not ready and not state.get("workers_paused") and not held
     with edit_state() as st:
         fs = st.setdefault("focus", {})
-        fs["idle_passes"] = int(fs.get("idle_passes", 0)) + 1 if starved and not filler_open(st) else 0
+        fs["idle_passes"] = int(fs.get("idle_passes", 0)) + 1 if starved and not filler_live(st, snap) else 0
         idle = fs["idle_passes"]
         last = parse_iso(fs.get("drift_checked"))
         drift_due = not last or now() - last >= dt.timedelta(hours=DRIFT_EVERY_H)
