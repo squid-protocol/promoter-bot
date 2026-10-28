@@ -1583,6 +1583,13 @@ def worker_slots(b: dict, running: int, max_workers: int = 2) -> int:
     return max(0, min(max_workers - running, max(free, 1)))
 
 
+def slot_free(state: dict, b: dict) -> bool:
+    """A worker could start now by the box's measure (worker_slots), so a quiet pass is the queue's doing. 2026-10-28:
+    the quiet line and idle_streak still tested GREEN after #77, so on nyx a slot idle at load 0.2 logged only "all 1
+    heavy slots held" and never the idle causes (the queue was starved: waits and owner rulings)."""
+    return worker_slots(b, len(claude_slot_holders(state)), int(state.get("max_workers", 2))) > 0
+
+
 # ---------------------------------------------------------------- workers
 # Every session churn starts gets the self-wait hook (2026-10-17: two workers spun ~1 h in a `pgrep -f` loop that
 # matched its own command line). It adds to the user's own hooks.
@@ -5201,12 +5208,12 @@ def focus_alerts(state: dict, snap: dict | None, launched: list[str]) -> list[st
     live = claude_slot_holders(state)
     free = len(live) < int(state.get("max_workers", 1))
     held = (t := parse_iso(state.get("paused_until"))) and t > now()  # a limit / offline pause: not starvation
-    # an exempt-lane run (an experiment arm, the retro) is not focus work: 2026-10-27 an E1 arm kept the ladder from
-    # ever starving, so two slots sat idle with nothing queued
-    focus_live = [r for r in live if in_focus(state, r) and r.get("lane") not in FOCUS_EXEMPT_LANES]
-    # focus work that exists but waits on CI admission, the box or the pace is not starvation: filler would wait too
+    # focus work that exists but waits on CI admission, the box or the pace is not starvation: filler would wait too.
+    # 2026-10-28: a free slot beside live focus workers starves too. Requiring no live focus work kept nyx at 2 of 3
+    # workers for hours with focus issue #6278 unqueued: the tick was never asked to queue its next step.
+    # It also covers 2026-10-27, when a live E1 experiment arm kept the ladder from ever starving.
     ready = focus_pick(state, snap, "calm", True)[1] is not None
-    starved = free and not launched and not focus_live and not ready and not state.get("workers_paused") and not held
+    starved = free and not launched and not ready and not state.get("workers_paused") and not held
     with edit_state() as st:
         fs = st.setdefault("focus", {})
         fs["idle_passes"] = int(fs.get("idle_passes", 0)) + 1 if starved and not filler_live(st, snap) else 0
@@ -7147,8 +7154,7 @@ def cmd_tick(a) -> int:
         reasons, model = gate(state, b, force, needs, snap)
         if not a.dry_run:
             note_box(state, b)
-            idle_now = (b.get("verdict") == "GREEN" and not state.get("workers_paused")
-                        and len(claude_slot_holders(state)) < int(state.get("max_workers", 2))
+            idle_now = (slot_free(state, b) and not state.get("workers_paused")
                         and not any(r.startswith("launch slot") for r in reasons))
             with edit_state() as st:  # consecutive ticks with a free slot and nothing launchable (calm backfill waits on it)
                 st["idle_streak"] = int(st.get("idle_streak", 0)) + 1 if idle_now else 0
@@ -7156,7 +7162,7 @@ def cmd_tick(a) -> int:
         if not reasons:
             if a.dry_run:
                 print(json.dumps({"quiet": True, "lanes": did}, indent=1))
-            free = b.get("verdict") == "GREEN" and len(claude_slot_holders(state)) < int(state.get("max_workers", 2))
+            free = slot_free(state, b)
             log(f"quiet (box {b.get('verdict')}: {'; '.join(b.get('reasons', []))[:200]}; "
                 f"{len(state.get('running', []))} running, window ${window_usd(state):.0f})"
                 + (f" {idle_causes(state, snap, state.get('ci_mode', 'calm'))}" if free else ""), quiet=True)
