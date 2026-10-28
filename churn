@@ -222,7 +222,7 @@ LANES = ("normal", "ci", "backfill")
 CRUCIBLE_REPOS = {"estate-crucible", "cics-crucible"}
 QUEUE_KEYS = {"issue", "model", "task", "needs_owner", "backend", "pr", "after_prs", "allow_workflows", "agy_step", "lane", "repo", "after_merge",
               "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "wait_worker", "scope", "promoted", "rescue",
-              "regraft", "also_prs"}
+              "regraft", "also_prs", "owner_hold"}
 # Scope labels (scope:core|sweep|frontier|infra) are kept on items for the scorecard; they no longer order or hold work.
 # Tiers, promotion and scope ranks were retired 2026-10-25: the owner's focus decides what launches.
 SCOPES = ("core", "sweep", "frontier", "infra")
@@ -5703,7 +5703,10 @@ def prune_pr_fixes(state: dict, snap: dict) -> list[str]:
     such items by hand."""
     out, keep = [], []
     for q in state.get("queue", []):
-        v = snap.get(str(q.get("pr"))) if q.get("auto") == "pr-fix" else None
+        v = snap.get(str(q.get("pr"))) if q.get("auto") == "pr-fix" or q.get("owner_hold") else None
+        if v is not None and q.get("owner_hold") and v.get("state") == "open":
+            keep.append(q)  # the owner's hold: a new head does not lift it, only the PR closing or merging
+            continue
         if v is not None and (v.get("state") != "open" or (q.get("head") and v.get("head") and q["head"] != v["head"])):
             out.append(f"#{q['pr']}")
             continue
@@ -5716,8 +5719,10 @@ FIX_LOOP_CAP, FIX_LOOP_WINDOW_H = 3, 24
 
 
 def recent_fix_runs(pr: int, issue: int) -> int:
-    """Fix-loop runs (PR fixes naming #pr, send-backs and precheck retries of the issue's runs) started in the window.
-    A run known to have committed nothing of its own (merge-only or no-op, #20) is not a fix round."""
+    """Fix-loop runs (PR fixes naming #pr, send-backs and precheck retries of runs on this PR) started in the window.
+    A run known to have committed nothing of its own (merge-only or no-op, #20) is not a fix round. 2026-10-28: a
+    send-back or precheck retry counts only for the PR its run worked on; #5859's precheck retries of #6832/#6843 made
+    every regraft PR of the issue start at 2 fix runs, so each went straight to an Opus rescue and a regraft."""
     cut = now() - dt.timedelta(hours=FIX_LOOP_WINDOW_H)
     n = 0
     for d in RUNS.glob(f"{issue}-*"):
@@ -5726,7 +5731,8 @@ def recent_fix_runs(pr: int, issue: int) -> int:
         if not t or t < cut or m.get("check_of") or m.get("code_changed") is False:
             continue
         kind = run_kind(m)
-        if (kind == "pr_fix" and re.search(rf"#{pr}\b", m.get("task") or "")) or kind in ("send_back", "precheck_retry"):
+        if (kind == "pr_fix" and re.search(rf"#{pr}\b", m.get("task") or "")) or (
+                kind in ("send_back", "precheck_retry") and str(m.get("pr") or "") == str(pr)):
             n += 1
     return n
 
@@ -5738,6 +5744,22 @@ RESCUE_TAG = "RESCUE"
 def was_rescued(pr: int, issue: int) -> bool:
     """An Opus rescue run for this PR has started (ever: one rescue per PR)."""
     return any(re.match(rf"{RESCUE_TAG} \(Fix PR #{pr}\b", _run_meta(d.name).get("task") or "") for d in RUNS.glob(f"{issue}-*"))
+
+
+RESCUE_VERDICT_RE = re.compile(r"Rescue verdict:\**\s*\**\s*(SAVE|SLICE|RESTART|OWNER)\b\**:?\s*(.*)", re.IGNORECASE)
+
+
+def rescue_verdict(pr: int, issue: int) -> tuple[str, str, str] | None:
+    """(run id, verdict, why) of the newest finished rescue of PR pr, or None (none ran, or it gave no verdict)."""
+    hits = sorted((m for d in RUNS.glob(f"{issue}-*") if (m := _run_meta(d.name)).get("status") == "done"
+                   and re.match(rf"{RESCUE_TAG} \(Fix PR #{pr}\b", m.get("task") or "")),
+                  key=lambda m: m.get("started", ""), reverse=True)
+    for m in hits[:1]:
+        with contextlib.suppress(OSError, ValueError):
+            result = str(json.loads((RUNS / m["run_id"] / "out.json").read_text()).get("result") or "")
+            if found := RESCUE_VERDICT_RE.findall(result):
+                return m["run_id"], found[-1][0].upper(), found[-1][1].strip()[:200]
+    return None
 
 
 def rescue_task(n, branch: str | None, issue: int, loops: int, why: list[str]) -> str:
@@ -5996,10 +6018,25 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
         # Owner 2026-10-17: two Sonnet fix runs, then ONE Opus rescue that judges the PR (save / slice / restart /
         # owner). 2026-10-24: a PR that fails again after its rescue, or falls STALE_BEHIND behind main while
         # conflicting, is regrafted (see STALE_BEHIND); the owner hears of it only if the regraft asks.
+        # 2026-10-28: only a CONFLICTING PR is regrafted. #6896 -> #6901 -> #6902 -> #6905 were each regrafted at 0
+        # commits behind for a red that was main's (DOOM-rosetta), each after an Opus rescue said SAVE: the same diff on
+        # a fresh branch takes the same red, and the old PR was closed with its checks still running. A red PR past
+        # its rescue that merges cleanly goes to the owner instead (as the rescue brief says), with the rescue's verdict.
         rescued = loops >= RESCUE_AT and was_rescued(int(n), issue)
         rescue = loops >= RESCUE_AT and not rescued
         dirty = "conflicts with main" in why
         behind = behind_main(entry, int(n), v.get("head", ""), compare) if dirty else 0
+        if rescued and not dirty:
+            rv = rescue_verdict(int(n), issue)
+            said = f"its rescue ({rv[0]}) said {rv[1]}: {rv[2]}" if rv else "its rescue gave no verdict"
+            state.setdefault("queue", []).insert(0, {
+                "issue": issue, "pr": int(n), "model": "opus", "needs_owner": True, "auto": "pr-fix",
+                "note": f"red after its Opus rescue, no conflict (a regraft would carry the same red); {said}"[:300],
+                "task": f"Owner ruling for PR #{n}: {' + '.join(why)} after its Opus rescue; {said}"[:600],
+                **({"head": v["head"]} if v.get("head") else {})})
+            queued.add(int(n))
+            added.append(f"#{n} (owner: red after its rescue)")
+            continue
         if rescued or (dirty and behind >= STALE_BEHIND):
             if rescued:
                 why.append(f"{loops} fix runs in {FIX_LOOP_WINDOW_H} h and an Opus rescue already ran")
@@ -7982,6 +8019,12 @@ def cmd_queue(a) -> int:
                 item["backend"] = "agy"
             if a.pr:
                 item["pr"] = a.pr
+            if getattr(a, "note", None):
+                item["note"] = a.note[:300]
+            if a.needs_owner and a.pr and not os.environ.get("CHURN_RUN"):
+                # 2026-10-28: the owner's hold on a PR. A tick removed one at 16:12Z ("main's red cleared") before the
+                # PR's own red check finished, and the gate sent the PR to an Opus rescue. Only the owner lifts it.
+                item["owner_hold"] = True
             if a.after_pr:
                 item["after_prs"] = a.after_pr
             if getattr(a, "after_merge", False):
@@ -8020,6 +8063,8 @@ def cmd_queue(a) -> int:
         elif a.action == "rm":
             if a.index is None or not 0 <= a.index < len(q):
                 raise SystemExit("queue rm needs --index N from `churn queue`")
+            if q[a.index].get("owner_hold"):
+                owner_only(f"queue rm of the owner's hold on PR #{q[a.index].get('pr')}")
             gone = q.pop(a.index)
             if gone.get("allow_workflows"):  # the launch reads it after the rm (#4726, #5501 on 2026-10-23)
                 state.setdefault("workflow_grants", {})[str(gone["issue"])] = iso(now())
