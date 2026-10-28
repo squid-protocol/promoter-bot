@@ -2748,6 +2748,28 @@ def test_limit_reset_reads_a_dated_weekly_reset(churn):
     assert churn.limit_reset("tests failed") is None
 
 
+def test_limit_reset_keeps_the_wall_clock_across_a_dst_change(churn, monkeypatch):
+    """Read on Wed Oct 28 (EDT), a reset on or after Sun Nov 1 (EST) is still at its stated local time."""
+    import time
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+
+    class Frozen(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 28, 17, 0) if tz is None else cls(2026, 10, 28, 21, 0, tzinfo=tz)
+
+    monkeypatch.setattr(churn.dt, "datetime", Frozen)
+    try:
+        for text, day, hour, minute in (("weekly limit · resets Nov 1, 9pm", 1, 21, 5),
+                                        ("weekly limit, resets Monday at 9:30am", 2, 9, 35)):
+            got = churn.limit_reset(text).astimezone()
+            assert (got.month, got.day, got.hour, got.minute) == (11, day, hour, minute), text
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
 def test_a_long_limit_pause_and_a_limit_loop_page(churn, monkeypatch):
     pages = []
     monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: pages.append(key) or True)
