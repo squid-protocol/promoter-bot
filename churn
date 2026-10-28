@@ -858,16 +858,55 @@ def pr_allows_workflows(state: dict, pr) -> bool:
                             for p in state.get("prs", []))
 
 
+def precheck_grants(st: dict, meta: dict) -> dict:
+    """The run's meta with the workflow grants the precheck honours: the PR's OK, else the standing policy."""
+    if pr_allows_workflows(st, meta.get("pr")):
+        return {**meta, "allow_workflows": True}
+    if not meta.get("allow_workflows") and standing_workflows(st):
+        return {**meta, "allow_workflows": "standing"}
+    return meta
+
+
+# 2026-10-28: 46 precheck send-back runs on nyx over 10-26..28 (~$1.36 each), about 3 a day for the 5-file rule alone:
+# the worker opened the PR, the gate's precheck found it over the cap, and a second run split it. The worker now runs
+# the same check before `gh pr create`.
+SELFCHECK_NOTE = ("\n\nBefore `gh pr create`: write the PR body to a file and run `churn selfcheck --body <file>` in your "
+                  "worktree. It is the gate's pre-review check (conflicts with main, workflow grant, class section, the "
+                  "5-file rule) without the slow gates. Fix everything it lists first (over the cap: keep the first "
+                  "slice of 5 or fewer hand-written files and list the rest under Remaining slices), then open the PR "
+                  "with `--body-file <file>`. A PR it would fail costs a send-back run.\n")
+
+
+def run_for_worktree(wt: str) -> dict:
+    """The newest churn run whose worktree is wt (a worker's own run, for its grants), or {}."""
+    want = os.path.realpath(wt)
+    metas = [m for d in RUNS.glob("*-*") if (m := _run_meta(d.name))
+             and m.get("worktree") and os.path.realpath(m["worktree"]) == want]
+    return max(metas, key=lambda m: str(m.get("started") or ""), default={})
+
+
+def cmd_selfcheck(a) -> int:
+    """`churn selfcheck [--body FILE] [--gates]`: the precheck's problems for the worktree in the current directory,
+    before a PR exists. Read-only: no state, no send-back. Exit 1 when it finds any."""
+    top = run(["git", "rev-parse", "--show-toplevel"], cwd=os.getcwd()).stdout.strip() or os.getcwd()
+    meta = precheck_grants(load_state(), {"allow_workflows": False, **run_for_worktree(top), "worktree": top})
+    body = Path(a.body).read_text(errors="replace") if a.body else ""
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    problems = precheck_problems(meta, body, gates=None if a.gates else (lambda: ok))
+    if not a.body:
+        problems = [p for p in problems if p != NO_CLASS_TABLE]
+    for p in problems:
+        print(f"- {p}")
+    print(f"selfcheck: {len(problems)} problem(s)" + ("" if a.gates else " (pr_gates not run: --gates to include)"))
+    return 1 if problems else 0
+
+
 def cmd_precheck(a) -> int:
     rd = RUNS / a.run_id
     meta = json.loads((rd / "meta.json").read_text())
     try:
         body = str(gh_json(f"repos/{REPO}/pulls/{meta['pr']}").get("body") or "")
-        st = load_state()
-        if pr_allows_workflows(st, meta.get("pr")):
-            meta = {**meta, "allow_workflows": True}
-        elif not meta.get("allow_workflows") and standing_workflows(st):
-            meta = {**meta, "allow_workflows": "standing"}
+        meta = precheck_grants(load_state(), meta)
         problems = precheck_problems(meta, body)
     except (RuntimeError, subprocess.TimeoutExpired, OSError, KeyError) as e:
         problems, err = [], f"precheck could not run: {e}"[:300]
@@ -1784,6 +1823,7 @@ def cmd_worker(a) -> int:
         prompt = Path(a.brief_file).read_text() if a.brief_file else a.brief
         if not prompt:
             raise SystemExit("worker needs --brief-file or --brief")
+        pr = repo = None
         if getattr(a, "worktree", None):  # a checker works in the tree it checks; a PR fix in the PR's own branch
             wt = Path(a.worktree)
             branch = a.branch or run(["git", "-C", str(wt), "branch", "--show-current"]).stdout.strip()
@@ -1820,6 +1860,8 @@ def cmd_worker(a) -> int:
                       f"(rename the branch if you like). Handoff notes go in {H}.\n\n{prompt}")
         if not getattr(a, "repo", None) and not getattr(a, "check_of", None) and "[c:" not in prompt:
             prompt += checklist_note(issue)
+        if not (repo or getattr(a, "repo", None) or getattr(a, "check_of", None) or pr):  # gitgalaxy, no PR yet
+            prompt += SELFCHECK_NOTE
     if model not in WORKER_BUDGET:
         raise SystemExit(f"model must be one of {sorted(WORKER_BUDGET)}")
     with state_lock():
@@ -8625,6 +8667,10 @@ def main() -> int:
     r.add_argument("run_id")
     pc = sub.add_parser("_precheck")
     pc.add_argument("run_id")
+    sc = sub.add_parser("selfcheck", help="a worker's pre-PR check: the precheck's problems for this worktree, before "
+                                          "`gh pr create`")
+    sc.add_argument("--body", help="the PR body file (checks its class section)")
+    sc.add_argument("--gates", action="store_true", help="also run pr_gates --fast (slow)")
     ra = sub.add_parser("_agyrun")
     ra.add_argument("run_id")
     argv = sys.argv[1:]
@@ -8663,6 +8709,8 @@ def main() -> int:
         return cmd_run(a)
     if a.cmd == "_precheck":
         return cmd_precheck(a)
+    if a.cmd == "selfcheck":
+        return cmd_selfcheck(a)
     if a.cmd == "_agyrun":
         return cmd_agyrun(a)
     if a.cmd == "agy":

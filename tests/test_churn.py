@@ -1626,6 +1626,44 @@ def _run(churn, rid, **meta):
     (churn.RUNS / rid / "meta.json").write_text(json.dumps({"run_id": rid, **meta}))
 
 
+def test_selfcheck_runs_the_precheck_for_this_worktree_before_a_pr_exists(churn, tmp_path, monkeypatch, capsys):
+    """2026-10-28: ~3 send-back runs a day on nyx were the 5-file rule, found only after the PR was open."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    _run(churn, "6693-a", issue=6693, worktree=str(wt), started="2026-10-28T10:00Z", allow_workflows=False)
+    _run(churn, "6693-b", issue=6693, worktree=str(wt), started="2026-10-28T11:00Z", allow_workflows=True)
+    _run(churn, "7-x", issue=7, worktree=str(tmp_path / "other"), started="2026-10-28T12:00Z", allow_workflows=True)
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, f"{wt}\n", ""))
+    seen = {}
+
+    def fake(meta, body, gates=None):
+        seen.update(meta=meta, body=body, gates=gates() if gates else "pr_gates")
+        return [churn.NO_CLASS_TABLE, "touches 7 hand-written files, over the 5-file rule (...)"]
+    monkeypatch.setattr(churn, "precheck_problems", fake)
+    assert churn.cmd_selfcheck(argparse.Namespace(body=None, gates=False)) == 1
+    assert seen["meta"]["allow_workflows"] is True and seen["meta"]["worktree"] == str(wt)  # the newest run here
+    assert seen["gates"].returncode == 0  # the slow gates are skipped unless asked
+    out = capsys.readouterr().out
+    assert "5-file rule" in out and "class table" not in out  # no body given: its check is not judged
+    body = tmp_path / "body.md"
+    body.write_text("x")
+    churn.cmd_selfcheck(argparse.Namespace(body=str(body), gates=True))
+    assert seen["body"] == "x" and seen["gates"] == "pr_gates" and "class table" in capsys.readouterr().out
+    monkeypatch.setattr(churn, "precheck_problems", lambda meta, body, gates=None: [])
+    assert churn.cmd_selfcheck(argparse.Namespace(body=str(body), gates=False)) == 0
+
+
+def test_a_new_worker_is_told_to_selfcheck_before_opening_its_pr(churn, tmp_path, monkeypatch):
+    monkeypatch.setattr(churn, "spawn_detached", lambda *a, **k: 4242)
+    monkeypatch.setattr(churn, "make_worktree", lambda issue, stamp: (tmp_path, "churn/6693-x"))
+    monkeypatch.setattr(churn, "crucible_repo_of", lambda issue: None)
+    monkeypatch.setattr(churn, "checklist_note", lambda issue: "")
+    ns = argparse.Namespace(resume_run=None, issue=6693, model="sonnet", task="CI", brief="do it", brief_file=None,
+                            worktree=None, branch=None, repo=None, force=True, lane=None, plan=False, check_of=None)
+    assert churn.cmd_worker(ns) == 0
+    assert "churn selfcheck --body" in next(churn.RUNS.iterdir()).joinpath("prompt.md").read_text()
+
+
 def test_a_held_plan_gates_its_requeued_item_without_a_new_plan_run(churn, tmp_path):
     st = {"held_plans": {"5005-a": {"issue": 5005, "t": churn.iso(churn.now()),
                                     "files": ["det/cics.py", "docs/x.md", "tests/tools/equivalence_cics.py"]}},
