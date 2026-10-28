@@ -226,6 +226,14 @@ class TestGateRules:
                                        "reasons": [real, "all 1 heavy slots held"]}, 0, 3) == 0, real
         assert churn.worker_slots({"verdict": "RED", "free_slots": 0, "reasons": ["all 1 heavy slots held"]}, 0, 3) == 0
 
+    def test_a_slot_held_only_by_heavy_bookkeeping_is_free_for_the_quiet_line(self, churn):
+        """2026-10-28: the quiet line tested GREEN, so a starved queue on nyx read as "all 1 heavy slots held"."""
+        held = {"verdict": "YELLOW", "free_slots": 0, "reasons": ["all 1 heavy slots held"]}
+        two = {"max_workers": 3, "running": [{"run_id": f"r{n}", "pid": n} for n in (1, 2)]}
+        assert churn.slot_free(two, held) and churn.slot_free(two, self.GREEN)
+        assert not churn.slot_free({**two, "max_workers": 2}, held)
+        assert not churn.slot_free(two, {"verdict": "YELLOW", "free_slots": 0, "reasons": ["CPU pressure 31%"]})
+
     def test_unapplied_owner_answers_wake_the_model(self, churn):
         st = {"queue": [], "running": []}
         rows = [{"id": "o1", "question": "Close #1?", "applied": True},
@@ -4161,6 +4169,20 @@ def test_starvation_asks_the_tick_first_and_pages_only_if_it_stays_unresolved(ch
     for _ in range(4):
         churn.focus_alerts(churn.load_state(), {}, [])
     assert [k for k, _ in pages] == ["focus-starved"]  # unresolved for STARVE_PAGE passes: now the owner
+
+
+def test_a_free_slot_beside_live_focus_workers_still_starves(churn, monkeypatch):
+    """2026-10-28: nyx ran 2 of 3 workers on focus issues for hours while focus issue #6278 had nothing queued."""
+    put(churn, focus=_focus(churn, monkeypatch), max_workers=3, queue=[],
+        running=[{"run_id": f"6072-{n}", "pid": n, "issue": 6072} for n in (1, 2)])
+    for _ in range(churn.STARVE_PASSES):
+        churn.focus_alerts(churn.load_state(), {}, [])
+    assert "no queued next step" in churn.focus_need(churn.load_state(), {})
+    with churn.edit_state() as st:
+        st["focus"]["idle_passes"] = 0
+        st["running"].append({"run_id": "6271-3", "pid": 3, "issue": 6271})
+    churn.focus_alerts(churn.load_state(), {}, [])
+    assert churn.load_state()["focus"]["idle_passes"] == 0  # every slot busy: not starving
 
 
 def test_focus_work_held_by_ci_or_the_box_is_not_starvation(churn, monkeypatch):
