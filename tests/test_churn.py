@@ -1721,6 +1721,72 @@ def test_a_pr_that_fails_after_its_rescue_is_regrafted_not_parked_for_the_owner(
     assert st["queue"][0]["regraft"] is True and st["queue"][0]["also_prs"] == [5181] and not st.get("quarantine")
 
 
+# ---------------------------------------------------------------- the #5859 loop (2026-10-28)
+def _red_after_rescue(churn, verdict="## Rescue verdict: SAVE\nThe red is main's DOOM-rosetta, not this diff."):
+    for i in range(2):
+        _run(churn, f"5176-{i}", issue=5176, task="Fix PR #5180 (b): shepherd:needs-fix", started=churn.iso(churn.now()))
+    _run(churn, "5176-r", issue=5176, status="done", task=churn.rescue_task(5180, "b", 5176, 2, []),
+         started=churn.iso(churn.now()))
+    (churn.RUNS / "5176-r" / "out.json").write_text(json.dumps({"result": verdict}))
+    return {"prs": [{"number": 5180, "issue": 5176}], "queue": [], "running": []}
+
+
+def test_a_red_pr_past_its_rescue_that_merges_cleanly_goes_to_the_owner_not_a_regraft(churn):
+    st = _red_after_rescue(churn)
+    snap = {"5180": pr(labels=["shepherd:needs-fix"], branch="churn/5176-x")}
+    added = churn.queue_pr_fixes(st, snap, triage=lambda n: ["real"])
+    assert added == ["#5180 (owner: red after its rescue)"]
+    q = st["queue"][0]
+    assert q["needs_owner"] and not q.get("regraft") and "5176-r" in q["note"] and "SAVE" in q["note"]
+    assert "main's DOOM-rosetta" in q["note"] and churn.expire_owner_parks(st) == []  # a noted park does not expire
+    assert churn.queue_pr_fixes(st, snap, triage=lambda n: ["real"]) == []  # parked: no second item
+
+
+def test_a_conflicting_pr_past_its_rescue_is_still_regrafted(churn):
+    st = _red_after_rescue(churn)
+    snap = {"5180": pr(ms="dirty", labels=["shepherd:needs-fix"], branch="churn/5176-x")}
+    added = churn.queue_pr_fixes(st, snap, triage=lambda n: ["real"], conflicts=lambda n: None)
+    assert added == ["#5180 (regraft)"] and st["queue"][0]["regraft"]
+
+
+def test_another_prs_precheck_retries_do_not_count_as_this_prs_fix_runs(churn):
+    for i, other in enumerate((6832, 6843)):
+        _run(churn, f"5859-p{i}", issue=5859, precheck_of=f"5859-x{i}", pr=other, started=churn.iso(churn.now()))
+    assert churn.recent_fix_runs(6901, 5859) == 0
+    _run(churn, "5859-p2", issue=5859, precheck_of="5859-x2", pr=6901, started=churn.iso(churn.now()))
+    assert churn.recent_fix_runs(6901, 5859) == 1
+
+
+def _hold_args(**kw):
+    base = {"action": "add", "issue": 5859, "task": "hold #6905", "model": "sonnet", "needs_owner": True, "backend": None,
+            "front": False, "pr": 6905, "after_pr": None, "allow_workflows": False, "agy_step": None, "lane": None,
+            "before_issue": None, "index": None, "note": "wait for #6908"}
+    return argparse.Namespace(**{**base, **kw})
+
+
+def test_the_owners_hold_on_a_pr_keeps_its_note_and_only_the_owner_lifts_it(churn, monkeypatch):
+    monkeypatch.delenv("CHURN_RUN", raising=False)
+    put(churn, queue=[])
+    churn.cmd_queue(_hold_args())
+    q = churn.load_state()["queue"][0]
+    assert q["owner_hold"] and q["note"] == "wait for #6908" and q["pr"] == 6905
+    monkeypatch.setenv("CHURN_RUN", "1")  # a tick or worker
+    with pytest.raises(SystemExit, match="owner only"):
+        churn.cmd_queue(argparse.Namespace(action="rm", index=0))
+    assert churn.load_state()["queue"][0]["owner_hold"]
+    churn.cmd_queue(_hold_args(pr=6906, note=None))  # a tick's park is not an owner hold
+    assert not churn.load_state()["queue"][1].get("owner_hold")
+    monkeypatch.delenv("CHURN_RUN")
+    churn.cmd_queue(argparse.Namespace(action="rm", index=0))
+    assert [x["pr"] for x in churn.load_state()["queue"]] == [6906]
+
+
+def test_the_owners_hold_survives_a_new_head_and_ends_when_the_pr_closes(churn):
+    st = {"queue": [{**item(5859, pr=6905, needs_owner=True), "owner_hold": True, "head": "aaaa11112222"}]}
+    assert churn.prune_pr_fixes(st, {"6905": pr(head="bbbb33334444")}) == [] and st["queue"]
+    assert churn.prune_pr_fixes(st, {"6905": pr(state="closed")}) == ["#6905"] and st["queue"] == []
+
+
 # ---------------------------------------------------------------- stale PRs: regraft (owner 2026-10-24)
 def _stale(churn, monkeypatch, behind=560, files=("tests/equivalence/det_sweep_coverage/a.json",)):
     monkeypatch.setattr(churn, "behind_main", lambda entry, n, head, compare=None: behind)
