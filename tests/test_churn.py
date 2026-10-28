@@ -263,6 +263,7 @@ class TestGateRules:
     def test_pr_reviewed_merge_records_the_head_and_labels(self, churn, monkeypatch):
         labels = []
         monkeypatch.setattr(churn, "gh_label", lambda n, add=None, remove=None: labels.append((n, add, remove)))
+        _pr_files(churn, monkeypatch, ["churn"])
         put(churn, prs=[5038])
         churn.cmd_pr(argparse.Namespace(action="reviewed", number=5038, issue=4770, head="b3c81f31", verdict="merge", note=None))
         assert churn.load_state()["prs"] == [{"number": 5038, "issue": 4770, "reviewed_head": "b3c81f31", "verdict": "merge",
@@ -3430,9 +3431,41 @@ def test_poll_nudges_the_gate_once_per_change(churn, monkeypatch):
     assert nudged == [1]  # stopped: the poll stays quiet
 
 
+def _pr_files(churn, monkeypatch, files, ref="churn/80-20261028T0900Z"):
+    monkeypatch.setattr(churn, "gh_json", lambda path: [{"filename": f} for f in files] if "/files" in path
+                        else {"head": {"ref": ref}})
+
+
+def test_a_merge_verdict_needs_the_same_workflow_grant_as_the_precheck(churn, monkeypatch):
+    """2026-10-28: nyx had no standing grant; its precheck sent workflow edits back while its review tick merged them."""
+    monkeypatch.setattr(churn, "gh_label", lambda n, add=None, remove=None: None)
+    _pr_files(churn, monkeypatch, [".github/workflows/cics-crucible.yml", "tests/tools/x.py"])
+    ns = argparse.Namespace(number=8, action="reviewed", head="h1", verdict="merge", note=None, issue=None)
+    with pytest.raises(SystemExit, match="no workflow grant on this host"):
+        churn.cmd_pr(ns)
+    assert not churn.load_state().get("prs")  # nothing recorded, no label
+    churn.cmd_pr(argparse.Namespace(**{**vars(ns), "verdict": "hold"}))  # hold and send-back need no grant
+    with churn.edit_state() as st:
+        st["owner_policy"] = {"workflows": churn.iso(churn.now())}
+    churn.cmd_pr(ns)
+    assert churn.load_state()["prs"][0]["verdict"] == "merge"
+
+
+def test_workflow_grant_problem_follows_the_precheck_rules(churn):
+    wf, shep = ".github/workflows/smoke.yml", ".github/workflows/shepherd-merge.yml"
+    assert churn.workflow_grant_problem({}, 1, 5, ["churn"]) is None  # no workflow edit
+    assert "smoke.yml" in churn.workflow_grant_problem({}, 1, 5, [wf])
+    assert churn.workflow_grant_problem({"prs": [{"number": 1, "allow_workflows": True}]}, 1, 5, [wf, shep]) is None
+    assert churn.workflow_grant_problem({"queue": [{"issue": 5, "allow_workflows": True}]}, 1, 5, [wf]) is None
+    standing = {"owner_policy": {"workflows": "2026-10-24T00:00Z"}}
+    assert churn.workflow_grant_problem(standing, 1, 5, [wf]) is None
+    assert "shepherd-merge.yml" in churn.workflow_grant_problem(standing, 1, 5, [wf, shep])  # never the shepherd's own
+
+
 def test_a_send_back_verdict_makes_the_running_tick_loop_once_more(churn, monkeypatch):
     monkeypatch.setattr(churn, "gh_label", lambda n, add=None, remove=None: None)  # never label a real PR
     monkeypatch.setattr(churn, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", ""))
+    _pr_files(churn, monkeypatch, ["churn"])
     ns =argparse.Namespace(number=7, action="reviewed", head="h1", verdict="send-back", note="fix x", issue=70)
     churn.cmd_pr(ns)
     assert churn.DIRTY.exists()

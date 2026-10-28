@@ -1735,6 +1735,25 @@ def owner_allows_workflows(state: dict, issue) -> bool:
     return bool(t) and now() - t < dt.timedelta(hours=WORKFLOW_GRANT_HOURS)
 
 
+def workflow_grant_problem(state: dict, pr, issue, files: list[str]) -> str | None:
+    """The workflow edits in `files` that no grant on this host covers, by the precheck's rules: the PR's OK, the
+    issue's item grant, or the standing policy (never the shepherd's own workflows). 2026-10-28: nyx had no standing
+    grant, so its precheck sent back 13 workflow edits since 10-24, while its review tick approved #6549 and #6873
+    "under the standing grant" it read in the skill text: the two disagreed and each send-back cost a worker run."""
+    wf = [f for f in files if f.startswith(".github/workflows/")]
+    if not wf or pr_allows_workflows(state, pr):
+        return None
+    if standing_workflows(state):
+        wf = [f for f in wf if SHEPHERD_WORKFLOWS.match(f)]
+    elif issue is not None and owner_allows_workflows(state, int(issue)):
+        return None
+    if not wf:
+        return None
+    return (f"edits {', '.join(wf)} with no workflow grant on this host (`churn policy` shows "
+            f"{json.dumps(state.get('owner_policy') or {})}): record `hold` for the owner, or the owner runs "
+            f"`churn pr allow-workflows {pr}`" + (" or `churn policy workflows on`" if not standing_workflows(state) else ""))
+
+
 def cmd_worker(a) -> int:
     stamp = now().strftime("%Y%m%dT%H%MZ")
     resume_of = None
@@ -7836,6 +7855,9 @@ def cmd_status(a) -> int:
     if state.get("quarantine"):
         print(f"quarantined state entries: {len(state['quarantine'])} (last: {state['quarantine'][-1]['where']}: "
               f"{state['quarantine'][-1]['why']})")
+    pol = state.get("owner_policy") or {}
+    print("owner policy: " + (", ".join(f"{k} on since {v}" for k, v in pol.items()) if pol else
+                              "none (workflow edits need an allow_workflows item or `churn pr allow-workflows N`)"))
     g = goal_cfg(state)
     print(f"goal: {g['stage']} ({len((g.get('issues') or {}).get(g['stage'], []))} issues)"
           + (f"; {goal_summary(g['measure'])} at {g['measure']['t']}" if g.get("measure") else ""))
@@ -8039,6 +8061,15 @@ def gh_label(n: int, add: str | None = None, remove: str | None = None) -> None:
 
 
 def cmd_pr(a) -> int:
+    if a.action == "reviewed" and a.verdict == "merge":  # a merge verdict honours the same grants as the precheck
+        st0 = load_state()
+        p0 = next((p for p in st0.get("prs", []) if isinstance(p, dict) and pr_num(p) == a.number), {})
+        head = gh_json(f"repos/{REPO}/pulls/{a.number}").get("head") or {}
+        m = re.match(r"churn/(\d+)-", str(head.get("ref") or ""))
+        issue = a.issue if a.issue is not None else p0.get("issue") or (int(m.group(1)) if m else None)
+        files = [f["filename"] for f in gh_json(f"repos/{REPO}/pulls/{a.number}/files?per_page=100")]
+        if why := workflow_grant_problem(st0, a.number, issue, files):
+            raise SystemExit(f"pr reviewed #{a.number} --verdict merge refused: {why}")
     with edit_state() as st:
         prs = st.setdefault("prs", [])
         idx = next((i for i, p in enumerate(prs) if pr_num(p) == a.number), None)
