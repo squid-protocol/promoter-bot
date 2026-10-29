@@ -5137,6 +5137,13 @@ FILLER_QUEUE_MAX = 4
 FILLER_HOURS_MAX = 12
 FILLER_BUDGET_USD = 8.0
 FILLER_SHARE_PAGE = 0.5
+# Owner 2026-10-29, after the ladder starved on ZECS002/ZECSNC waiting for an assembler coverage slice: "if I approved
+# work for a goal and one of those issues requires already logged issues it is okay to begin working on that issue as
+# part of the goal." So a PREREQUISITE (`churn focus prereq FOCUS NEED --reason R`, the tick may do it) makes an open,
+# already-logged issue that a focus issue needs count as focus work. One level only (a prerequisite's own needs are not
+# linked), at most PREREQ_MAX at once, the owner is paged for each and can drop it (`churn focus prereq rm NEED`), and a
+# link ends when its issue closes (checked with the drift check) or its focus issue leaves the focus.
+PREREQ_MAX = 3
 FILLER_NOTE = ("\n\nFILLER WORK (the host's focus is out of launchable work, so this slice keeps production going): "
                "do this one PR-sized slice only. Do not plan follow-ups: list what is left under **Remaining slices** / "
                "**Sibling gaps** and stop; churn will not queue a next slice for filler work.\n")
@@ -5154,6 +5161,40 @@ def focus_issues(state: dict) -> list[int]:
     return [int(n) for n in focus_cfg(state).get("issues") or []]
 
 
+def focus_prereqs(state: dict) -> list[dict]:
+    """Live prerequisite links: [{issue, for, reason, by, t}], only those whose focus issue is still in the focus."""
+    own = set(focus_issues(state))
+    return [p for p in focus_cfg(state).get("prereqs") or [] if int(p.get("for", 0)) in own]
+
+
+def issue_open(n: int) -> bool | None:
+    """Is issue #n open? None if unreadable (or not an issue)."""
+    r = run(["gh", "issue", "view", str(n), "--repo", REPO, "--json", "state"])
+    if r.returncode:
+        return None
+    try:
+        return json.loads(r.stdout).get("state") == "OPEN"
+    except ValueError:
+        return None
+
+
+def prune_prereqs(state: dict) -> list[str]:
+    """Drop prerequisite links whose issue closed or whose focus issue left the focus (one gh read per link)."""
+    out, keep, live = [], [], {id(p) for p in focus_prereqs(state)}
+    for p in focus_cfg(state).get("prereqs") or []:
+        if id(p) not in live:
+            out.append(f"#{p['issue']} (focus #{p.get('for')} left the focus)")
+        elif issue_open(int(p["issue"])) is False:
+            out.append(f"#{p['issue']} (closed)")
+        else:
+            keep.append(p)
+    if out:
+        with edit_state() as st:
+            st.setdefault("focus", {})["prereqs"] = [p for p in st["focus"].get("prereqs") or []
+                                                     if any(p.get("issue") == k.get("issue") for k in keep)]
+    return out
+
+
 def in_focus(state: dict, x: dict) -> bool:
     """May item / launch x run under the focus? With no focus set only red main and the exempt lanes run: churn never
     roams free (the free-roaming refill was where the drift came from). Filler is decided separately (filler_open)."""
@@ -5165,7 +5206,9 @@ def in_focus(state: dict, x: dict) -> bool:
         return True  # fixing a filler PR finishes work in hand; a PR left to rot is the stale-PR problem again
     if x.get("main_red_pr"):
         return True  # 2026-10-27: #6785's fix item sat "off focus" while main stayed red
-    return x.get("issue") is not None and int(x["issue"]) in set(focus_issues(state))
+    if x.get("issue") is None:
+        return False
+    return int(x["issue"]) in set(focus_issues(state)) | {int(p["issue"]) for p in focus_prereqs(state)}
 
 
 def filler_branch(branch: str | None) -> bool:
@@ -5253,7 +5296,10 @@ def focus_need(state: dict, snap: dict | None) -> str | None:
             f"item waiting on something already done (`churn queue wait` expired, a merged --after-pr), a focus issue "
             f"with no queued next step (queue it: `churn queue add --issue <focus issue> ...`)"
             + (f", a stale evidence measure the ladder #{lad} slices from (`churn goal measure`)" if lad else "")
-            + ", a report waiting for review. 2) Only if the focus is truly out of launchable work for now (blocked on "
+            + ", a report waiting for review, or a focus issue that waits on another already-logged open issue (owner "
+            f"2026-10-29: that is goal work; link it with `churn focus prereq <focus issue> <needed issue> --reason "
+            f"\"<where the focus issue needs it>\"`, then queue it; at most {PREREQ_MAX}, never one you just filed). "
+            f"2) Only if the focus is truly out of launchable work for now (blocked on "
             f"CI, an owner ruling, another host's claim, or done), open filler: `churn focus filler --hours <1-"
             f"{FILLER_HOURS_MAX}> --reason \"<one plain sentence: why the focus cannot use the slot>\"`. Filler launches "
             f"the off-focus queue items already queued; if there are none, add at most {FILLER_QUEUE_MAX} small, "
@@ -5295,6 +5341,8 @@ def focus_alerts(state: dict, snap: dict | None, launched: list[str]) -> list[st
         notify("focus-starved", "focus starved", msg, priority="high", cooldown_h=6)
         out.append(f"FOCUS starved: {msg}")
     if drift_due:
+        if gone := prune_prereqs(state):
+            out.append("focus prereq ended: " + ", ".join(gone))
         mix = focus_share(state)
         if mix["leak"]:
             msg = (f"{name}: {mix['leak']} of {mix['total']} launches in the last 24 h were neither focus work nor "
@@ -5309,9 +5357,50 @@ def focus_alerts(state: dict, snap: dict | None, launched: list[str]) -> list[st
     return out
 
 
+def focus_prereq(args: list[str], reason: str | None) -> int:
+    """`focus prereq FOCUS NEED --reason R` links an open, already-logged issue a focus issue needs (tick or owner);
+    `focus prereq rm NEED` drops a link. See PREREQ_MAX."""
+    tick = bool(os.environ.get("CHURN_RUN"))
+    with edit_state() as st:
+        f = st.setdefault("focus", {})
+        links = f.get("prereqs") or []
+        if args[:1] == ["rm"] and len(args) == 2:
+            need = _int(args[1])
+            f["prereqs"] = [p for p in links if int(p["issue"]) != need]
+            msg = f"focus prereq rm #{need}"
+        elif len(args) == 2 and "rm" not in args:
+            forn, need = _int(args[0]), _int(args[1])
+            if forn not in focus_issues(st):
+                raise SystemExit(f"focus prereq: #{forn} is not a focus issue; only the focus's own issues may link a "
+                                 "prerequisite (one level: a prerequisite's needs are not linked)")
+            if need in focus_issues(st):
+                raise SystemExit(f"focus prereq: #{need} is already a focus issue")
+            if not reason:
+                raise SystemExit("focus prereq FOCUS NEED --reason \"where the focus issue needs it\"")
+            live = [p for p in focus_prereqs(st) if int(p["issue"]) != need]
+            if len(live) >= PREREQ_MAX:
+                raise SystemExit(f"focus prereq: {PREREQ_MAX} prerequisites are live ("
+                                 + ", ".join(f"#{p['issue']}" for p in live) + "); finish one, or ask the owner")
+            if issue_open(need) is not True:
+                raise SystemExit(f"focus prereq: #{need} is not an open issue; only already-logged open issues count "
+                                 "(new or closed work is the owner's call)")
+            f["prereqs"] = live + [{"issue": need, "for": forn, "reason": reason[:300], "by": "tick" if tick else "owner",
+                                    "t": iso(now())}]
+            msg = f"focus prereq: #{need} counts as focus work for #{forn}: {reason[:200]}"
+        else:
+            raise SystemExit("focus prereq FOCUS NEED --reason R | focus prereq rm NEED")
+    log(msg)
+    print(msg)
+    if tick and "rm" not in args:
+        notify(f"focus-prereq-{args[1]}", "focus prerequisite",
+               f"{msg}. Drop it with `churn focus prereq rm {args[1]}`.", cooldown_h=1)
+    return 0
+
+
 def cmd_focus(a) -> int:
     """`churn focus` (status), `set NAME N..`, `add N..`, `rm N..`, `ladder ANCHOR [--skip P..]`, `off`,
-    `filler --hours H --reason R [--max N]` / `filler off` (the tick may open filler only while starving)."""
+    `filler --hours H --reason R [--max N]` / `filler off` (the tick may open filler only while starving),
+    `prereq FOCUS NEED --reason R` / `prereq rm NEED` (the tick may link an already-logged prerequisite)."""
     args = list(a.args or [])
     if a.action == "status":
         state = load_state()
@@ -5336,9 +5425,13 @@ def cmd_focus(a) -> int:
         q = state.get("queue", [])
         print(f"  queued: {sum(in_focus(state, x) for x in q)} focus, {sum(not in_focus(state, x) for x in q)} off-focus "
               f"(launch only as filler)")
+        for p in focus_prereqs(state):
+            print(f"  prerequisite #{p['issue']} for #{p['for']} ({p.get('by')}, {p.get('t')}): {p.get('reason', '')[:100]}")
         for p in (f.get("parked") or [])[-10:]:
             print(f"  not queued (off focus, {p.get('source')}, {p.get('t')}): #{p['issue']} {p['task'][:100]}")
         return 0
+    if a.action == "prereq":
+        return focus_prereq(args, a.reason)
     if a.action == "filler":
         with edit_state() as st:
             f = st.setdefault("focus", {})
@@ -8702,12 +8795,15 @@ def main() -> int:
     gl.add_argument("args", nargs="*")
     fo = sub.add_parser("focus", help="the owner's focus, what this host launches first and alone: status (default) / "
                                       "set NAME N.. / add N.. / rm N.. / ladder ANCHOR|off [--skip P..] / off / "
-                                      "filler --hours H --reason R | filler off")
-    fo.add_argument("action", nargs="?", default="status", choices=["status", "set", "add", "rm", "ladder", "off", "filler"])
+                                      "filler --hours H --reason R | filler off / "
+                                      "prereq FOCUS NEED --reason R | prereq rm NEED")
+    fo.add_argument("action", nargs="?", default="status",
+                    choices=["status", "set", "add", "rm", "ladder", "off", "filler", "prereq"])
     fo.add_argument("args", nargs="*")
     fo.add_argument("--skip", nargs="*", help="ladder: programs the ladder leaves out (owner rulings)")
     fo.add_argument("--hours", type=float, help=f"filler: how long the window stays open (max {FILLER_HOURS_MAX})")
-    fo.add_argument("--reason", help="filler: one plain sentence, why the focus cannot use the slot")
+    fo.add_argument("--reason", help="filler: one plain sentence, why the focus cannot use the slot; prereq: where "
+                                     "the focus issue needs it")
     fo.add_argument("--max", type=int, help=f"filler: launches the window allows (default {FILLER_MAX})")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
     sub.add_parser("poll", help="every 2 min: one gh call; start the gate at once when a watched PR changed")

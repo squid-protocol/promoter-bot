@@ -4439,6 +4439,53 @@ def test_the_tick_opens_filler_only_while_the_focus_starves(churn, monkeypatch):
     assert not churn.filler_open(churn.load_state())
 
 
+def _prereq_ns(args, reason="the ZECS002 slice needs #4125's resolver"):
+    return argparse.Namespace(action="prereq", args=args, skip=None, hours=None, reason=reason, max=None)
+
+
+def test_a_focus_issue_may_link_an_already_logged_open_prerequisite_as_focus_work(churn, monkeypatch):
+    pages, opened = [], {4125: True, 4254: True, 3799: True, 5859: False}
+    monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: pages.append(key) or True)
+    monkeypatch.setattr(churn, "issue_open", lambda n: opened.get(n))
+    put(churn, focus=_focus(churn, monkeypatch))
+    monkeypatch.setenv("CHURN_RUN", "1")  # the tick may link one
+    assert not churn.in_focus(churn.load_state(), item(4125))
+    churn.cmd_focus(_prereq_ns(["6072", "4125"]))
+    st = churn.load_state()
+    assert churn.in_focus(st, item(4125)) and churn.focus_prereqs(st)[0]["by"] == "tick"
+    assert pages == ["focus-prereq-4125"]  # the owner hears of every link
+    with pytest.raises(SystemExit, match="not a focus issue"):
+        churn.cmd_focus(_prereq_ns(["4125", "4254"]))  # one level only
+    with pytest.raises(SystemExit, match="not an open issue"):
+        churn.cmd_focus(_prereq_ns(["6072", "5859"]))  # closed
+    with pytest.raises(SystemExit, match="not an open issue"):
+        churn.cmd_focus(_prereq_ns(["6072", "9999"]))  # never logged
+    with pytest.raises(SystemExit, match="--reason"):
+        churn.cmd_focus(_prereq_ns(["6072", "4254"], reason=None))
+    churn.cmd_focus(_prereq_ns(["6072", "4254"]))
+    churn.cmd_focus(_prereq_ns(["6271", "3799"]))
+    opened[5133] = True
+    with pytest.raises(SystemExit, match="prerequisites are live"):
+        churn.cmd_focus(_prereq_ns(["6072", "5133"]))
+    churn.cmd_focus(_prereq_ns(["rm", "4254"]))
+    assert not churn.in_focus(churn.load_state(), item(4254))
+
+
+def test_a_prerequisite_ends_when_it_closes_or_its_focus_issue_leaves(churn, monkeypatch):
+    opened = {4125: True, 3799: True}
+    monkeypatch.setattr(churn, "issue_open", lambda n: opened.get(n))
+    put(churn, focus=_focus(churn, monkeypatch))
+    churn.cmd_focus(_prereq_ns(["6072", "4125"]))
+    churn.cmd_focus(_prereq_ns(["6271", "3799"]))
+    opened[4125] = False
+    assert churn.prune_prereqs(churn.load_state()) == ["#4125 (closed)"]
+    with churn.edit_state() as st:
+        st["focus"]["issues"] = [6072]  # the owner took #6271 out of the focus
+    assert not churn.in_focus(churn.load_state(), item(3799))
+    assert churn.prune_prereqs(churn.load_state()) == ["#3799 (focus #6271 left the focus)"]
+    assert churn.load_state()["focus"]["prereqs"] == []
+
+
 def test_filler_launches_only_when_no_focus_item_can_and_never_reorders_the_focus(churn, monkeypatch):
     f = _focus(churn, monkeypatch, filler={"until": churn.iso(churn.now() + churn.dt.timedelta(hours=2)), "launched": 0,
                                            "max": 2})
