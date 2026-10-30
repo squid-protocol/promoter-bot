@@ -222,7 +222,7 @@ LANES = ("normal", "ci", "backfill")
 CRUCIBLE_REPOS = {"estate-crucible", "cics-crucible"}
 QUEUE_KEYS = {"issue", "model", "task", "needs_owner", "backend", "pr", "after_prs", "allow_workflows", "agy_step", "lane", "repo", "after_merge",
               "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "wait_worker", "scope", "promoted", "rescue",
-              "regraft", "also_prs", "owner_hold"}
+              "regraft", "also_prs", "owner_hold", "covered_note"}
 # Scope labels (scope:core|sweep|frontier|infra) are kept on items for the scorecard; they no longer order or hold work.
 # Tiers, promotion and scope ranks were retired 2026-10-25: the owner's focus decides what launches.
 SCOPES = ("core", "sweep", "frontier", "infra")
@@ -3417,6 +3417,96 @@ def blocked_by(q: dict, snap: dict | None, state: dict | None = None) -> list[in
 STALL_AFTER = 3
 
 
+# #30 (nyx 2026-10-20): a queued item whose scope an open PR of the same issue already covered waited 6 h, then
+# relaunched once the PR merged and redid the work. Now a new-work item that names files, overlapping an open watched PR
+# of its issue, waits for that PR to MERGE (after_prs + after_merge) with a note of what the PR already changes; when
+# the PR merges, an item whose named files the merged diff fully covers is dropped ("covered by merged PR #N", task in
+# the log). Never dropped on overlap alone: a deliberate next slice often edits the same file (a ladder case.json).
+# Left alone: items naming no files, PR-fix and red-main items, and churn's own generated next slices (GENERATED_AUTO).
+TASK_PATH = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)+[\w.-]+\.[A-Za-z]{1,6}|[\w.-]+\.(?:py|json|md|yml|yaml|toml|cbl|cpy|"
+                       r"cob|jcl|bms|asm|mac|java|sh))(?![\w/-])")
+
+
+def task_paths(task: str) -> set[str]:
+    """The file paths an item's task names (`tests/tools/x.py`, `case.json`, ...)."""
+    return {m.group(1).strip(".") for m in TASK_PATH.finditer(task or "")} - {""}
+
+
+def split_covered(paths: set[str], files: set[str]) -> tuple[set[str], set[str]]:
+    """(paths a changed file covers, the rest): a path matches a file exactly or as its trailing part (`case.json`)."""
+    hit = {p for p in paths if any(f == p or f.endswith("/" + p) for f in files)}
+    return hit, paths - hit
+
+
+def pr_changed_files(n: int, head: str | None) -> set[str] | None:
+    """PR n's changed files, from the per-head cache inflight_files keeps (#64), else one gh read; None if unreadable."""
+    try:
+        cache = json.loads(PR_FILES_CACHE.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    hit = cache.get(str(n)) or {}
+    if head and hit.get("head") == head:
+        return set(hit.get("files") or [])
+    try:
+        files = {f["filename"] for f in gh_json(f"repos/{REPO}/pulls/{n}/files?per_page=100")}
+    except (RuntimeError, ValueError):
+        return None
+    if head:
+        cache[str(n)] = {"head": head, "files": sorted(files)}
+        with contextlib.suppress(OSError):
+            PR_FILES_CACHE.write_text(json.dumps(cache))
+    return files
+
+
+GENERATED_AUTO = ("refill", "followup-next")  # a next slice queued on purpose after a merge: never "covered"
+
+
+def _foldable(x: dict) -> bool:
+    return bool(x.get("issue")) and not x.get("pr") and x.get("auto") != "main-red" and not x.get("main_red_pr") \
+        and not str(x.get("task", "")).startswith(("Fix PR", "Main is red:")) and bool(task_paths(x.get("task", "")))
+
+
+def fold_covered(state: dict, snap: dict) -> list[str]:
+    """#30: a new-work queue item whose named files an open watched PR of its issue also changes waits for that PR to
+    merge, with a note of what it already changes (the merge sweep then drops it if nothing is left)."""
+    open_prs: dict[int, list[tuple[int, str | None]]] = {}
+    for p in state.get("prs", []):
+        n, v = pr_num(p), snap.get(str(pr_num(p)), {})
+        if isinstance(p, dict) and p.get("issue") and v.get("state") == "open":
+            open_prs.setdefault(int(p["issue"]), []).append((n, v.get("head")))
+    out = []
+    for x in state.get("queue", []):
+        if not _foldable(x) or x.get("auto") in GENERATED_AUTO or int(x["issue"]) not in open_prs:
+            continue
+        paths = task_paths(x["task"])
+        for n, head in open_prs[int(x["issue"])]:
+            if n in (x.get("after_prs") or []) or (files := pr_changed_files(n, head)) is None:
+                continue
+            hit, rest = split_covered(paths, files)
+            if not hit:
+                continue
+            x["after_prs"] = sorted({*(x.get("after_prs") or []), n})
+            x["after_merge"] = True
+            x["covered_note"] = n
+            x["task"] = (f"(PR #{n} already changes {', '.join(sorted(hit))[:200]}; this item waited for it to merge: do "
+                         f"only what it left{' -- ' + ', '.join(sorted(rest))[:200] if rest else ''}.) " + x["task"])
+            out.append(f"#{x['issue']}: waits for PR #{n} to merge (it already changes {len(hit)} of {len(paths)} "
+                       "named files)")
+    return out
+
+
+def drop_merged_covered(state: dict, issue: int, pr: int) -> list[str]:
+    """#30 merge sweep: queued new-work items of `issue` whose named files the merged PR fully changed are dropped."""
+    cands = [x for x in state.get("queue", []) if _foldable(x) and x.get("auto") not in GENERATED_AUTO
+             and int(x["issue"]) == int(issue)]
+    if not cands or (files := pr_changed_files(pr, None)) is None:
+        return []
+    gone = [x for x in cands if not split_covered(task_paths(x["task"]), files)[1]]
+    if gone:
+        state["queue"] = [x for x in state.get("queue", []) if not any(x is g for g in gone)]
+    return [f"dropped #{issue} from the queue: covered by merged PR #{pr} (task: {x['task'][:160]})" for x in gone]
+
+
 def settle_closed(state: dict, snap: dict) -> list[str]:
     """Drop merged/closed PRs from the watch list. A merge that says "Fixes #n" needs nothing more (GitHub closes the
     issue); a "Part of" merge or an unmerged close becomes a followup the tick must clear (`churn followup done`)."""
@@ -3432,6 +3522,9 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
         m = re.match(r"churn/(\d+)-", v.get("branch", ""))
         owner = issue or (int(m.group(1)) if m else None)  # #20: an entry without its issue (mark_flake, ints) settles
         checks = v.get("checks") or ([[*v["check"], ""]] if v.get("check") else [])
+        if v.get("merged") and owner:
+            with contextlib.suppress(Exception):  # #30: a merged slice retires queued items it already did
+                notes += drop_merged_covered(state, int(owner), n)
         if v.get("merged") and owner and checks and not v.get("closes") and (
                 note := "; ".join(x for c in checks if (x := settle_check(state, int(owner), n, *c)))):
             notes.append(note)  # the box records it: no followup for the tick
@@ -7228,6 +7321,9 @@ def cmd_tick(a) -> int:
                 with contextlib.suppress(Exception):
                     if carried := carry_reviews(st, snap):
                         log("review kept across the gate's update-branch: " + ", ".join(carried))
+                with contextlib.suppress(Exception):  # #30
+                    for note in fold_covered(st, snap):
+                        log(note)
                 pruned = prune_pr_fixes(st, snap)
                 fixes = queue_pr_fixes(st, snap)
                 with contextlib.suppress(Exception):
