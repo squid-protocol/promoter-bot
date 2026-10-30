@@ -8146,8 +8146,9 @@ def push_factory(data: dict, tries: int = 3) -> bool:
         out = {"repo": data.get("repo", REPO), "updated": data["updated"], "hosts": hosts,
                "days": combine_factory_days(hosts)}
         content = base64.b64encode(json.dumps(out, indent=1, sort_keys=True).encode()).decode()
-        r = run(["gh", "api", "-X", "PUT", path, "-f", f"message=churn: agent factory metrics {data['updated']} ({HOST_ID})",
-                 "-f", f"content={content}", "-f", f"branch={DASH_BRANCH}", *(["-f", f"sha={sha}"] if sha else [])])
+        body = {"message": f"churn: agent factory metrics {data['updated']} ({HOST_ID})", "content": content,
+                "branch": DASH_BRANCH, **({"sha": sha} if sha else {})}
+        r = run(["gh", "api", "-X", "PUT", path, "--input", "-"], input=json.dumps(body))  # on stdin: an argument caps at 128 KB
         if not r.returncode:
             return True
         err = r.stderr.strip()

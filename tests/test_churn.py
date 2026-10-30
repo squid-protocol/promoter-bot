@@ -1470,7 +1470,7 @@ def test_factory_history_keeps_its_days_and_publishes_one_file(churn, monkeypatc
     puts = []
     monkeypatch.setattr(churn, "FACTORY_DAYS", 30)
     monkeypatch.setattr(churn, "gh_json", lambda path: {"sha": "abc"})
-    monkeypatch.setattr(churn, "run", lambda cmd, **kw: puts.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: puts.append([*cmd, json.loads(kw["input"])]) or subprocess.CompletedProcess(cmd, 0, "", ""))
     fa = {"worker_hours": {"new_work": 1.0}, "new_work_share": 1.0}
     for i in range(32):
         day = (churn.dt.date(2026, 9, 1) + churn.dt.timedelta(days=i)).isoformat()
@@ -1478,13 +1478,13 @@ def test_factory_history_keeps_its_days_and_publishes_one_file(churn, monkeypatc
                               "usd_per_merged_churn_pr": 4.5}, push=(i == 31))
     data = json.loads(churn.FACTORY.read_text())
     assert len(data["days"]) == 30 and min(data["days"]) == "2026-09-03" and data["days"]["2026-10-02"]["churn_merged"] == 2
-    assert len(puts) == 1 and puts[0][:4] == ["gh", "api", "-X", "PUT"] and "sha=abc" in puts[0]
-    assert "branch=dashboard" in puts[0] and puts[0][4] == f"repos/{churn.DASH_REPO}/contents/factory.json"
+    assert len(puts) == 1 and puts[0][:4] == ["gh", "api", "-X", "PUT"] and puts[0][-1]["sha"] == "abc"
+    assert puts[0][-1]["branch"] == "dashboard" and puts[0][4] == f"repos/{churn.DASH_REPO}/contents/factory.json"
 
 
 def _published(cmd):
     import base64
-    return json.loads(base64.b64decode(next(a for a in cmd if a.startswith("content="))[8:]))
+    return json.loads(base64.b64decode(cmd[-1]["content"]))
 
 
 def _day(merged, usd, new, fix, mw, slot, wait):
@@ -1516,11 +1516,20 @@ def test_publishing_replaces_only_this_hosts_days(churn, monkeypatch):
     puts = []
     monkeypatch.setattr(churn, "HOST_ID", "nyx")
     monkeypatch.setattr(churn, "gh_json", lambda path: cur)
-    monkeypatch.setattr(churn, "run", lambda cmd, **kw: puts.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: puts.append([*cmd, json.loads(kw["input"])]) or subprocess.CompletedProcess(cmd, 0, "", ""))
     assert churn.push_factory({"updated": "t", "days": {"d1": _day(2, 8.0, 1.0, 1.0, 1, 0.25, 30.0)}})
     out = _published(puts[0])
     assert set(out["hosts"]) == {"melek", "nyx"} and out["hosts"]["melek"] == remote["hosts"]["melek"]
-    assert out["days"]["d1"]["churn_merged"] == 8 and "sha=s1" in puts[0]
+    assert out["days"]["d1"]["churn_merged"] == 8 and puts[0][-1]["sha"] == "s1"
+
+
+def test_a_factory_file_over_the_argument_limit_goes_on_stdin(churn, monkeypatch):
+    calls = []
+    monkeypatch.setattr(churn, "gh_json", lambda path: {"sha": "s1", "content": ""})
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: calls.append((cmd, kw)) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    assert churn.push_factory({"updated": "t", "days": {"d1": {"note": "x" * 200_000}}})
+    cmd, kw = calls[0]
+    assert max(map(len, cmd)) < 1000 and len(kw["input"]) > 200_000  # 2026-10-30: `limits` took it past Linux's 128 KB
 
 
 def test_a_pre_host_file_is_kept_as_legacy_and_a_lost_race_is_retried(churn, monkeypatch):
@@ -1530,7 +1539,7 @@ def test_a_pre_host_file_is_kept_as_legacy_and_a_lost_race_is_retried(churn, mon
     puts = []
     monkeypatch.setattr(churn, "HOST_ID", "nyx")
     monkeypatch.setattr(churn, "gh_json", lambda path: next(reads))
-    monkeypatch.setattr(churn, "run", lambda cmd, **kw: puts.append(cmd) or subprocess.CompletedProcess(
+    monkeypatch.setattr(churn, "run", lambda cmd, **kw: puts.append([*cmd, json.loads(kw["input"])]) or subprocess.CompletedProcess(
         cmd, 1 if len(puts) == 1 else 0, "", "HTTP 409: factory.json does not match s1"))
     assert churn.push_factory({"updated": "t", "days": {}})
     assert len(puts) == 2 and _published(puts[1])["hosts"]["_legacy"] == flat["days"]
