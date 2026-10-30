@@ -471,6 +471,7 @@ ETAG_CACHE = H / "etag-cache"  # #64: conditional requests: a 304 does not count
 QUOTA_DEFAULT = {"reserve": 1000, "optional_reserve": 2000}
 QUOTA_MODE = "ok"
 GH_CALLS = H / "gh-calls.log"  # #64: one line per gh call churn makes (time, caller, endpoint), for the API budget
+GH_WORKER_CALLS = H / "gh-worker-calls.log"  # #64: the same shape, one line per `gh` a worker runs (tools/log-gh-calls.py)
 
 
 GH_WRITE_SUBCOMMANDS = {("pr", x) for x in ("create", "edit", "merge", "ready", "comment", "close", "reopen", "review")} | \
@@ -536,12 +537,15 @@ def quota_tick(state: dict) -> dict | None:
     burn = None
     if prev.get("reset") == q["reset"] and prev.get("ts") and t - prev["ts"] > 30:
         burn = round(max(0, q["used"] - prev["used"]) / (t - prev["ts"]) * 3600)
-    mine = 0
+    mine = workers = 0
+    since = iso(dt.datetime.fromtimestamp(prev.get("ts") or t - 600, dt.timezone.utc))
     with contextlib.suppress(OSError):
-        since = iso(dt.datetime.fromtimestamp(prev.get("ts") or t - 600, dt.timezone.utc))
         mine = sum(1 for line in GH_CALLS.read_text().splitlines() if line[:17] >= since)
+    with contextlib.suppress(OSError):
+        workers = sum(1 for line in GH_WORKER_CALLS.read_text().splitlines() if line[:17] >= since)
     QUOTA_MODE = quota_mode(q, burn, quota_cfg(state), t)
-    reading = {**q, "ts": t, "t": iso(now()), "burn_h": burn, "churn_calls": mine, "mode": QUOTA_MODE}
+    reading = {**q, "ts": t, "t": iso(now()), "burn_h": burn, "churn_calls": mine, "worker_calls": workers,
+               "mode": QUOTA_MODE}
     with contextlib.suppress(OSError):
         with open(GH_QUOTA_LOG, "a") as fh:
             fh.write(json.dumps(reading, sort_keys=True) + "\n")
@@ -1638,8 +1642,11 @@ def slot_free(state: dict, b: dict) -> bool:
 # Every session churn starts gets the self-wait hook (2026-10-17: two workers spun ~1 h in a `pgrep -f` loop that
 # matched its own command line). It adds to the user's own hooks.
 SELF_WAIT_HOOK = Path(SELF).parent / "tools" / "block-self-wait.py"
+# #64: and the gh-call log (never blocks), so a worker's API calls are attributed instead of landing in "other"
+GH_LOG_HOOK = Path(SELF).parent / "tools" / "log-gh-calls.py"
 SESSION_SETTINGS = json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
-    {"type": "command", "command": f"python3 {SELF_WAIT_HOOK}", "timeout": 10}]}]}})
+    {"type": "command", "command": f"python3 {SELF_WAIT_HOOK}", "timeout": 10},
+    {"type": "command", "command": f"python3 {GH_LOG_HOOK}", "timeout": 5}]}]}})
 
 
 def claude_cmd(prompt: str, model: str, budget: float, resume: str | None = None, allowed: list[str] | None = None) -> list[str]:
@@ -2084,7 +2091,7 @@ def cmd_run(a) -> int:
     """Detached body of one worker: (plan, impact check,) run claude, save its JSON, then nudge a tick."""
     rd = RUNS / a.run_id
     meta = json.loads((rd / "meta.json").read_text())
-    env = plan_env(PYTHONPATH=meta["worktree"])
+    env = plan_env(PYTHONPATH=meta["worktree"], CHURN_RUN_ID=a.run_id, CHURN_GH_LOG=str(GH_WORKER_CALLS))
     # --max-budget-usd is checked against the session's total, which on a resume includes the earlier runs
     budget = float(meta.get("budget_usd") or WORKER_BUDGET[meta["model"]]) + float(meta.get("resume_base_usd") or 0)
     if meta.get("lane") == "credit":
@@ -7470,7 +7477,8 @@ def _median(xs: list[float]) -> float | None:
     return round((xs[len(xs) // 2] + xs[(len(xs) - 1) // 2]) / 2, 2) if xs else None
 
 
-def api_day(day: dt.date, quota_log: Path | None = None, calls_log: Path | None = None) -> dict:
+def api_day(day: dt.date, quota_log: Path | None = None, calls_log: Path | None = None,
+            worker_log: Path | None = None) -> dict:
     """#64: the day's API use for the dashboard: per reset window (one hour) the most used, the readings at 0 (gate
     runs that found the quota exhausted), and churn's own calls by caller."""
     lo = day.isoformat()
@@ -7493,8 +7501,17 @@ def api_day(day: dt.date, quota_log: Path | None = None, calls_log: Path | None 
                 callers[parts[1].split(">")[0]] += 1
                 if len(parts) > 4 and parts[4] == "w":
                     writes_h[parts[0][11:13]] += 1
+    workers: collections.Counter = collections.Counter()
+    worker_writes = 0
+    with contextlib.suppress(OSError):
+        for line in (worker_log or GH_WORKER_CALLS).read_text().splitlines():
+            parts = line.split("\t")
+            if parts[0].startswith(lo) and len(parts) > 1:
+                workers[parts[1]] += 1
+                worker_writes += len(parts) > 4 and parts[4] == "w"
     hours = {dt.datetime.fromtimestamp(r - 3600, dt.timezone.utc).strftime("%H"): u for r, u in sorted(windows.items())}
-    return {"readings": readings, "used_by_hour": hours, "peak_hour": max(hours.values()) if hours else None,
+    return {"worker_calls": sum(workers.values()), "worker_writes": worker_writes,
+            "worker_top_runs": dict(workers.most_common(5)), "readings": readings, "used_by_hour": hours, "peak_hour": max(hours.values()) if hours else None,
             "readings_at_zero": zero, "churn_calls": sum(callers.values()), "churn_by_caller": dict(callers.most_common(8)),
             "churn_writes": sum(writes_h.values()), "churn_writes_busiest_hour": max(writes_h.values()) if writes_h else 0}
 
@@ -8092,7 +8109,7 @@ def cmd_status(a) -> int:
         print(f"GitHub API: {gq.get('remaining')}/{gq.get('limit')} left, resets "
               f"{iso(dt.datetime.fromtimestamp(gq.get('reset', 0), dt.timezone.utc))}, burn "
               f"{gq.get('burn_h') if gq.get('burn_h') is not None else '?'}/h (all users of the token), churn "
-              f"{gq.get('churn_calls')} calls since the reading before; mode {gq.get('mode')} at {gq.get('t')}")
+              f"{gq.get('churn_calls')} + workers {gq.get('worker_calls', '?')} calls since the reading before; mode {gq.get('mode')} at {gq.get('t')}")
     ex = active_experiment(state)
     print("experiments: " + (f"{ex['id']} {ex['stage']} (${exp_spent(ex)} of ${exp_cfg(state)['budget_usd']}): "
                              f"{ex['question'][:90]}" if ex else f"none active; {exp_room(state)[1]}"))

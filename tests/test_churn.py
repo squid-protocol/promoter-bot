@@ -4165,10 +4165,35 @@ def test_api_day_sums_the_hours_zero_readings_and_churn_callers(churn, tmp_path)
         {"t": "2026-10-23T20:15Z", "reset": 1, "used": 9, "remaining": 1})))
     cl.write_text("2026-10-24T19:22Z\tpr_snapshot>cmd_tick\tgraphql\t\n2026-10-24T19:23Z\tinflight_files>x\tapi\tr\n"
                   "2026-10-24T19:24Z\tinflight_files>x\tapi\tr\n2026-10-23T01:00Z\told\tapi\tr\n")
-    d = churn.api_day(churn.dt.date(2026, 10, 24), ql, cl)
+    wl = tmp_path / "w.log"
+    wl.write_text("2026-10-24T19:30Z\tworker:7063-x\tapi\trepos/o/r/pulls/N\tr\n"
+                  "2026-10-24T19:31Z\tworker:7063-x\tpr\t\tw\n2026-10-23T01:00Z\tworker:old\tapi\t\tr\n")
+    d = churn.api_day(churn.dt.date(2026, 10, 24), ql, cl, wl)
     assert d["readings"] == 3 and d["readings_at_zero"] == 1 and d["peak_hour"] == 5000
     assert len(d["used_by_hour"]) == 2 and d["churn_calls"] == 3
     assert d["churn_by_caller"] == {"inflight_files": 2, "pr_snapshot": 1}
+    assert d["worker_calls"] == 2 and d["worker_writes"] == 1 and d["worker_top_runs"] == {"worker:7063-x": 2}
+
+
+def test_the_worker_gh_hook_logs_each_gh_command_and_never_blocks(tmp_path, monkeypatch):
+    """#64: tools/log-gh-calls.py appends one gh-calls.log-shaped line per `gh` a worker runs; a bad input exits 0."""
+    import os
+    import sys
+    hook = Path(__file__).resolve().parents[1] / "tools" / "log-gh-calls.py"
+    log = tmp_path / "w.log"
+    env = {**os.environ, "CHURN_GH_LOG": str(log), "CHURN_RUN_ID": "7064-r"}
+    def run(cmd, env=env):
+        return subprocess.run([sys.executable, str(hook)], input=json.dumps({"tool_input": {"command": cmd}}),
+                              capture_output=True, text=True, env=env)
+    r = run("gh pr view 7 --json state && gh api -X PATCH repos/o/r/issues/12 -f body=x; echo gh is fine")
+    assert r.returncode == 0 and r.stdout == ""
+    rows = [ln.split("\t") for ln in log.read_text().splitlines()]
+    assert [(x[1], x[2], x[3], x[4]) for x in rows] == [("worker:7064-r", "pr", "", "r"),
+                                                        ("worker:7064-r", "api", "repos/o/r/issues/N", "w")]
+    assert run("ls -la").returncode == 0 and len(log.read_text().splitlines()) == 2  # no gh: nothing logged
+    bad = subprocess.run([sys.executable, str(hook)], input="not json", capture_output=True, text=True, env=env)
+    assert bad.returncode == 0 and bad.stdout == ""
+    assert run("gh pr list", env={k: v for k, v in env.items() if k != "CHURN_GH_LOG"}).returncode == 0
 
 
 def test_poll_uses_a_conditional_request_and_a_304_costs_nothing(churn, monkeypatch):
