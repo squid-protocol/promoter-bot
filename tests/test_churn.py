@@ -4305,6 +4305,40 @@ def test_every_launch_path_refuses_off_focus_work(churn, monkeypatch):
         churn.cmd_worker(ns(off_focus=True))  # a tick cannot use the owner's override
 
 
+def test_an_item_an_open_pr_overlaps_waits_for_its_merge_and_a_covered_one_is_then_dropped(churn, monkeypatch):
+    """#30: overlap -> wait for the merge with a note; merged and fully covered -> dropped; generated slices untouched."""
+    files = {7000: {"tests/tools/ledger.py", "tests/equivalence/cases/zecs-zecs001/case.json"}}
+    monkeypatch.setattr(churn, "gh_json", lambda path: [{"filename": f} for f in files[int(path.split("/")[-2])]])
+    snap = {"7000": {"state": "open", "head": "abc"}}
+    covered = item(6839, task="add scenarios to zecs-zecs001/case.json")
+    partly = item(6839, task="edit tests/tools/ledger.py and tests/tools/other.py")
+    ladder = {**item(6839, task="[ladder:zecs] more scenarios in zecs-zecs001/case.json"), "auto": "refill"}
+    nopath = item(6839, task="take the next unchecked item")
+    other = item(4269, task="edit tests/tools/ledger.py")  # another issue's PR is no cover
+    put(churn, prs=[{"pr": 7000, "issue": 6839}], queue=[covered, partly, ladder, nopath, other])
+    with churn.edit_state() as st:
+        notes = churn.fold_covered(st, snap)
+    q = churn.load_state()["queue"]
+    assert len(q) == 5 and len(notes) == 2  # nothing dropped on overlap alone
+    assert q[0]["after_prs"] == [7000] and q[0]["after_merge"] and q[0]["task"].startswith("(PR #7000 already changes")
+    assert q[1]["after_prs"] == [7000] and "tests/tools/other.py" in q[1]["task"].split(")")[0]
+    assert "after_prs" not in q[2] and "after_prs" not in q[3] and "after_prs" not in q[4]
+    with churn.edit_state() as st:
+        assert churn.fold_covered(st, snap) == []  # once per PR
+        notes = churn.drop_merged_covered(st, 6839, 7000)
+    q = churn.load_state()["queue"]
+    assert len(notes) == 1 and "covered by merged PR #7000" in notes[0]
+    assert [x["task"][-40:] for x in q] == [x["task"][-40:] for x in (partly, ladder, nopath, other)]
+    assert churn.load_state()["queue"][0]["covered_note"] == 7000  # the key survives the queue normaliser
+
+
+def test_task_paths_reads_paths_not_versions_or_abbreviations(churn):
+    got = churn.task_paths("add 2 scenarios to zecs-zecs001/case.json; edit tests/tools/evidence_report.py and "
+                           "README.md (v1.2, e.g. 3.5x)")
+    assert got == {"zecs-zecs001/case.json", "tests/tools/evidence_report.py", "README.md"}
+    assert churn.split_covered({"case.json", "a/b.py"}, {"x/y/case.json"}) == ({"case.json"}, {"a/b.py"})
+
+
 def test_a_starved_focus_refills_the_next_checklist_line_of_idle_focus_issues(churn, monkeypatch):
     body = "- [x] first part\n- [ ] second part\n"
     issues = {6271: {"number": 6271, "state": "open", "title": "a focus issue", "body": body,
