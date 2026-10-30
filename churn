@@ -5307,6 +5307,42 @@ def focus_need(state: dict, snap: dict | None) -> str | None:
             f"or scope:sweep issues, one PR each, never an epic). Say in your summary which of the two you did.")
 
 
+# 2026-10-30 (owner, after an overnight of idle slots): when the focus starves, the gate itself queues the next unchecked
+# checklist line of each focus issue that has nothing queued, running or waiting for review, before the tick is asked.
+# At most FOCUS_REFILL_READS issue reads a pass, each issue at most once per FOCUS_REFILL_EVERY_H; the ladder anchor
+# is skipped (the ladder refill slices it by estate), and so is an issue another host claims or this host skips.
+FOCUS_REFILL_READS = 6
+FOCUS_REFILL_EVERY_H = 2
+
+
+def focus_refill(state: dict) -> list[str]:
+    """Queue the next checklist line of starved focus issues (see FOCUS_REFILL_READS). Returns log lines."""
+    if not focus_on(state) or state.get("workers_paused") or QUOTA_MODE != "ok":
+        return []
+    busy = {x.get("issue") for k in ("queue", "running", "reports_pending") for x in state.get(k, [])}
+    checked = focus_cfg(state).get("refill_checked") or {}
+    due = [n for n in focus_issues(state) if n not in busy and n != ladder_anchor(state)
+           and not ((t := parse_iso(checked.get(str(n)))) and now() - t < dt.timedelta(hours=FOCUS_REFILL_EVERY_H))]
+    out, items, seen = [], [], {}
+    for n in due[:FOCUS_REFILL_READS]:
+        seen[str(n)] = iso(now())
+        try:
+            i = gh_json(f"repos/{REPO}/issues/{n}")
+        except (RuntimeError, ValueError):
+            continue
+        if i.get("state") != "open" or foreign_claim(i) or host_skips(i):
+            continue
+        if c := next_check(i, state):
+            items.append(refill_item(i, check=c))
+            out.append(f"focus refill: queued #{n} [c:{c['key']}] {c['text'][:80]}")
+    with edit_state() as st:
+        f = st.setdefault("focus", {})
+        f["refill_checked"] = {**(f.get("refill_checked") or {}), **seen}
+        have = {x.get("issue") for x in st.get("queue", [])}
+        st.setdefault("queue", []).extend(x for x in items if x["issue"] not in have)
+    return out
+
+
 def focus_alerts(state: dict, snap: dict | None, launched: list[str]) -> list[str]:
     """Starvation bookkeeping, the unresolved-starvation page and the launch-mix pages. Returns log lines."""
     if not focus_on(state):
@@ -7305,6 +7341,11 @@ def cmd_tick(a) -> int:
                 for line in focus_alerts(state, snap, did):
                     log(line)
             state = load_state()
+            if starving(state):
+                with contextlib.suppress(Exception):  # a refill bug must never stop the gate
+                    for line in focus_refill(state):
+                        log(line)
+                state = load_state()
         if not a.dry_run:
             with contextlib.suppress(Exception), edit_state() as st:
                 for line in release_workflow_holds(st, snap):
@@ -8300,8 +8341,10 @@ def cmd_pr(a) -> int:
 def requeue_next_slice(state: dict, f: dict, nxt: str | None) -> str | None:
     """#37 (2026-10-21): followups for #5878/#5893 (#5648) and #5850 (#5649) left their issues open and nothing queued
     the next slice, so nyx's core work stopped until the owner requeued it. A merged "Part of" followup whose issue is
-    still open queues the next slice at the front: `--next` text when the tick gives it, else (core issues only, like
-    settle_check's checklist lines) a generic continue-after-#pr task. None = nothing queued."""
+    still open queues the next slice at the front: `--next` text when the tick gives it, else a generic
+    continue-after-#pr task. 2026-10-30: that generic slice was core-only (from before the focus lock), so the owner's
+    sweep/infra focus issues (#5126, #7064, #4269 ...) got no next slice overnight and the box idled; the focus
+    allowlist above now does that job. None = nothing queued."""
     issue = f.get("issue")
     if not issue or f.get("kind") != "merged" or (not nxt and (state.get("workers_paused")
                                                                or not focus_on(state))):
@@ -8315,8 +8358,6 @@ def requeue_next_slice(state: dict, f: dict, nxt: str | None) -> str | None:
     except (RuntimeError, ValueError):
         return None
     if i.get("state") != "open" or foreign_claim(i) or host_skips(i):
-        return None
-    if not nxt and issue_scope(issue, i) != "core":
         return None
     item = refill_item(i, task=(f"Next slice of #{issue} after PR #{f['pr']}: {nxt}" if nxt else
                                 f"#{issue} {i.get('title', '')[:120]} -- continue after PR #{f['pr']} (a merged slice): "
