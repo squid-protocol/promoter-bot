@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import bisect
 import collections
 import contextlib
 import datetime as dt
@@ -7612,6 +7613,75 @@ def api_day(day: dt.date, quota_log: Path | None = None, calls_log: Path | None 
             "churn_writes": sum(writes_h.values()), "churn_writes_busiest_hour": max(writes_h.values()) if writes_h else 0}
 
 
+# Owner 2026-10-30: the dashboard shows the limit in force each day. Several limits can apply at once, so each minute
+# gets one: the first thing that, if removed, would start another worker. Launches only: with every slot full this says
+# code-gen even when merges are stuck behind CI. A log reading stands for at most IDLE_TICK_CAP_S.
+LIMIT_PACE_S = 5 * 60  # a pace hold stands for one tick
+
+
+def _log_events(log_text: str, quiet_text: str) -> list[tuple[dt.datetime, str]]:
+    """Every logged event in time order, log order within a minute: sorting on the text as well put a minute's
+    "busy -> calm" before its "calm -> busy" and read as busy since midnight (ci_busy_hours 45 on 2026-10-23)."""
+    events = [(parse_iso(m.group(1)), m.group(2)) for t in (log_text, quiet_text) for line in t.splitlines()
+              if (m := LOG_LINE.match(line))]
+    return sorted(((t, x) for t, x in events if t), key=lambda e: e[0])
+
+
+def limits_day(lo: dt.datetime, hi: dt.datetime, events: list[tuple[dt.datetime, str]], max_workers: int) -> dict:
+    """Minutes of [lo, hi) under each limit, in all and by hour. `hosts` adds up across hosts with the rest, so a
+    combined day can be drawn per host."""
+    quiet, pace, modes, paused = [], [], [], set()
+    for t, x in events:
+        if t >= hi:
+            continue
+        if m := re.match(r"paused until (\S+)", x):
+            if until := parse_iso(m.group(1)):
+                paused.update(range(int((max(t, lo) - lo).total_seconds()) // 60,
+                                    int((min(until, hi) - lo).total_seconds()) // 60))
+        elif x.startswith("launch held by pace"):
+            pace.append(t)
+        elif m := re.match(r"CI mode \w+ -> (\w+)", x):
+            modes.append((t, m.group(1)))
+        elif m := re.match(r"quiet \(box (\w+).*?(\d+) running", x):
+            why = re.search(r"\bidle: (.*)$", x)
+            quiet.append((t, m.group(1), int(m.group(2)), why.group(1) if why else None))
+
+    def latest(rows: list, t: dt.datetime):
+        i = bisect.bisect_right(rows, t, key=lambda r: r[0] if isinstance(r, tuple) else r) - 1
+        return rows[i] if i >= 0 else None
+
+    def limit(minute: int) -> str:
+        if minute in paused:
+            return "tokens"
+        t = lo + dt.timedelta(minutes=minute)
+        q = latest(quiet, t)
+        if not q or (t - q[0]).total_seconds() > IDLE_TICK_CAP_S:
+            return "unknown"
+        _, box, running, why = q
+        if running >= max_workers:
+            return "code-gen"
+        held = latest(pace, t)
+        if held and (t - held).total_seconds() <= LIMIT_PACE_S:
+            return "tokens"
+        if box != "GREEN":
+            return "box"
+        kinds = {c.split(" (")[0].rsplit(" ", 1)[0] for c in re.split(r", (?![^()]*\))", why)} if why else set()
+        mode = latest(modes, t)
+        if kinds & {"ci-admission", "ci-busy"} or (not why and mode and mode[1] == "busy"):
+            return "ci"
+        if "owner" in kinds:
+            return "owner"
+        return "no-work" if kinds else "unknown"
+
+    total: collections.Counter = collections.Counter()
+    by_hour: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    for minute in range(int((hi - lo).total_seconds()) // 60):
+        c = limit(minute)
+        total[c] += 1
+        by_hour[f"{minute // 60:02d}"][c] += 1
+    return {"hosts": 1, "minutes": dict(total), "hours": {h: dict(c) for h, c in sorted(by_hour.items())}}
+
+
 def factory(day: dt.date, state: dict, log_text: str, quiet_text: str, merged_prs: list[dict],
             runs_dir: Path | None = None) -> dict:
     """The agent factory's own numbers for one UTC day (owner 2026-10-16: the bottleneck moved from CI to worker
@@ -7637,19 +7707,18 @@ def factory(day: dt.date, state: dict, log_text: str, quiet_text: str, merged_pr
             starts[k] += 1
     worked = sum(hours.values())
     slot_h = int(state.get("max_workers", 2)) * (hi - lo).total_seconds() / 3600
-    events = [(parse_iso(m.group(1)), m.group(2)) for t in (log_text, quiet_text) for line in t.splitlines()
-              if (m := LOG_LINE.match(line))]
-    events = [(t, x) for t, x in events if t and lo <= t < hi]
+    every = _log_events(log_text, quiet_text)
+    events = [(t, x) for t, x in every if lo <= t < hi]
     holds = {k: sum(1 for _, x in events if x.startswith(p)) for k, p in HOLDS}
     paused, last = 0.0, lo  # union of [line, paused_until] intervals
-    for t, x in sorted(events):
+    for t, x in events:
         if x.startswith("paused until ") and (until := parse_iso(x.split()[2])):
             a, b = max(t, last), min(until, hi)
             if b > a:
                 paused += (b - a).total_seconds() / 3600
                 last = b
     busy_h, since = 0.0, None  # CI-busy mode (normal work held): from the mode switches
-    for t, x in sorted(events):
+    for t, x in events:
         if x.startswith("CI mode "):
             if x.split()[4].startswith("busy"):
                 since = t
@@ -7688,7 +7757,7 @@ def factory(day: dt.date, state: dict, log_text: str, quiet_text: str, merged_pr
         "idle_hours": round(idle_h, 2), "idle_causes": dict(causes.most_common()),
         "idle_blockers": dict(blockers.most_common(5)),
         "review_wait_min_median": _median(waits), "pr_open_to_merge_h_median": _median(ages),
-        "api": api_day(day),
+        "api": api_day(day), "limits": limits_day(lo, hi, every, int(state.get("max_workers", 2))),
     }
 
 
@@ -8016,7 +8085,7 @@ def record_factory(c: dict, push: bool = True) -> bool:
 # Fields of a factory day that add up across hosts (counts, hours, dollars, worker slots); the ratios are recomputed
 # from these sums, so a combined day is exact. ci_busy_hours is each host's view of the same CI queue: the max.
 FACTORY_SUM = ("churn_merged", "slices_merged", "items_done", "usd", "loop_runs", "idle_ticks", "idle_hours", "paused_hours", "max_workers",
-               "worker_hours", "precheck", "holds", "idle_causes", "idle_blockers", "first_pass", "quality")
+               "worker_hours", "precheck", "holds", "idle_causes", "idle_blockers", "first_pass", "quality", "limits")
 
 
 def _add(a, b):
@@ -8143,10 +8212,30 @@ def cmd_checklist(a) -> int:
     return 0
 
 
+def backfill_limits(days: list[dt.date], push: bool) -> int:
+    """Add `limits` to days already recorded, from the logs alone (no GitHub) and each day's own max_workers: a full
+    backfill recomputes the day with today's, which would rewrite the history of the cap."""
+    data = json.loads(FACTORY.read_text()) if FACTORY.exists() else {}
+    log, quiet = (p.read_text(errors="ignore") if p.exists() else "" for p in (LOG, QUIET_LOG))
+    every = _log_events(log, quiet)
+    for day in days:
+        row = data.get("days", {}).get(day.isoformat())
+        if not row:
+            print(f"{day}: not recorded, skipped")
+            continue
+        lo = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
+        row["limits"] = limits_day(lo, min(lo + dt.timedelta(days=1), now()), every, int(row.get("max_workers") or 2))
+        print(f"{day}: {row['limits']['minutes']}")
+    FACTORY.write_text(json.dumps(data, indent=1, sort_keys=True))
+    return 0 if not push or push_factory(data) else 1
+
+
 def cmd_factory(a) -> int:
     """Record (and publish) the factory numbers for --days past days, e.g. a backfill; today's partial day with --today."""
     state, today = load_state(), now().date()
     days = [today - dt.timedelta(days=i) for i in range(a.days, 0, -1)] + ([today] if a.today else [])
+    if getattr(a, "limits_only", False):
+        return backfill_limits(days, a.push)
     for i, day in enumerate(days):
         if i:  # 2026-10-26: a 16-day backfill ran ~6 search counts a day back to back and hit search's 30/min limit
             time.sleep(FACTORY_PACE_S)
@@ -8911,6 +9000,7 @@ def main() -> int:
     fy.add_argument("--days", type=int, default=1, help="how many past UTC days (default: yesterday)")
     fy.add_argument("--today", action="store_true", help="also today so far")
     fy.add_argument("--push", action="store_true", help="publish factory.json to squid-bot's dashboard branch")
+    fy.add_argument("--limits-only", action="store_true", help="add only the limits of those days, keeping their recorded numbers")
     ck = sub.add_parser("checklist", help="checklist parts per open issue (ticked/total) and the scope's parts left")
     ck.add_argument("--scope", default="core", choices=list(SCOPES))
     ck.add_argument("--next", action="store_true", help="also show each issue's next unclaimed line")

@@ -1593,6 +1593,70 @@ def test_factory_totals_idle_hours_causes_and_blockers(churn, tmp_path):
     assert "~1.7h; blocked 2" in md and "blocked behind #5204 2" in md
 
 
+def test_ci_busy_hours_keep_a_flip_inside_one_minute_in_log_order(churn, tmp_path):
+    log = "\n".join(["- 2026-10-15T10:00Z [churn] CI mode calm -> busy (held)",
+                     "- 2026-10-15T10:00Z [churn] CI mode busy -> calm (room)"])
+    fa = churn.factory(churn.dt.date(2026, 10, 15), {"max_workers": 2}, log, "", [], runs_dir=tmp_path)
+    assert fa["ci_busy_hours"] == 0  # sorted on the text, the second line came first and read as busy since midnight
+
+
+def _limits(churn, quiet, max_workers=2, log=""):
+    lo = churn.dt.datetime(2026, 10, 15, tzinfo=churn.dt.timezone.utc)
+    return churn.limits_day(lo, lo + churn.dt.timedelta(hours=2), churn._log_events(log, quiet), max_workers)
+
+
+def _at(minute, rest):
+    return f"- 2026-10-15T{minute // 60:02d}:{minute % 60:02d}Z [churn] {rest}"
+
+
+def test_limits_take_the_first_thing_that_would_start_a_worker(churn):
+    green = "quiet (box GREEN: headroom; {} running, window $3)"
+    assert _limits(churn, _at(0, green.format(2)))["minutes"] == {"code-gen": 31, "unknown": 89}  # a reading lasts 30 min
+    both = green.format(1) + " idle: ci-admission 3 (room 5 runner-min), owner 2"
+    assert _limits(churn, _at(0, both))["minutes"]["ci"] == 31  # CI first: work is ready behind it
+    assert _limits(churn, _at(0, green.format(1) + " idle: owner 2"))["minutes"]["owner"] == 31
+    assert _limits(churn, _at(0, green.format(1) + " idle: blocked 5 (#1x5), wait 1"))["minutes"]["no-work"] == 31
+    assert _limits(churn, _at(0, green.format(1) + " idle: empty"))["minutes"]["no-work"] == 31
+    assert _limits(churn, _at(0, "quiet (box RED: load; 1 running, window $3) idle: owner 2"))["minutes"]["box"] == 31
+    assert _limits(churn, _at(0, green.format(1)))["minutes"]["unknown"] == 120  # a free slot and no reason logged
+    busy = _limits(churn, _at(0, green.format(1)), log=_at(0, "CI mode calm -> busy (held)"))
+    assert busy["minutes"]["ci"] == 31
+
+
+def test_limits_put_a_pause_first_and_a_pace_hold_after_full_slots(churn):
+    paused = _limits(churn, "", log=_at(30, "paused until 2026-10-15T01:00Z"))
+    assert paused["minutes"] == {"unknown": 90, "tokens": 30}  # no quiet lines while paused: the pause still counts
+    assert paused["hours"]["00"] == {"unknown": 30, "tokens": 30} and paused["hosts"] == 1
+    quiet = _at(0, "quiet (box GREEN: headroom; 1 running, window $3) idle: owner 2")
+    held = _limits(churn, quiet, log=_at(0, "launch held by pace: next 1 (opus)"))
+    assert held["minutes"]["tokens"] == 6 and held["minutes"]["owner"] == 25
+    full = _limits(churn, quiet, max_workers=1, log=_at(0, "launch held by pace: next 1 (opus)"))
+    assert full["minutes"] == {"code-gen": 31, "unknown": 89}
+
+
+def test_limits_add_up_across_hosts(churn):
+    a = _day(6, 12.0, 3.0, 1.0, 2, 0.5, 10.0)
+    limits = {"hosts": 1, "minutes": {"ci": 60}, "hours": {"10": {"ci": 60}}}
+    other = {"hosts": 1, "minutes": {"ci": 30, "owner": 30}, "hours": {"10": {"ci": 30, "owner": 30}}}
+    both = churn.combine_factory_days({"melek": {"d1": {**a, "limits": limits}}, "nyx": {"d1": {**a, "limits": other}}})
+    assert both["d1"]["limits"] == {"hosts": 2, "minutes": {"ci": 90, "owner": 30}, "hours": {"10": {"ci": 90, "owner": 30}}}
+    old = churn.combine_factory_days({"melek": {"d1": {**a, "limits": limits}}, "nyx": {"d1": a}})
+    assert old["d1"]["limits"]["hosts"] == 1  # a host without the field isn't counted: the bar stays per host
+
+
+def test_limits_backfill_keeps_each_days_recorded_cap(churn, monkeypatch, capsys):
+    pushed = []
+    monkeypatch.setattr(churn, "push_factory", lambda d: pushed.append(d) or True)
+    churn.FACTORY.write_text(churn.json.dumps({"days": {"2026-10-15": {"max_workers": 1, "usd": 5.0}}}))
+    churn.QUIET_LOG.write_text(_at(0, "quiet (box GREEN: headroom; 1 running, window $3)") + "\n")
+    days = [churn.dt.date(2026, 10, 15), churn.dt.date(2026, 10, 14)]
+    assert churn.backfill_limits(days, True) == 0
+    row = churn.json.loads(churn.FACTORY.read_text())["days"]["2026-10-15"]
+    assert row["max_workers"] == 1 and row["usd"] == 5.0  # the day's numbers stay as recorded
+    assert row["limits"]["minutes"]["code-gen"] == 31 and len(pushed) == 1  # with today's cap of 2 this would be unknown
+    assert "2026-10-14: not recorded, skipped" in capsys.readouterr().out
+
+
 def _ago(churn, minutes):
     return churn.iso(churn.now() - churn.dt.timedelta(minutes=minutes))
 
