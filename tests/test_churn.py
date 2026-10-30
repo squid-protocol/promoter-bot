@@ -309,6 +309,10 @@ class TestGateRules:
         q = done(1)
         assert len(q) == 1 and "continue after PR #1" in q[0]["task"]
         assert any("queued the next slice of #5648 (generic: no --next)" in ln for ln in churn.LOG.read_text().splitlines())
+        # 2026-10-30: a sweep/infra focus issue gets the generic next slice too (it was core-only; the box idled overnight)
+        put(churn, queue=[], focus={"name": "t", "issues": [5700]}, followups=[{"pr": 2, "kind": "merged", "issue": 5700}])
+        q = done(2)
+        assert len(q) == 1 and q[0]["issue"] == 5700 and q[0]["scope"] == "sweep"
 
     def test_review_done_without_pr_comments_the_outcome(self, churn, monkeypatch):
         calls = []
@@ -4274,6 +4278,34 @@ def test_every_launch_path_refuses_off_focus_work(churn, monkeypatch):
     monkeypatch.setenv("CHURN_RUN", "1")
     with pytest.raises(SystemExit, match="owner only"):
         churn.cmd_worker(ns(off_focus=True))  # a tick cannot use the owner's override
+
+
+def test_a_starved_focus_refills_the_next_checklist_line_of_idle_focus_issues(churn, monkeypatch):
+    body = "- [x] first part\n- [ ] second part\n"
+    issues = {6271: {"number": 6271, "state": "open", "title": "a focus issue", "body": body,
+                     "labels": [{"name": "scope:sweep"}]},
+              6072: {"number": 6072, "state": "open", "title": "the ladder", "body": body, "labels": []}}
+    reads = []
+    monkeypatch.setattr(churn, "gh_json", lambda path: reads.append(path) or issues[int(path.rsplit("/", 1)[1])])
+    monkeypatch.setattr(churn, "host_skips", lambda i: None)
+    monkeypatch.setattr(churn, "foreign_claim", lambda i: None)
+    put(churn, focus={**_focus(churn, monkeypatch), "ladder": {"anchor": 6072, "skip": []}})
+    out = churn.focus_refill(churn.load_state())
+    q = churn.load_state()["queue"]
+    assert [x["issue"] for x in q] == [6271] and "second part" in q[0]["task"] and out[0].startswith("focus refill")
+    assert all(not p.endswith("/6072") for p in reads)  # the ladder anchor is the ladder refill's
+    reads.clear()
+    with churn.edit_state() as st:
+        st["queue"] = []
+    assert churn.focus_refill(churn.load_state()) == [] and reads == []  # read at most once per FOCUS_REFILL_EVERY_H
+    with churn.edit_state() as st:
+        st["focus"]["refill_checked"] = {}
+        st["queue"] = [item(6271)]
+    assert churn.focus_refill(churn.load_state()) == [] and reads == []  # an issue with work queued is not read
+    with churn.edit_state() as st:
+        st["queue"] = []
+    monkeypatch.setattr(churn, "foreign_claim", lambda i: "nyx")
+    assert churn.focus_refill(churn.load_state()) == [] and churn.load_state()["queue"] == []  # another host's claim
 
 
 def test_queue_add_and_followups_park_off_focus_work_instead_of_queueing_it(churn, monkeypatch, capsys):
