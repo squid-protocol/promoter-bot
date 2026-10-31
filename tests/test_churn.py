@@ -4143,6 +4143,28 @@ def test_ci_occupancy_counts_jobs_not_runs_and_live_waits_reuse_them(churn):
     assert with_cap["runs_read"] == 1 and with_cap["runs_unread"] == 1
 
 
+def test_ci_occupancy_counts_jobs_running_inside_queued_runs(churn):
+    """2026-10-31: GitHub keeps a run `queued` while some of its jobs run and others wait, so in-progress runs alone
+    read 14.75 of 19.25. Queued runs' running jobs count, oldest first; their waiting jobs stay out of jobs_queued."""
+    ago = lambda m: churn.iso(churn.now() - dt.timedelta(minutes=m))  # noqa: E731
+    jobs = {1: [{"id": 11, "status": "in_progress", "created_at": ago(9)}],
+            2: [{"id": 21, "status": "in_progress", "created_at": ago(8)},
+                {"id": 22, "status": "queued", "created_at": ago(8)}],
+            3: [{"id": 31, "status": "queued", "created_at": ago(1)}]}
+
+    def gh(path):
+        return {"jobs": jobs[int(path.split("/runs/")[1].split("/")[0])]}
+
+    runs = [{"id": 1, "created_at": ago(9)}]
+    queued = [{"id": 3, "created_at": ago(1)}, {"id": 2, "created_at": ago(8)}]
+    occ = churn.ci_occupancy({}, runs, gh=gh, queued=queued)
+    assert (occ["jobs_running"], occ["jobs_running_in_queued_runs"], occ["jobs_queued"]) == (2, 1, 0)
+    assert list(occ["jobs"]) == [1]  # live PR waits still read in-progress runs only
+    capped = churn.ci_occupancy({"ci_admission_cfg": {"occupancy_queued_runs": 1}}, runs, gh=gh, queued=queued)
+    assert capped["jobs_running"] == 2  # the cap keeps the oldest run, the one with a job on a runner
+    assert churn.ci_occupancy({}, runs, gh=gh)["jobs_running"] == 1
+
+
 def test_admission_sees_how_long_queued_jobs_have_waited(churn):
     """Started-job waits only show the waits that ended: queued jobs' age cuts, blocks a climb, and lifts the hourly p50."""
     st = {"ci_profile": {"target_util": 0.8, "workflows": {}, "waits": []}}

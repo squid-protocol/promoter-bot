@@ -4722,7 +4722,8 @@ def ci_queue(gh=None, ignore=()) -> dict:
                                 if (t := parse_iso(r.get("created_at"))) and now() - t < dt.timedelta(hours=STALE_QUEUED_H))
     return {"queued": max(0, queued), "median_wait_min": round(waits[len(waits) // 2], 1) if waits else 0.0,
             **({"stale": stale} if stale else {}), **({"ignored": light} if light else {}),
-            **({"unseen": unseen} if unseen > 0 else {}), "by_workflow": dict(by_wf)}
+            **({"unseen": unseen} if unseen > 0 else {}), "by_workflow": dict(by_wf),
+            "runs": [{"id": r.get("id"), "created_at": r.get("created_at")} for r in runs]}
 
 
 def ci_mode(state: dict, q: dict, adm: dict | None = None) -> tuple[str, str]:
@@ -4878,7 +4879,8 @@ def per_push_cost(runs: list[dict], prof: dict, cfg: dict) -> float | None:
 CI_ADMISSION_DEFAULT = {"target_wait_min": 5.0, "util_init": 0.8, "util_min": 0.3, "util_max": 1.0, "util_step": 0.05,
                         "util_cut": 0.8, "pushes_per_pr": 2.0, "horizon_min": 60, "min_waits": 5,
                         "live_runs": 2, "fast_factor": 1.5, "fast_window_min": 30, "fast_every_min": 20,
-                        "hold_queue_wait_min": 10.0, "climb_every_min": 20, "occupancy_runs": 25}
+                        "hold_queue_wait_min": 10.0, "climb_every_min": 20, "occupancy_runs": 25,
+                        "occupancy_queued_runs": 12}
 
 
 def ci_admission_cfg(state: dict) -> dict:
@@ -4917,13 +4919,17 @@ def adjust_target_util(state: dict) -> str | None:
         if round(new, 3) != round(u, 3) else None
 
 
-def ci_occupancy(state: dict, in_progress: list[dict] | None, gh=None) -> dict:
+def ci_occupancy(state: dict, in_progress: list[dict] | None, gh=None, queued: list[dict] | None = None) -> dict:
     """Runner occupancy from the jobs of every run in progress (newest occupancy_runs, one API call each), counting the
     ignored light workflows too: they hold runners. 2026-10-24: the snapshot's `in_progress` counts RUNS (~10), which
     read as half the 20-runner pool idle; a job-level sample found 18-22 jobs running and 41-68 queued, queued jobs
     waiting a median 1.5-8 min and up to 37 min, while the started-job wait churn tuned on said ~3.6 min. Returns
     jobs_running, jobs_queued, queued_job_age_p50 / _max (minutes so far), runs_read, and `jobs` {run id: jobs} for
-    live_pr_job_waits to reuse."""
+    live_pr_job_waits to reuse.
+    2026-10-31: GitHub keeps a run `queued` while some of its jobs run and others wait for a runner, for minutes, so
+    reading in-progress runs alone saw 14.75 jobs on average while 19.25 ran. The oldest occupancy_queued_runs of `queued`
+    (those far enough along to hold runners) are read as well: their running jobs count in jobs_running and in
+    jobs_running_in_queued_runs, and their waiting jobs stay out of jobs_queued so the admission inputs don't move."""
     n = int(ci_admission_cfg(state)["occupancy_runs"])
     runs = sorted((r for r in in_progress or [] if r.get("id")), key=lambda r: str(r.get("created_at") or ""),
                   reverse=True)
@@ -4940,7 +4946,16 @@ def ci_occupancy(state: dict, in_progress: list[dict] | None, gh=None) -> dict:
             elif j.get("status") in ("queued", "waiting", "pending") and (c := parse_iso(j.get("created_at"))):
                 ages.append(round(max(0.0, (now() - c).total_seconds() / 60), 1))
     ages.sort()
-    return {"jobs_running": running, "jobs_queued": len(ages), "runs_read": len(jobs_by_run),
+    held = 0
+    oldest = sorted((r for r in queued or [] if r.get("id")), key=lambda r: str(r.get("created_at") or ""))
+    for r in oldest[:int(ci_admission_cfg(state)["occupancy_queued_runs"])]:
+        try:
+            jobs = (gh or gh_json)(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100&filter=latest").get("jobs", [])
+        except RuntimeError:
+            continue
+        held += sum(j.get("status") == "in_progress" for j in jobs)
+    return {"jobs_running": running + held, "jobs_running_in_queued_runs": held,
+            "jobs_queued": len(ages), "runs_read": len(jobs_by_run),
             **({"runs_unread": len(runs) - n} if len(runs) > n else {}),
             "queued_job_age_p50": ages[len(ages) // 2] if ages else None, "queued_job_age_max": ages[-1] if ages else None,
             "jobs": jobs_by_run}
@@ -7397,6 +7412,7 @@ def cmd_tick(a) -> int:
                 log(note)
             ign = ci_cfg(state)["ignore_workflows"]
             cq, inprog_all = ci_queue(ignore=ign), ci_in_progress()
+            queued_runs = cq.pop("runs", [])  # read for occupancy only: cq itself is saved in the state
             inprog = None if inprog_all is None else [r for r in inprog_all
                                                       if os.path.basename(str(r.get("path", ""))) not in set(ign)]
             prev_occ = state.get("ci_occupancy") or {}
@@ -7404,7 +7420,7 @@ def cmd_tick(a) -> int:
                 occ = {k: v for k, v in prev_occ.items() if k != "t"}  # #64: poll-nudged gates reuse it (~12 calls each)
                 occ_fresh = False
             else:
-                occ = ci_occupancy(state, inprog_all) if inprog_all is not None else {}
+                occ = ci_occupancy(state, inprog_all, queued=queued_runs) if inprog_all is not None else {}
                 occ_fresh = True
             want = [*collections.Counter(cq.get("by_workflow") or {}).elements(),
                     *(os.path.basename(str(r.get("path", ""))) for r in inprog or [])]
