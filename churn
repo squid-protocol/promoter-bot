@@ -6826,20 +6826,39 @@ def goal_reports() -> list[dict]:
     return out
 
 
+# Owner 2026-10-31: 68 cics-crucible programs shared one ladder slice, so the estate that held most of the ladder got
+# one worker at a time. An estate here slices by family, the program path part at this index, so each family is its own
+# `below` row and its own [ladder:estate/family] item, and a merge in one family does not wait on the others.
+LADDER_SPLIT = {"cics-crucible": 1}
+
+
+def ladder_group(estate: str, program: str) -> str:
+    """The `below` row of a program: its estate, or estate/family for an estate in LADDER_SPLIT."""
+    i, parts = LADDER_SPLIT.get(estate), Path(program).parts
+    return f"{estate}/{parts[i]}" if i is not None and len(parts) > i + 1 else estate
+
+
 def goal_measure(reports: list[dict], issues: list[dict]) -> dict:
     """Programs per level, and every program that does not translate whole (L0) with the open issues that name it.
     `untracked` = L0 programs no open issue mentions: nobody is working on them. `below` = {estate: [[program, level]]}
-    for the programs at L1-L3, which the ladder refill slices by estate."""
+    for the programs at L1-L3, which the ladder refill slices by estate (ladder_group). `source_defects` = L0 programs
+    the report names as source IBM rejects (owner 2026-10-31: settled): they keep their level but are nobody's work."""
     levels: collections.Counter = collections.Counter()
     texts = [(i["number"], f"{i.get('title', '')}\n{i.get('body') or ''}".lower()) for i in issues]
-    untranslated, below = [], collections.defaultdict(list)
+    untranslated, defects, below = [], [], collections.defaultdict(list)
     for rep in reports:
         for p in rep.get("programs") or []:
             lv = str(p.get("level") or "?").rstrip("*")
             levels[lv] += 1
             if lv in ("L1", "L2", "L3"):
-                below[Path(rep["file"]).parent.name].append([Path(str(p.get("program", ""))).stem, lv])
+                group = ladder_group(Path(rep["file"]).parent.name, str(p.get("program", "")))
+                below[group].append([Path(str(p.get("program", ""))).stem, lv])
             if lv != "L0":
+                continue
+            excl = p.get("ladder_exclusion") or {}
+            if excl.get("kind") == "source_defect":
+                defects.append({"estate": Path(rep["file"]).parent.name, "program": p.get("program"),
+                                "reason": str(excl.get("reason") or "")[:120], "issue": excl.get("issue")})
                 continue
             t = p.get("translation") or {}
             stem = Path(str(p.get("program", ""))).stem.lower()
@@ -6849,14 +6868,16 @@ def goal_measure(reports: list[dict], issues: list[dict]) -> dict:
                                  "classes": [str(c)[:120] for c in (t.get("gap_classes") or [])[:4]], "issues": hits})
     return {"t": iso(now()), "programs": sum(levels.values()), "levels": dict(sorted(levels.items())),
             "untranslated": untranslated, "untracked": [u["program"] for u in untranslated if not u["issues"]],
-            "below": {e: sorted(ps) for e, ps in sorted(below.items())}}
+            "source_defects": defects, "below": {e: sorted(ps) for e, ps in sorted(below.items())}}
 
 
 def goal_summary(m: dict) -> str:
     lv = " ".join(f"{k} {v}" for k, v in (m.get("levels") or {}).items())
     holes = sum(int(u.get("holes") or 0) for u in m.get("untranslated", []))
+    defects = len(m.get("source_defects") or [])
     return (f"{m.get('programs', 0)} programs: {lv}; {len(m.get('untranslated', []))} not translated whole "
-            f"({holes} holes), {len(m.get('untracked', []))} with no open issue")
+            f"({holes} holes), {len(m.get('untracked', []))} with no open issue"
+            + (f"; {defects} named source defects" if defects else ""))
 
 
 def goal_tick(state: dict, force: bool = False) -> list[str]:
@@ -6930,7 +6951,7 @@ def ladder_items(state: dict, snap: dict | None) -> list[dict]:
     last = dict(focus_cfg(state).get("ladder_queued") or {})
     out = []
     for estate, progs in sorted((m.get("below") or {}).items()):
-        if estate.lower() in skip:
+        if estate.split("/")[0].lower() in skip:
             continue  # a whole estate dropped from the ladder (owner 2026-10-27: cics-crucible)
         tag = LADDER_TAG.format(estate)
         if tag in ours or ((t := parse_iso(last.get(estate))) and (not measured or measured <= t)):
@@ -6940,10 +6961,12 @@ def ladder_items(state: dict, snap: dict | None) -> list[dict]:
         if not progs:
             continue
         names = ", ".join(f"{p} ({lv})" for p, lv in progs)
+        one_pr = ("ONE PR for the family, as many programs as fit one reviewable PR (the next measure queues the rest)"
+                  if "/" in estate else "ONE PR for the estate")
         out.append({"issue": int(anchor), "model": "sonnet", "needs_owner": False, "auto": "ladder", "scope": "core",
                     "task": f"{tag} ladder slice of #{anchor}, estate {estate}: lift every program below L4 at the "
                             f"latest evidence report ({names}). Re-measure at origin/main first (`ladder_gaps.py`): drop "
-                            f"what is already L4. ONE PR for the estate, one or both rungs, data only (case scenarios, "
+                            f"what is already L4. {one_pr}, one or both rungs, data only (case scenarios, "
                             f"reviewed infeasible outcomes with their reason; the ladder-slice skill, `ladder_refresh.py`); "
                             f"state before/after coverage per program. A program that will not close goes under "
                             f"**Remaining slices** with why; a harness or tool gap is a sibling for #6271, never code in "
@@ -6975,6 +6998,8 @@ def cmd_goal(a) -> int:
         print(f"  L0 {u['estate']} {u['program']}: {u.get('holes')} holes"
               + (f" ({u['refused']})" if u.get("refused") else "") + " -> "
               + (", ".join(f"#{n}" for n in u["issues"]) or "NO ISSUE"))
+    for d in m.get("source_defects") or []:
+        print(f"  source defect {d['estate']} {d['program']} ({d.get('issue')}): {d.get('reason')}")
     return 0
 
 

@@ -4812,3 +4812,47 @@ def test_factory_backfill_paces_days_and_retries_a_rate_limit_once(churn, monkey
     assert churn.cmd_factory(argparse.Namespace(days=2, today=False, push=True)) == 0
     assert sleeps == [churn.FACTORY_PACE_S, churn.FACTORY_RETRY_S]
     assert [c[2] for c in calls] == [False, True] and len(seen) == 3
+
+
+def test_a_split_estate_is_measured_and_sliced_by_family(churn, monkeypatch):
+    prog = "cases/{}/ca-x/src/{}.cbl"
+    reps = [{"file": "r/cics-crucible/report.json", "programs": [
+        {"program": prog.format("ghost-tasks", "CAA"), "level": "L1"},
+        {"program": prog.format("ghost-tasks", "CAB"), "level": "L1"},
+        {"program": prog.format("hex-attributes", "CAC"), "level": "L2"}]},
+        {"file": "r/zecs/report.json", "programs": [{"program": "ZECS001.cbl", "level": "L2"}]}]
+    m = churn.goal_measure(reps, [])
+    assert m["below"] == {"cics-crucible/ghost-tasks": [["CAA", "L1"], ["CAB", "L1"]],
+                          "cics-crucible/hex-attributes": [["CAC", "L2"]], "zecs": [["ZECS001", "L2"]]}
+    monkeypatch.setattr(churn, "RUNS", churn.Path("/nonexistent"))
+    st = {"focus": {"name": "f", "issues": [6072], "ladder": {"anchor": 6072, "skip": []}},
+          "goal": {"measure": m}, "queue": [{"task": "[ladder:cics-crucible/ghost-tasks] mine"}], "running": []}
+    monkeypatch.setattr(churn, "goal_cfg", lambda s: {"measure": m})
+    out = churn.ladder_items(st, {})
+    assert sorted(x["task"].split("]")[0] for x in out) == ["[ladder:cics-crucible/hex-attributes", "[ladder:zecs"]
+    fam = next(x for x in out if "hex-attributes" in x["task"])
+    assert "ONE PR for the family" in fam["task"]
+    assert "ONE PR for the estate" in next(x for x in out if "ladder:zecs" in x["task"])["task"]
+    st["focus"]["ladder"]["skip"] = ["cics-crucible"]  # a skip names the estate: every family goes
+    st["focus"]["ladder_queued"] = {}
+    assert [x["task"].split("]")[0] for x in churn.ladder_items(st, {})] == ["[ladder:zecs"]
+
+
+def test_a_program_outside_a_family_stays_on_its_estate(churn):
+    assert churn.ladder_group("cics-crucible", "CAA.cbl") == "cics-crucible"
+    assert churn.ladder_group("zecs", "cases/a/b.cbl") == "zecs"
+
+
+def test_a_named_source_defect_is_settled_not_untracked(churn):
+    reps = [{"file": "r/carddemo/report.json", "programs": [
+        {"program": "app/cbl/CBEXPORT.cbl", "level": "L0", "translation": {"hole_count": 7},
+         "ladder_exclusion": {"kind": "source_defect", "issue": "#5866", "reason": "RECORD KEY"}},
+        {"program": "app/cbl/EPS.cbl", "level": "L0", "translation": {"hole_count": 2},
+         "ladder_exclusion": {"kind": "owner_held", "issue": "#5106", "reason": "held"}},
+        {"program": "app/cbl/OTHER.cbl", "level": "L0", "translation": {"hole_count": 1}}]}]
+    m = churn.goal_measure(reps, [])
+    assert m["levels"] == {"L0": 3}  # the denominator keeps every program
+    assert [u["program"] for u in m["untranslated"]] == ["app/cbl/EPS.cbl", "app/cbl/OTHER.cbl"]
+    assert m["untracked"] == ["app/cbl/EPS.cbl", "app/cbl/OTHER.cbl"]  # only a source defect is settled
+    assert m["source_defects"][0]["program"] == "app/cbl/CBEXPORT.cbl"
+    assert churn.goal_summary(m).endswith("; 1 named source defects")
