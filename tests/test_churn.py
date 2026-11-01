@@ -3333,8 +3333,8 @@ def test_retro_is_due_weekly_only_with_a_standing_issue(churn):
     st["retro"]["last"] = churn.iso(churn.now() - dt.timedelta(days=2))
     assert churn.retro_due(st)[1].startswith("next after")
     st["retro"]["last"] = churn.iso(churn.now() - dt.timedelta(days=8))
-    st["running"] = [{"run_id": "5399-x", "pid": 7, "lane": "retro"}]
-    assert churn.retro_due(st) == (False, "a retro is running")
+    st["running"] = [{"run_id": "5399-x", "pid": 7, "lane": "rsi"}]
+    assert churn.retro_due(st) == (False, "an RSI job is running")
 
 
 def test_retro_data_gathers_the_weeks_facts_without_a_model(churn, tmp_path):
@@ -3367,7 +3367,7 @@ def test_retro_lane_launches_once_a_week_with_its_cap_and_a_deep_audit_every_fou
     green = {"verdict": "GREEN", "free_slots": 2}
     assert churn.retro_lane(green, {}) == ["weekly retro #3 (sonnet, cap $4.0)"]
     [a] = launched
-    assert a.issue == 5399 and a.lane == "retro" and a.budget_usd == 4.0 and not a.plan
+    assert a.issue == 5399 and a.lane == "rsi" and a.budget_usd == 4.0 and not a.plan
     assert "Part of #5399" in a.brief and "TEMPLATE" in a.brief and "Deep audit" not in a.brief
     assert json.loads((churn.H / "retro" / f"retro-{churn.now():%Y-%m-%d}.json").read_text())["runs"] == 0
     assert churn.retro_lane(green, {}) == []  # done for the week
@@ -3385,6 +3385,108 @@ def test_retro_cli_sets_issue_and_size_budgets(churn, capsys):
     cfg = churn.retro_cfg(churn.load_state())
     assert cfg["issue"] == 5399 and cfg["size_budget_kb"] == {".claude/agents/gitgalaxy-pr-worker.md": 16.0}
     assert "now: due" in capsys.readouterr().out
+
+
+def _conflict_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)  # noqa: E731
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (repo / "hot.py").write_text("def a():\n    return 1\n\n\ndef b():\n    return 2\n" + "# pad\n" * 200)
+    (repo / "small.py").write_text("x = 1\n")
+    (repo / "notes.md").write_text("one\n")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    for n in range(3):
+        src = (repo / "hot.py").read_text().replace(f"return {n + 1}\n", f"return {n + 10}\n")
+        (repo / "hot.py").write_text(src if n != 2 else src.replace("return 11", "return 12"))
+        (repo / "small.py").write_text(f"x = {n + 2}\n")
+        git("add", ".")
+        git("commit", "-qm", f"edit {n}")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    return repo
+
+
+def _plan_held(runs, run, files):
+    (runs / run).mkdir(parents=True)
+    (runs / run / "plan_held").write_text(json.dumps({"worker x": files}))
+
+
+def test_conflict_data_ranks_a_big_held_file_and_skips_docs_small_files_and_old_runs(churn, tmp_path):
+    repo, runs = _conflict_repo(tmp_path), tmp_path / "runs"
+    stamp = churn.now().strftime("%Y%m%dT%H%M")
+    _plan_held(runs, f"1-{stamp}Z", ["hot.py", "notes.md"])
+    _plan_held(runs, f"2-{stamp}Z", ["hot.py", "small.py"])
+    _plan_held(runs, "3-20200101T0000Z", ["hot.py"])  # before the window
+    put(churn, conflicts={"min_lines": 100})
+    facts = churn.conflict_data(churn.load_state(), churn.now() - dt.timedelta(days=7), runs_dir=runs, repo=repo)
+    assert facts["runs_held"] == 2 and facts["holds_by_class"] == {"code": 3, "doc": 1}
+    [row] = facts["candidates"]
+    assert (row["file"], row["holds"], row["commits"]) == ("hot.py", 2, 4)  # the base commit is inside the window
+    assert set(row["regions"]) >= {"a", "b"} and all(v >= 1 for v in row["regions"].values())
+
+
+def test_conflict_class_splits_only_code_and_tests(churn):
+    assert [churn.conflict_class(p) for p in ("a/b.py", "tests/test_x.py", "docs/m.md", "c/case.json")] == [
+        "code", "test", "doc", "data"]
+
+
+def test_a_week_with_no_candidate_launches_nothing_and_waits_a_week(churn, monkeypatch):
+    put(churn, conflicts={"issue": 9}, max_workers=2)
+    monkeypatch.setattr(churn, "rate_plan", lambda state: None)
+    monkeypatch.setattr(churn, "conflict_data", lambda *a, **k: {"runs_held": 0, "candidates": []})
+    launched = []
+    monkeypatch.setattr(churn, "cmd_worker", lambda a: launched.append(a))
+    green = {"verdict": "GREEN", "free_slots": 2}
+    assert churn.conflict_lane(green, {}) == ["weekly conflict check: 0 held runs, 0 candidate(s)"]
+    assert launched == [] and churn.conflict_lane(green, {}) == []
+    assert churn.conflict_due(churn.load_state())[1].startswith("next after")
+
+
+def test_a_candidate_launches_the_capped_opus_session_in_the_rsi_lane(churn, monkeypatch):
+    put(churn, conflicts={"issue": 9}, max_workers=2, max_opus=1)
+    monkeypatch.setattr(churn, "rate_plan", lambda state: None)
+    monkeypatch.setattr(churn, "worker_brief_template", lambda: "TEMPLATE")
+    facts = {"runs_held": 4, "candidates": [{"file": "hot.py", "holds": 4, "commits": 9, "lines": 5000}]}
+    monkeypatch.setattr(churn, "conflict_data", lambda *a, **k: facts)
+    launched = []
+    monkeypatch.setattr(churn, "cmd_worker", lambda a: launched.append(a))
+    did = churn.conflict_lane({"verdict": "GREEN", "free_slots": 2}, {})
+    [a] = launched
+    assert did[-1].endswith("hot.py") and a.model == "opus" and a.lane == "rsi" and a.budget_usd == 20.0
+    assert "hot-file-split" in a.brief and "Part of #9" in a.brief and "TEMPLATE" in a.brief
+    assert churn.load_state()["conflicts"]["count"] == 1
+    assert json.loads(next((churn.H / "rsi").glob("conflicts-*.json")).read_text())["runs_held"] == 4
+
+
+def test_the_rsi_lane_runs_one_job_and_stays_outside_the_focus(churn, monkeypatch):
+    monkeypatch.setattr(churn, "pid_alive", lambda pid: True)
+    st = {"running": [{"run_id": "x", "pid": 7, "lane": "rsi"}], "retro": {"issue": 1}, "conflicts": {"issue": 2}}
+    assert churn.retro_due(st)[1] == churn.conflict_due(st)[1] == "an RSI job is running"
+    assert "rsi" in churn.FOCUS_EXEMPT_LANES and churn.claim_exempt({"conflicts": {"issue": 2}}, 2)
+
+
+def test_the_conflict_job_waits_for_a_free_opus_slot_and_never_counts_the_try(churn, monkeypatch):
+    put(churn, conflicts={"issue": 9}, max_workers=2, max_opus=1)
+    monkeypatch.setattr(churn, "rate_plan", lambda state: None)
+    monkeypatch.setattr(churn, "live_opus_count", lambda state: 1)
+    monkeypatch.setattr(churn, "conflict_data", lambda *a, **k: pytest.fail("measured with no Opus slot"))
+    assert churn.conflict_lane({"verdict": "GREEN", "free_slots": 2}, {}) == []
+    assert churn.conflict_due(churn.load_state()) == (True, "due")
+
+
+def test_rsi_cli_status_and_settings(churn, capsys):
+    ns = lambda action, job=None, key=None, value=None: argparse.Namespace(action=action, job=job, key=key, value=value)  # noqa: E731
+    churn.cmd_rsi(ns("set", "conflicts", "issue", "9"))
+    churn.cmd_rsi(ns("off", "conflicts"))
+    assert churn.conflict_due(churn.load_state())[0] is False
+    churn.cmd_rsi(ns("on", "conflicts"))
+    out = capsys.readouterr().out
+    assert "issue #9" in out and "RSI lane" in out
+    with pytest.raises(SystemExit):
+        churn.cmd_rsi(ns("set", "retro", "issue", "9"))
 
 
 class FakeGH:
