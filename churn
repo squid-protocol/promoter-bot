@@ -8188,7 +8188,7 @@ records, mutation records, generated lists, time ratchets, count pins
 collateral: the PR's change broke OTHER existing tests, audits, or another language's or program's output
 own_test: the PR's own new or changed tests failed in CI
 review: the reviewer asked for more work, a different approach, or PR text changes
-other: none of these, or no failure was found
+other: none of these, or no failure was found (red checks that were only cancelled or superseded runs are no failure: other, not env)
 Reply with ONLY a JSON object mapping id to cause, e.g. {"12":"env"}.
 
 ITEMS:
