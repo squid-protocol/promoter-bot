@@ -5104,3 +5104,8 @@ def test_a_named_source_defect_is_settled_not_untracked(churn):
     assert m["untracked"] == ["app/cbl/EPS.cbl", "app/cbl/OTHER.cbl"]  # only a source defect is settled
     assert m["source_defects"][0]["program"] == "app/cbl/CBEXPORT.cbl"
     assert churn.goal_summary(m).endswith("; 1 named source defects")
+
+
+def test_the_cause_prompt_says_a_cancelled_run_is_no_failure(churn):
+    """2026-10-29..31: 22 runs that found only cancelled checks were labelled env, and drew a false rise on the quality chart."""
+    assert "cancelled or superseded runs are no failure: other, not env" in churn.CAUSE_PROMPT
