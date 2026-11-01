@@ -2049,6 +2049,15 @@ def db_neighbours(db: Path, files: list[str]) -> dict:
     return out
 
 
+# 2026-11-01 (#7455): 54 of the week's 75 file-level plan holds were data files, and each hold spends a model tick. These
+# are written by a tool, never by hand, so two workers on one cannot really conflict: the merge takes main's copy and the
+# tool rewrites it (det_sweep_durations.json: the nightly; det_sweep_coverage/<case>.json: det_coverage_ledger.py;
+# <case>/evidence.json: `equivalence.py run --record`). Narrow on purpose, not REGENERATED_RE, which matches every .json:
+# case.json, infeasible_outcomes/ and port_blockers.json are hand-written, and det_sweep_baseline.json takes hand entries.
+PLAN_HOLD_EXEMPT = re.compile(r"(^|/)det_sweep_durations\.json$|(^|/)det_sweep_coverage/[^/]+\.json$"
+                              r"|(^|/)tests/equivalence/[^/]+/evidence\.json$")
+
+
 def plan_impact(meta: dict, plan_text: str) -> dict:
     files = plan_files(plan_text)
     db = Path(meta["worktree"]) / "docs/self_scan/gitgalaxy_master.db"
@@ -2060,7 +2069,8 @@ def plan_impact(meta: dict, plan_text: str) -> dict:
             direct[who] = d
         if n := sorted(near_set & fs):
             near[who] = n
-    hold = {w: f for w, f in direct.items() if w.startswith("worker ")}  # two live edits of one file: the tick decides
+    hold = {w: real for w, f in direct.items() if w.startswith("worker ")  # two live edits of one file: the tick decides
+            and (real := [x for x in f if not PLAN_HOLD_EXEMPT.search(x)])}
     return {"files": files, "stats": nb["stats"], "neighbours": nb["neighbours"][:60], "direct_overlap": direct,
             "near_overlap": near, "hold": hold, "db": str(db) if db.exists() else None}
 
@@ -2227,7 +2237,7 @@ def credit_pick(state: dict, snap: dict, cfg: dict) -> tuple[dict, dict] | tuple
     ci items by position. Items queued for Opus stay with the plan unless the lane itself runs Opus."""
     q = [(i, x) for i, x in enumerate(state.get("queue", [])) if not x.get("needs_owner") and x.get("backend") != "agy"
          and x.get("lane", "normal") in ("normal", "ci") and not blocked_by(x, snap, state) and not waiting(x)
-         and not plan_overlap(state, x) and in_focus(state, x)
+         and not plan_overlap(state, x) and not estate_wait(state, x) and in_focus(state, x)
          and (x.get("model", "sonnet") != "opus" or cfg["model"] == "opus")]
     q.sort(key=lambda ix: (not ix[1].get("pr"), ix[0]))
     for _, x in q:
@@ -5489,8 +5499,42 @@ def plan_overlap(state: dict, x: dict) -> list[str]:
     global _INFLIGHT
     if _INFLIGHT is None:
         _INFLIGHT = inflight_files(rid)
-    files = {f for f in h.get("files", []) if not OVERLAP_IGNORE.search(f)}
+    files = {f for f in h.get("files", []) if not OVERLAP_IGNORE.search(f) and not PLAN_HOLD_EXEMPT.search(f)}
     return [f"{who}: {f}" for who, fs in _INFLIGHT.items() if who != f"worker {rid}" for f in sorted(files & fs)]
+
+
+# 2026-11-01 (#7455): a ladder slice launched beside a live worker on its own estate spends a plan run only to be held.
+# The gate now keeps it queued until that worker ends, with no plan run and no tick. The estate is the whole tag, so a
+# LADDER_SPLIT estate waits per family: the owner split cics-crucible (10-31) so its families run side by side, and a
+# block in one estate never holds another's slice (10-27). ladder_items already skips a tag it can read in a live task,
+# but a tick often launches under its own label ("ladder slice commarea-mismatch"), so a known name counts too.
+LADDER_ESTATE_WAIT = bool(_CFG.get("ladder_estate_wait", True))
+LADDER_TAG_RE = re.compile(r"\[ladder:([^\]]+)\]")
+
+
+def ladder_estate(task: object, known) -> str | None:
+    """The ladder estate a task names: its [ladder:...] tag, else the longest of `known` (estate or estate/family, or the
+    family alone) in a task that says ladder. None for any other task."""
+    text = str(task or "")
+    if m := LADDER_TAG_RE.search(text):
+        return m[1]
+    if not re.search(r"\bladder\b", text, re.I):
+        return None
+    for key in sorted(known, key=len, reverse=True):
+        if any(re.search(rf"(?<![\w/-]){re.escape(name)}(?![\w/-])", text) for name in (key, key.rsplit("/", 1)[-1])):
+            return key
+    return None
+
+
+def estate_wait(state: dict, x: dict) -> str | None:
+    """The live run already on queue item x's ladder estate, or None. A PR fix never waits: it finishes work in hand."""
+    if x.get("pr") or not LADDER_ESTATE_WAIT:
+        return None
+    known = {*((goal_cfg(state).get("measure") or {}).get("below") or {}), *(focus_cfg(state).get("ladder_queued") or {})}
+    if not (estate := ladder_estate(x.get("task"), known)):
+        return None
+    return next((str(r.get("run_id")) for r in state.get("running", []) if pid_alive(r.get("pid"))
+                 and ladder_estate(r.get("task"), known) == estate), None)
 
 
 def backfill_rank(x: dict) -> int:
@@ -5995,7 +6039,7 @@ def focus_pick(state: dict, snap: dict | None, mode: str, focus: bool) -> tuple[
     2026-10-25: the focus replaced the ranking layers (scope, tier, goal stage, core slot), so queue position orders."""
     q = [(i, x) for i, x in enumerate(state.get("queue", [])) if not x.get("needs_owner") and x.get("backend") != "agy"
          and in_focus(state, x) == focus and not blocked_by(x, snap, state) and not waiting(x)
-         and not plan_overlap(state, x)]
+         and not plan_overlap(state, x) and not estate_wait(state, x)]
     for want in (lambda x: x.get("pr"), lambda x: x.get("auto") == "main-red", lambda x: x.get("lane") == "ci"):
         if hit := next(((i, x) for i, x in q if want(x)), None):
             return hit  # a PR fix finishes work in hand; a red main blocks every PR
@@ -6034,6 +6078,8 @@ def idle_causes(state: dict, snap: dict | None, mode: str) -> str:
             c["wait"] += 1
         elif plan_overlap(state, x):
             c["plan-overlap"] += 1
+        elif estate_wait(state, x):
+            c["estate-wait"] += 1
         elif x.get("lane") == "backfill" and mode != "busy":
             c["backfill-calm"] += 1
         elif x.get("lane") in (None, "normal") and not x.get("pr") and mode == "busy":
