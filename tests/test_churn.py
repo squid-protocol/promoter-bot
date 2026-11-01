@@ -1759,6 +1759,99 @@ def test_a_held_plan_gates_its_requeued_item_without_a_new_plan_run(churn, tmp_p
     assert churn.plan_overlap(st, st["queue"][0]) == []  # aged out
 
 
+def _impact(churn, monkeypatch, tmp_path, files, live):
+    monkeypatch.setattr(churn, "plan_files", lambda text: files)
+    monkeypatch.setattr(churn, "inflight_files", lambda rid: live)
+    return churn.plan_impact({"run_id": "6072-a", "worktree": str(tmp_path)}, "plan")
+
+
+@pytest.mark.parametrize("path", ["tests/equivalence/det_sweep_durations.json",
+                                  "tests/equivalence/det_sweep_coverage/zecs-zecs001.json",
+                                  "tests/equivalence/zecs-zecs001/evidence.json"])
+def test_a_regenerated_file_does_not_hold_a_plan(churn, monkeypatch, tmp_path, path):
+    """2026-11-01: two ladder plans were held on det_sweep_durations.json alone, and a tick called both harmless."""
+    impact = _impact(churn, monkeypatch, tmp_path, [path], {"worker 6072-b": {path}})
+    assert impact["hold"] == {} and impact["direct_overlap"] == {"worker 6072-b": [path]}  # the worker is still told
+
+
+@pytest.mark.parametrize("path", ["tests/equivalence/zecs-zecs001/case.json",  # REGENERATED_RE matches all of these
+                                  "tests/equivalence/infeasible_outcomes/zecs-zecs001.json",
+                                  "tests/cobol_mainframe/port_blockers.json",
+                                  "tests/equivalence/det_sweep_baseline.json",  # takes hand entries with their cause
+                                  "tests/tools/equivalence_cics.py"])
+def test_a_hand_written_file_still_holds_a_plan(churn, monkeypatch, tmp_path, path):
+    impact = _impact(churn, monkeypatch, tmp_path, [path], {"worker 6072-b": {path}})
+    assert impact["hold"] == {"worker 6072-b": [path]}
+
+
+def test_a_mixed_overlap_holds_on_its_hand_written_file_alone(churn, monkeypatch, tmp_path):
+    cov, case = "tests/equivalence/det_sweep_coverage/zecs-zecs001.json", "tests/equivalence/zecs-zecs001/case.json"
+    impact = _impact(churn, monkeypatch, tmp_path, [cov, case], {"worker 6072-b": {cov, case}, "PR #7": {case}})
+    assert impact["hold"] == {"worker 6072-b": [case]}  # an open PR never held a plan
+
+
+def test_a_regenerated_file_does_not_keep_a_held_plan_waiting(churn):
+    cov = "tests/equivalence/det_sweep_coverage/zecs-zecs001.json"
+    st = {"held_plans": {"5005-a": {"issue": 5005, "t": churn.iso(churn.now()), "files": [cov]}},
+          "queue": [item(5005, task="requeued: implement plan of run 5005-a")], "running": [], "prs": []}
+    churn._INFLIGHT = {"worker 6072-b": {cov}}
+    assert churn.plan_overlap(st, st["queue"][0]) == []
+
+
+def _ladder(*tasks, focus=()):
+    """A queue of one ladder item; `tasks` are live workers' tasks."""
+    return {"queue": [item(7434, task="[ladder:cics-crucible/commarea-mismatch] ladder slice of #7434")], "prs": [],
+            "running": [{"run_id": f"r{i}", "pid": 1, "task": t} for i, t in enumerate(tasks)],
+            "focus": {"ladder_queued": dict.fromkeys(focus, "2026-11-01T00:00Z")}}
+
+
+FAMILIES = ("cics-crucible", "cics-crucible/commarea-mismatch", "cics-crucible/ghost-tasks", "zecs")
+
+
+@pytest.mark.parametrize("label", ["[ladder:cics-crucible/commarea-mismatch] ladder slice of #7434",
+                                   "ladder slice commarea-mismatch",  # the tick's own labels, seen 2026-11-01
+                                   "ladder slice of #7434, estate cics-crucible/commarea-mismatch"])
+def test_a_ladder_slice_waits_for_a_live_worker_on_its_estate(churn, label):
+    st = _ladder(label, focus=FAMILIES)
+    assert churn.estate_wait(st, st["queue"][0]) == "r0"
+    assert churn.pick_item(st, {}, "calm") == (None, None)
+    assert churn.idle_causes(st, {}, "calm") == "idle: estate-wait 1"
+
+
+def test_the_estate_wait_ends_with_the_worker(churn):
+    st = _ladder("ladder slice commarea-mismatch", focus=FAMILIES)
+    st["running"][0]["pid"] = -1  # dead
+    assert churn.estate_wait(st, st["queue"][0]) is None and churn.pick_item(st, {}, "calm")[0] == 0
+
+
+@pytest.mark.parametrize("label", ["[ladder:cics-crucible/ghost-tasks] ladder slice",  # the owner's families: side by side
+                                   "ladder slice ghost-tasks",
+                                   "[ladder:zecs] ladder slice of #7434",  # another estate
+                                   "ladder slice 3",  # names none: fails open, the plan check still guards it
+                                   "ladder_refresh.py for commarea-mismatch",  # the tool, not a ladder slice
+                                   "#6876 cics-crucible programs that do not translate"])
+def test_a_ladder_slice_does_not_wait_on_another_estate_or_any_other_work(churn, label):
+    st = _ladder(label, focus=FAMILIES)
+    assert churn.estate_wait(st, st["queue"][0]) is None and churn.pick_item(st, {}, "calm")[0] == 0
+
+
+def test_a_family_name_does_not_read_as_its_parent_estate(churn):
+    assert churn.ladder_estate("ladder slice cics-crucible/ghost-tasks", FAMILIES) == "cics-crucible/ghost-tasks"
+    assert churn.ladder_estate("ladder slice cics-crucible/unknown-family", FAMILIES) is None
+
+
+def test_a_pr_fix_on_a_busy_estate_does_not_wait(churn):
+    st = _ladder("[ladder:zecs] slice")
+    x = item(7434, pr=7, task="[ladder:zecs] fix PR #7")
+    assert churn.estate_wait(st, x) is None
+
+
+def test_the_estate_wait_can_be_turned_off(churn, monkeypatch):
+    monkeypatch.setattr(churn, "LADDER_ESTATE_WAIT", False)
+    st = _ladder("[ladder:cics-crucible/commarea-mismatch] slice")
+    assert churn.estate_wait(st, st["queue"][0]) is None
+
+
 def test_direct_spec_covers_pr_fixes_backfill_resumes_and_cleared_held_plans(churn, tmp_path):
     wt = tmp_path / "wt"
     wt.mkdir()
