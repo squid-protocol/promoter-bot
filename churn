@@ -647,6 +647,13 @@ def own_commits(wt: str, start: str | None) -> bool | None:
     return None if r.returncode else bool(r.stdout.strip())
 
 
+def own_hand_commits(wt: str, start: str | None) -> bool | None:
+    """Did those commits touch a hand-written file? None = unknown. Not hand_written(): REGENERATED_RE passes every .json,
+    and a case.json edit is a real fix. A .py is always hand-written, whatever GENERATED_RE says of det_coverage_ledger.py."""
+    r = run(["git", "-C", wt, "log", "--no-merges", "--name-only", "--format=", "HEAD", f"^{start}", "^origin/main"])
+    return None if r.returncode else any(f and (f.endswith(".py") or not GENERATED_RE.search(f)) for f in r.stdout.splitlines())
+
+
 def small_delta(wt: str, reviewed_head: str) -> str | None:
     """Why the PR's own change since `reviewed_head` is small enough for a Sonnet re-review, or None (Opus). Own change =
     non-merge commits since that head that are not on origin/main, so a merge of main counts for nothing. 2026-10-16:
@@ -3434,6 +3441,8 @@ def reap(state: dict) -> list[dict]:
             meta["branch"] = branch or meta["branch"]
             if (changed := own_commits(meta["worktree"], meta.get("head_start"))) is not None:
                 meta["code_changed"] = changed
+                if changed and (hand := own_hand_commits(meta["worktree"], meta.get("head_start"))) is not None:
+                    meta["hand_changed"] = hand
         meta.update(session_id=out.get("session_id"), status=status, cost_usd=round(cost, 2), finished=iso(now()), pr=pr,
                     session_cost_usd=round(session_cost, 4))
         if pr and not meta.get("repo") and all(pr_num(p) != pr for p in state.get("prs", [])):
@@ -6226,17 +6235,20 @@ def red_main_issues() -> list[dict]:
 
 NOISE = {"infra", "flake", "main"}  # ci_digest triage the shepherd handles by rerunning (or main's own fix)
 CI_RED: dict[int, str] = {}  # PR -> its failing checks at the last triage, for the fix brief (#19: no tick to read CI)
+CI_CHECKS: dict[int, list[str]] = {}  # PR -> the names of its real failing checks at the last triage (fix_loop_rounds)
 
 
 def ci_triage(n: int) -> list[str] | None:
     """ci_digest's triage of PR n's failed checks at its current head (origin/main's ci_digest in TOOLS), or None when
     it cannot be read. [] = nothing failing right now (CI still running, or the label is stale)."""
+    CI_CHECKS.pop(n, None)
     try:  # ci_digest exits 1 whenever something failed; its JSON is the answer either way
         r = run([sys.executable, str(TOOLS / "tests" / "tools" / "ci_digest.py"), str(n), "--json"], timeout=300)
         failed = json.loads(r.stdout)["failed"]
         CI_RED[n] = "; ".join(f"{f.get('check')} ({f.get('triage')})"
                               + (f": {' '.join((f.get('tests') or [])[:3])}" if f.get("tests") else "")
                               + (f", repro `{f['repro']}`" if f.get("repro") else "") for f in failed)[:600]
+        CI_CHECKS[n] = sorted({str(f.get("check")) for f in failed if f.get("triage") not in NOISE})
         return [f.get("triage") for f in failed]
     except (ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired):
         return None
@@ -6291,6 +6303,62 @@ def recent_fix_runs(pr: int, issue: int) -> int:
                 kind in ("send_back", "precheck_retry") and str(m.get("pr") or "") == str(pr)):
             n += 1
     return n
+
+
+# 2026-11-01 (#7455): #7389 needed a crucible release, yet took 22 fix rounds that only merged main; each moved the head
+# and re-ran CI. recent_fix_runs leaves merge-only runs out (#20), so nothing ever counted them or reached the rescue.
+# After FIX_LOOP_STOP finished rounds in a row with the same real failing checks and no hand-written change, the PR goes
+# on hold, naming the worker's blocker, and owner_items pages it. A round that changes hand-written code or moves the
+# failing checks starts the count again. A conflict still gets its fix: resolving one is progress. 0 turns this off.
+FIX_LOOP_STOP = int(_CFG.get("fix_loop_stop", 2))
+FIX_LOOP_NOTE = "fix loop on"
+BLOCKER_WORD_RE = re.compile(r"(?i)\b(block\w*|waits? (on|for)|waiting (on|for)|until|can't|cannot|needs)\b")
+BLOCKER_LABELS = ("blocker", "blocked on", "blocked by", "what clears it", "what's needed", "waits on", "waiting on", "cause")
+
+
+def pr_fix_rounds(pr: int, issue: int) -> list[dict]:
+    """Finished runs on PR pr, oldest first. A run that crashed or hit a limit says nothing about the PR, so is left out."""
+    runs = [m for d in RUNS.glob(f"{issue}-*") if (m := _run_meta(d.name)).get("finished") and m.get("pr") == pr
+            and m.get("status") in ("done", "denied") and not m.get("check_of")]
+    return sorted(runs, key=lambda m: (m.get("started", ""), m.get("run_id", "")))
+
+
+def fix_loop_rounds(entry: dict, pr: int, issue: int, checks: list[str]) -> int:
+    """How many rounds in a row left the same `checks` red with no hand-written change (kept in entry["fix_loop"]). An
+    unknown change counts as progress, as does a run from before churn recorded hand_changed that changed code."""
+    rec, runs = entry.get("fix_loop") or {}, pr_fix_rounds(pr, issue)
+    ids = [m["run_id"] for m in runs]
+    new = runs[ids.index(rec["run"]) + 1:] if rec.get("run") in ids else None
+    stuck = new is not None and checks == rec.get("checks") and not any(
+        m.get("hand_changed", m.get("code_changed")) is not False for m in new)
+    rounds = rec.get("rounds", 0) + len(new) if stuck else 0
+    entry["fix_loop"] = {"run": ids[-1] if ids else None, "checks": checks, "rounds": rounds}
+    return rounds
+
+
+def run_blocker(rid: str | None) -> str:
+    """What a run's report says blocks its PR: the bullet labelled so, in BLOCKER_LABELS order, else the first sentence
+    that sounds like one. Read by rule, no model."""
+    result = ""
+    with contextlib.suppress(OSError, ValueError, TypeError, AttributeError):
+        result = str(json.loads((RUNS / str(rid) / "out.json").read_text()).get("result") or "")
+    labelled = {m[1].lower().replace("\u2019", "'"): m[2] for m in re.finditer(
+        r"(?im)^[\s*_#-]*([a-z][a-z' \u2019]*?)[*_]*:[*_]*\s+(\S.*)$", result)}
+    text = next((labelled[k] for k in BLOCKER_LABELS if k in labelled), None) or next(
+        (s for s in re.split(r"(?<=[.!?])\s+", result) if BLOCKER_WORD_RE.search(s)), "")
+    return text.replace("`", "").replace("*", "").strip() or f"no blocker named: read run {rid}"
+
+
+def hold_fix_loop(entry: dict, n: str, v: dict, checks: list[str], rounds: int) -> str:
+    """Hold PR n as `churn pr reviewed --verdict hold` does. The count restarts, so a later verdict gets fresh rounds. The
+    blocker comes first: owner_items shows only the note's first 140 characters."""
+    rid = entry.get("fix_loop", {}).get("run")
+    note = (f"{FIX_LOOP_NOTE} {', '.join(checks)}: {run_blocker(rid)} ({rounds} rounds, no hand-written change; "
+            f"last run {rid})")
+    entry.update(reviewed_head=v.get("head"), verdict="hold", reviewed_at=iso(now()), note=note[:300])
+    entry.pop("fix_loop", None)
+    log(f"PR #{n} held: {note[:300]}")
+    return f"hold:#{n} ({FIX_LOOP_NOTE} {', '.join(checks)})"
 
 
 RESCUE_AT = 2  # Sonnet fix runs in the window before the one Opus rescue run (owner 2026-10-17)
@@ -6573,6 +6641,10 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
                         if isinstance(p, dict) and pr_num(p) == int(n):
                             p["clean_head"] = v.get("head")
                 continue
+            if FIX_LOOP_STOP and entry is not None and (checks := CI_CHECKS.get(int(n))) and (
+                    rounds := fix_loop_rounds(entry, int(n), issue, checks)) >= FIX_LOOP_STOP:
+                added.append(hold_fix_loop(entry, n, v, checks, rounds))
+                continue
         loops = recent_fix_runs(int(n), issue)
         # Owner 2026-10-17: two Sonnet fix runs, then ONE Opus rescue that judges the PR (save / slice / restart /
         # owner). 2026-10-24: a PR that fails again after its rescue, or falls STALE_BEHIND behind main while
@@ -6680,7 +6752,8 @@ def release_workflow_holds(state: dict, snap: dict) -> list[str]:
             continue
         p = next((p for p in state.get("prs", []) if isinstance(p, dict) and pr_num(p) == int(n)), None)
         note = str((p or {}).get("note") or "")
-        if p is not None and HOLD_WORKFLOW_RE.search(note) and not re.search(r"shepherd", note, re.I):
+        if (p is not None and HOLD_WORKFLOW_RE.search(note) and not re.search(r"shepherd", note, re.I)
+                and not note.startswith(FIX_LOOP_NOTE)):
             p.pop("verdict", None)
             p.pop("reviewed_head", None)
             p["allow_workflows"] = True
