@@ -27,6 +27,7 @@ All state stays in $H/churn-state.json (shared with the night-shift skill).
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import bisect
 import collections
@@ -397,7 +398,7 @@ def normalize_state(state: dict) -> list[str]:
         state["max_workers"] = 2
     for gone in ("promoted_issues", "line_partials", "refill"):  # retired 2026-10-25 (the focus replaced them)
         state.pop(gone, None)
-    for key in ("agy", "features", "usage", "credit", "retro", "goal", "focus"):
+    for key in ("agy", "features", "usage", "credit", "retro", "conflicts", "goal", "focus"):
         if not isinstance(state.get(key, {}), dict):
             quarantine(key, state[key], "not an object")
             state[key] = {}
@@ -2297,6 +2298,18 @@ def credit_hold(state: dict, status: str, rid: str, text: str) -> None:
            "`churn credit add USD` after a new grant (or a new key) starts it again.", priority="low", cooldown_h=24)
 
 
+# ---------------------------------------------------------------- the RSI lane
+# Owner 2026-11-01: the system's weekly look at itself is one lane, always on, outside the focus: the retro (the rules
+# workers read) and the conflict job (the files they collide on). One RSI job runs at a time. "retro" is the lane's old
+# name, kept so a run started before the rename still counts.
+RSI_LANE = "rsi"
+RSI_LANES = (RSI_LANE, "retro")
+
+
+def rsi_busy(state: dict) -> bool:
+    return any(x.get("lane") in RSI_LANES and pid_alive(x.get("pid")) for x in state.get("running", []))
+
+
 # ---------------------------------------------------------------- weekly retro
 def retro_cfg(state: dict) -> dict:
     return {**RETRO_DEFAULT, **{k: v for k, v in (state.get("retro") or {}).items() if k in RETRO_DEFAULT}}
@@ -2308,8 +2321,8 @@ def retro_due(state: dict) -> tuple[bool, str]:
         return False, "off (`churn retro on`)"
     if not cfg["issue"]:
         return False, "no standing issue (`churn retro set issue N`)"
-    if any(x.get("lane") == "retro" and pid_alive(x.get("pid")) for x in state.get("running", [])):
-        return False, "a retro is running"
+    if rsi_busy(state):
+        return False, "an RSI job is running"
     if (last := parse_iso(r.get("last"))) and now() - last < dt.timedelta(days=float(cfg["every_days"])):
         return False, f"next after {iso(last + dt.timedelta(days=float(cfg['every_days'])))}"
     return True, "due"
@@ -2331,7 +2344,7 @@ def retro_data(state: dict, since: dt.datetime, runs_dir: Path | None = None, lo
             meta = json.loads(m.read_text())
         except (OSError, ValueError):
             continue
-        if not (t := parse_iso(meta.get("started"))) or t < since or meta.get("lane") == "retro":
+        if not (t := parse_iso(meta.get("started"))) or t < since or meta.get("lane") in RSI_LANES:
             continue
         st = "agy-" + str(meta.get("status", "?")) if meta.get("backend") == "agy" else str(meta.get("status", "running"))
         statuses[st] = statuses.get(st, 0) + 1
@@ -2400,12 +2413,205 @@ def retro_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
             cmd_worker(argparse.Namespace(resume_run=None, issue=int(cfg["issue"]), model=cfg["model"],
                                           task=f"weekly retro {day}", brief=brief, brief_file=None, force=False,
                                           plan=False, worktree=None, branch=None, check_of=None, repo=None,
-                                          lane="retro", budget_usd=float(cfg["budget_usd"])))
+                                          lane=RSI_LANE, budget_usd=float(cfg["budget_usd"])))
     except (SystemExit, OSError, RuntimeError) as e:
         log(f"weekly retro launch refused: {str(e)[:200]}")
         return []
     with edit_state() as st:
         st.setdefault("retro", {}).update(last=iso(now()), count=n)
+    return did
+
+
+# ---------------------------------------------------------------- weekly conflict job
+# Owner 2026-11-01, after #5274 was finished by hand: plan holds are per file, so a file many slices edit serializes
+# them. Each week churn measures, with no model, which files held runs and took commits; only a file past the thresholds
+# launches the capped Opus session, which splits it behaviour-preserving (the repo's hot-file-split skill). A quiet week
+# costs nothing.
+CONFLICT_DEFAULT = {"enabled": True, "issue": None, "every_days": 7, "model": "opus", "budget_usd": 20.0, "min_holds": 2,
+                    "min_commits": 15, "min_lines": 1000, "top": 8}
+CONFLICT_RUN = re.compile(r"-(\d{8}T\d{4})Z$")
+PY_HEADER = re.compile(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@ ?(.*)$", re.M)
+CONFLICT_BRIEF = """# Weekly conflict job {day} (Part of #{issue})
+
+Plan holds are per file: a file many slices edit makes them run one at a time. churn measured the last {days:g} days, with
+no model, in {data} (JSON: holds by file and class, and `candidates`: the code and test files past the thresholds, with the
+functions that took the edits). Read it first and judge from it, not from impressions.
+
+Follow the repo's `hot-file-split` skill: it is the recipe, and it lists the failures an earlier split hit.
+
+Take the top candidate that a split would really help, and open ONE draft PR titled
+"Weekly conflict job {day}: split <file> (Part of #{issue})":
+1. Find what the commits to the file have in common. Split along that seam so that the next slice edits one family
+   file. Moving text that no slice edits helps nobody; say so and take the next candidate.
+2. A chain every slice edits becomes a registry the families answer through, not a smaller chain.
+3. The change preserves behaviour, and the PR body proves it the way the skill says, with a control that shows the proof
+   can fail. No golden, evidence or expected output changes.
+If no candidate is worth splitting, open no PR and say why in your report.
+
+In the PR body: the candidate's numbers (holds, commits, lines before and after), the proof, and one line on the
+`holds_by_class` figures. Holds on docs or data files are not fixed by a split: name what would fix the largest of them.
+Never loosen a gate or a test to make the split pass.
+
+{template}
+"""
+
+
+def conflict_cfg(state: dict) -> dict:
+    return {**CONFLICT_DEFAULT, **{k: v for k, v in (state.get("conflicts") or {}).items() if k in CONFLICT_DEFAULT}}
+
+
+def conflict_due(state: dict) -> tuple[bool, str]:
+    cfg, r = conflict_cfg(state), state.get("conflicts") or {}
+    if not cfg["enabled"]:
+        return False, "off (`churn rsi on conflicts`)"
+    if not cfg["issue"]:
+        return False, "no standing issue (`churn rsi set conflicts issue N`)"
+    if rsi_busy(state):
+        return False, "an RSI job is running"
+    if (last := parse_iso(r.get("last"))) and now() - last < dt.timedelta(days=float(cfg["every_days"])):
+        return False, f"next after {iso(last + dt.timedelta(days=float(cfg['every_days'])))}"
+    return True, "due"
+
+
+def conflict_class(path: str) -> str:
+    """test, doc, data or code: a split helps only the first and the last."""
+    name = path.rsplit("/", 1)[-1]
+    if name.endswith((".md", ".rst")):
+        return "doc"
+    if REGENERATED_RE.search(path):
+        return "data"
+    return "test" if name.startswith("test_") or name.endswith("_test.py") else "code"
+
+
+def conflict_regions(repo: Path, path: str, commits: list[str]) -> dict[str, int]:
+    """How many of `commits` changed each function of a Python file, read from that commit's own text; another language
+    by the function name git puts in its hunk header."""
+    regions: dict[str, int] = {}
+    for c in commits:
+        diff = run(["git", "-C", str(repo), "show", c, "--format=", "-U0", "--", path], timeout=60).stdout
+        seen: set[str] = set()
+        spans: list[tuple[int, int, str]] = []
+        if path.endswith(".py"):
+            try:
+                tree = ast.parse(run(["git", "-C", str(repo), "show", f"{c}:{path}"], timeout=60).stdout)
+            except (SyntaxError, ValueError):
+                tree = None
+            for n in ast.walk(tree) if tree else ():
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    spans.append((n.lineno, n.end_lineno or n.lineno, n.name))
+            spans.sort(key=lambda x: x[1] - x[0])  # the innermost function that holds the line
+        for m in PY_HEADER.finditer(diff):
+            if path.endswith(".py"):
+                first, count = int(m[1]), max(int(m[2] or 1), 1)
+                for line in range(first, first + count):
+                    seen.add(next((n for a, z, n in spans if a <= line <= z), "<module>"))
+            else:
+                seen.add(m[3].split("(")[0].strip()[:60] or "<top>")
+        for name in seen:
+            regions[name] = regions.get(name, 0) + 1
+    return dict(sorted(regions.items(), key=lambda kv: (-kv[1], kv[0]))[:12])
+
+
+def conflict_data(state: dict, since: dt.datetime, runs_dir: Path | None = None, repo: Path | None = None,
+                  previous: dict | None = None) -> dict:
+    """The period's conflict facts, from churn's run directories and git: no model and no GitHub. A candidate is a code or
+    test file big enough to split that held runs or took many commits."""
+    cfg, repo = conflict_cfg(state), repo or V6
+    held: dict[str, int] = {}
+    total = 0
+    for p in sorted((runs_dir or RUNS).glob("*/plan_held")):
+        if not (m := CONFLICT_RUN.search(p.parent.name)):
+            continue
+        when = dt.datetime.strptime(m[1], "%Y%m%dT%H%M").replace(tzinfo=dt.timezone.utc)
+        try:
+            files = {f for fs in json.loads(p.read_text()).values() for f in fs}
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+        if when >= since:
+            total += 1
+            for f in files:
+                held[f] = held.get(f, 0) + 1
+    log_out = run(["git", "-C", str(repo), "log", "origin/main", "--first-parent", f"--since={iso(since)}",
+                   "--name-only", "--format=%x00%h"], timeout=120).stdout
+    commits: dict[str, list[str]] = {}
+    for chunk in log_out.split("\0")[1:]:
+        head, *names = chunk.split("\n")
+        for f in filter(None, names):
+            commits.setdefault(f, []).append(head.strip())
+    by_class: dict[str, int] = {}
+    for f, n in held.items():
+        by_class[conflict_class(f)] = by_class.get(conflict_class(f), 0) + n
+    rows = []
+    for f in sorted(set(held) | set(commits), key=lambda f: (-held.get(f, 0), -len(commits.get(f, [])), f)):
+        if conflict_class(f) not in ("code", "test"):
+            continue
+        if held.get(f, 0) < cfg["min_holds"] and len(commits.get(f, [])) < cfg["min_commits"]:
+            continue
+        shown = run(["git", "-C", str(repo), "show", f"origin/main:{f}"], timeout=60)
+        lines = shown.stdout.count("\n") if shown.returncode == 0 else 0
+        if lines >= cfg["min_lines"]:
+            rows.append({"file": f, "class": conflict_class(f), "holds": held.get(f, 0), "commits": len(commits.get(f, [])),
+                         "lines": lines})
+        if len(rows) >= cfg["top"]:
+            break
+    for row in rows[:3]:
+        row["regions"] = conflict_regions(repo, row["file"], commits.get(row["file"], []))
+    days = max((now() - since).total_seconds() / 86400, 1e-9)
+    data = {"since": iso(since), "runs_held": total, "held_per_day": round(total / days, 2), "holds_by_class": by_class,
+            "top_held": [{"file": f, "holds": n} for f, n in sorted(held.items(), key=lambda kv: (-kv[1], kv[0]))[:15]],
+            "candidates": rows}
+    if previous:  # what last week's work moved
+        data["previous"] = {k: previous.get(k) for k in ("since", "runs_held", "held_per_day", "holds_by_class")}
+    return data
+
+
+def conflict_previous() -> dict | None:
+    try:
+        return json.loads(sorted((H / "rsi").glob("conflicts-*.json"))[-1].read_text())
+    except (IndexError, OSError, ValueError):
+        return None
+
+
+def conflict_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
+    """The weekly measure, then the capped Opus session when a file is past the thresholds. Like the retro, a plan worker
+    that takes a slot; a week with no candidate spends nothing."""
+    if not host_role("retro"):
+        return []
+    state = load_state()
+    ok, _ = conflict_due(state)
+    if not ok or state.get("workers_paused") or b.get("verdict") != "GREEN":
+        return []
+    if worker_slots(b, len(claude_slot_holders(state)), slot_ceiling(state, rate_plan(state))) <= 0:
+        return []
+    cfg = conflict_cfg(state)
+    if cfg["model"] == "opus" and live_opus_count(state) >= int(state.get("max_opus", 1)):
+        return []
+    days = float(cfg["every_days"])
+    previous = conflict_previous()
+    facts = conflict_data(state, now() - dt.timedelta(days=days), previous=previous)
+    n = int((state.get("conflicts") or {}).get("count", 0)) + 1
+    if dry_run:
+        return [f"weekly conflict job #{n}: {len(facts['candidates'])} candidate(s)"]
+    day = now().strftime("%Y-%m-%d")
+    data = H / "rsi" / f"conflicts-{day}.json"
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.write_text(json.dumps(facts, indent=1))
+    did = [f"weekly conflict check: {facts['runs_held']} held runs, {len(facts['candidates'])} candidate(s)"]
+    if facts["candidates"]:
+        brief = CONFLICT_BRIEF.format(day=day, issue=cfg["issue"], days=days, data=data,
+                                      template=worker_brief_template() or "")
+        try:
+            with contextlib.redirect_stdout(open(os.devnull, "w")):
+                cmd_worker(argparse.Namespace(resume_run=None, issue=int(cfg["issue"]), model=cfg["model"],
+                                              task=f"weekly conflict job {day}", brief=brief, brief_file=None, force=False,
+                                              plan=False, worktree=None, branch=None, check_of=None, repo=None,
+                                              lane=RSI_LANE, budget_usd=float(cfg["budget_usd"])))
+        except (SystemExit, OSError, RuntimeError) as e:
+            log(f"weekly conflict job launch refused: {str(e)[:200]}")
+            return []
+        did.append(f"weekly conflict job #{n} ({cfg['model']}, cap ${cfg['budget_usd']}): {facts['candidates'][0]['file']}")
+    with edit_state() as st:
+        st.setdefault("conflicts", {}).update(last=iso(now()), count=n)
     return did
 
 
@@ -5341,7 +5547,7 @@ CORE_RESERVE = 1
 # - starvation still unresolved after STARVE_PAGE passes pages the owner; every 6 h the launch mix is checked: any
 #   off-focus launch that was not filler pages "drift" (a leak), and filler over FILLER_SHARE_PAGE of launches pages
 #   "the focus keeps starving".
-FOCUS_EXEMPT_LANES = ("retro", "experiment")
+FOCUS_EXEMPT_LANES = (*RSI_LANES, "experiment")
 DRIFT_EVERY_H = 6
 STARVE_PASSES = 2
 STARVE_PAGE = 6
@@ -7147,8 +7353,8 @@ def claim_label(host: str = HOST_ID) -> str:
 
 
 def claim_exempt(state: dict, issue) -> bool:
-    """Standing issues every host may work at once: the weekly retro's issue."""
-    return not issue or int(issue) == retro_cfg(state).get("issue")
+    """Standing issues every host may work at once: those of the RSI lane's jobs."""
+    return not issue or int(issue) in (retro_cfg(state).get("issue"), conflict_cfg(state).get("issue"))
 
 
 def foreign_claim(i: dict) -> str | None:
@@ -7583,7 +7789,8 @@ def cmd_tick(a) -> int:
         if direct := direct_launches(b, snap, a.dry_run):
             did += [f"direct launch {d}" for d in direct]
         did += credit_lane(b, snap, False, a.dry_run)  # when=always, or credit about to expire
-        did += retro_lane(b, snap, a.dry_run)
+        did += retro_lane(b, snap, a.dry_run)  # the RSI lane: always on, whatever the focus
+        did += conflict_lane(b, snap, a.dry_run)
         if host_role("retro"):  # the experiment lane runs where the retro does (one host)
             did += experiment_lane(b, snap, a.dry_run)
             last_sweep = parse_iso(state.get("experiment_sweep"))
@@ -8447,7 +8654,7 @@ def cmd_status(a) -> int:
     ok, why = credit_ready(state, bool((p := parse_iso(state.get("paused_until"))) and now() < p))
     if (state.get("credit") or {}).get("grants"):
         print(f"credit lane: ${credit_balance(state)['balance']:.2f} left; {'launches next tick' if ok else why}")
-    print(f"weekly retro: {retro_due(state)[1]}")
+    print(f"RSI lane: retro: {retro_due(state)[1]}; conflicts: {conflict_due(state)[1]}")
     if gq := state.get("gh_quota"):
         print(f"GitHub API: {gq.get('remaining')}/{gq.get('limit')} left, resets "
               f"{iso(dt.datetime.fromtimestamp(gq.get('reset', 0), dt.timezone.utc))}, burn "
@@ -8978,6 +9185,40 @@ def cmd_credit(a) -> int:
     return 0
 
 
+def cmd_rsi(a) -> int:
+    """`churn rsi` (status), `conflicts` (the measure, printed, no launch), `now|on|off retro|conflicts`,
+    `set conflicts KEY V`. The retro's own settings stay under `churn retro`."""
+    if a.action in ("now", "on", "off", "set") and a.job not in ("retro", "conflicts"):
+        raise SystemExit("rsi: name a job, retro or conflicts")
+    if a.action in ("now", "on", "off"):
+        with edit_state() as st:
+            r = st.setdefault(a.job, {})
+            if a.action == "now":
+                r.pop("last", None)
+            else:
+                r["enabled"] = a.action == "on"
+    elif a.action == "set":
+        casts = {"issue": int, "every_days": float, "model": str, "budget_usd": float, "min_holds": int, "min_commits": int,
+                 "min_lines": int, "top": int}
+        if a.job != "conflicts" or a.key not in casts or a.value is None:
+            raise SystemExit(f"rsi set conflicts: one of {sorted(casts)} and a value")
+        if a.key == "model" and a.value not in WORKER_BUDGET:
+            raise SystemExit(f"rsi model: one of {sorted(WORKER_BUDGET)}")
+        with edit_state() as st:
+            st.setdefault("conflicts", {})[a.key] = casts[a.key](a.value)
+    state = load_state()
+    if a.action == "conflicts":
+        days = float(conflict_cfg(state)["every_days"])
+        print(json.dumps(conflict_data(state, now() - dt.timedelta(days=days), previous=conflict_previous()), indent=1))
+        return 0
+    cfg = conflict_cfg(state)
+    print(f"RSI lane (always on, outside the focus; one job at a time)\n  retro: {retro_due(state)[1]}\n"
+          f"  conflicts: {'on' if cfg['enabled'] else 'off'}, issue #{cfg['issue']}, every {cfg['every_days']} days, "
+          f"{cfg['model']} cap ${cfg['budget_usd']}, candidate: {cfg['min_lines']}+ lines and {cfg['min_holds']}+ holds or "
+          f"{cfg['min_commits']}+ commits; {conflict_due(state)[1]}")
+    return 0
+
+
 def cmd_retro(a) -> int:
     """`churn retro` (status), `now` (due at the next tick), `on`, `off`, `set issue|every_days|model|budget_usd|deep_every V`,
     `size FILE KB` (0 removes the budget)."""
@@ -9184,6 +9425,11 @@ def main() -> int:
     cr.add_argument("value", nargs="?")
     cr.add_argument("--expires", help="add: the grant's expiry date (YYYY-MM-DD)")
     cr.add_argument("--note")
+    rs = sub.add_parser("rsi", help="the RSI lane: status (default) / conflicts / now|on|off JOB / set conflicts KEY V")
+    rs.add_argument("action", nargs="?", default="status", choices=["status", "conflicts", "now", "on", "off", "set"])
+    rs.add_argument("job", nargs="?")
+    rs.add_argument("key", nargs="?")
+    rs.add_argument("value", nargs="?")
     rt = sub.add_parser("retro", help="weekly retro: status (default) / now / on / off / set KEY V / size FILE KB")
     rt.add_argument("action", nargs="?", default="status", choices=["status", "now", "on", "off", "set", "size"])
     rt.add_argument("key", nargs="?")
@@ -9291,6 +9537,8 @@ def main() -> int:
         return cmd_credit(a)
     if a.cmd == "retro":
         return cmd_retro(a)
+    if a.cmd == "rsi":
+        return cmd_rsi(a)
     if a.cmd == "poll":
         return cmd_poll(a)
     if a.cmd == "sync":

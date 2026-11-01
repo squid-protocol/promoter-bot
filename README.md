@@ -62,3 +62,15 @@ differs is left alone and alerts once a day. `churn skills` runs it now. One-tim
 `gh repo clone squid-protocol/promoter-bot-private ~/.local/src/promoter-bot-private`.
 
 Tests: `python3 -m pytest -q tests` (each test runs against a tmp `CHURN_HOME`, never the live state).
+
+## The RSI lane
+
+The system's weekly look at itself is one lane, on by default and outside the focus, running one job at a time. `churn rsi`
+shows it.
+
+- **Retro** (`churn retro`): prunes and promotes the rules workers read, from the week's run data.
+- **Conflict job** (`churn rsi conflicts` prints the measure): plan holds are per file, so a file many slices edit makes
+  them run one at a time. Each week churn measures, with no model and no GitHub, which files held runs and took commits.
+  A code or test file past the thresholds launches one capped Opus session, which splits it without changing behaviour,
+  following the repo's `hot-file-split` skill. A week with no candidate spends nothing. Set it up with
+  `churn rsi set conflicts issue N`, where N is a standing issue in the target repo.
