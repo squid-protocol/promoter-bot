@@ -1995,6 +1995,166 @@ def test_the_owners_hold_survives_a_new_head_and_ends_when_the_pr_closes(churn):
     assert churn.prune_pr_fixes(st, {"6905": pr(state="closed")}) == ["#6905"] and st["queue"] == []
 
 
+REPORT = """I merged origin/main again and pushed it.
+
+- **Cause:** CI proves the case at the pinned tag, which lacks it.
+- **Blocker:** squid-protocol/cics-crucible#48 is still open and no newer tag exists.
+- **CI:** not re-read.
+"""
+
+
+class TestFixLoopStop:
+    """2026-11-01: #7389 merged main again and again, its `det` red until a crucible release."""
+    RED = {"7389": pr(labels=("shepherd:needs-fix",), branch="churn/5119-x")}
+
+    @pytest.fixture(autouse=True)
+    def quiet(self, churn, monkeypatch):
+        monkeypatch.setattr(churn, "recently_settling", lambda *a: False)
+        monkeypatch.setattr(churn, "recent_fix_runs", lambda *a: 0)
+
+    def state(self):
+        return {"prs": [{"number": 7389, "issue": 5119}], "queue": [], "running": []}
+
+    def round(self, churn, st, i, checks=("det",), report=REPORT, status="done", **meta):
+        """Finish fix run i on the PR, drop any queued fix, then one gate pass with `checks` red."""
+        _run(churn, f"5119-{i}", issue=5119, pr=7389, started=f"2026-11-01T0{i}:00Z", status=status,
+             finished=churn.iso(churn.now()), **meta)
+        (churn.RUNS / f"5119-{i}" / "out.json").write_text(json.dumps({"result": report}))
+        return self.gate(churn, st, checks)
+
+    def gate(self, churn, st, checks):
+        st["queue"] = []
+        churn.CI_CHECKS[7389] = list(checks)
+        return churn.queue_pr_fixes(st, self.RED, triage=lambda n: ["test"])
+
+    def test_a_loop_with_one_cause_and_no_hand_change_stops_after_two_rounds(self, churn):
+        st = self.state()
+        assert self.round(churn, st, 0, code_changed=True) == ["#7389"]  # the first red after the PR's own run
+        assert self.round(churn, st, 1, code_changed=False) == ["#7389"]  # round 1
+        assert self.round(churn, st, 2, code_changed=False) == ["hold:#7389 (fix loop on det)"]  # round 2: no third
+        assert st["queue"] == [] and churn.on_hold(st, "7389")
+        assert st["prs"][0]["reviewed_head"] == "aaaa11112222"
+        assert "cics-crucible#48" in st["prs"][0]["note"] and "`" not in st["prs"][0]["note"]
+
+    def test_the_hold_pages_the_owner_with_the_blocker_in_view(self, churn):
+        st = self.state()
+        for i, changed in enumerate((True, False, False)):
+            self.round(churn, st, i, code_changed=changed)
+        (line,) = churn.owner_items(st, self.RED)
+        assert line.startswith("PR #7389 on hold: fix loop on det: squid-protocol/cics-crucible#48 is still open")
+        assert churn.queue_pr_fixes(st, self.RED, triage=lambda n: ["test"]) == []  # and the PR takes no more fixes
+
+    def test_no_op_rounds_at_one_head_count(self, churn):
+        st = self.state()
+        self.round(churn, st, 0)
+        self.round(churn, st, 1, code_changed=False)
+        assert self.round(churn, st, 2, code_changed=False)[0].startswith("hold:")  # RED's head never moved
+
+    def test_a_pass_with_no_new_run_is_not_a_round(self, churn):
+        st = self.state()
+        self.round(churn, st, 0)
+        self.round(churn, st, 1, code_changed=False)
+        for _ in range(3):
+            assert self.gate(churn, st, ("det",)) == ["#7389"]
+
+    @pytest.mark.parametrize("meta", [{"code_changed": True, "hand_changed": True}, {"code_changed": True},
+                                      {"code_changed": None}, {}])
+    def test_a_hand_written_or_unknown_change_keeps_the_loop_going(self, churn, meta):
+        st = self.state()
+        self.round(churn, st, 0)
+        self.round(churn, st, 1, code_changed=False)
+        assert self.round(churn, st, 2, **meta) == ["#7389"]  # progress: the count starts again
+        assert self.round(churn, st, 3, code_changed=False) == ["#7389"]
+        assert self.round(churn, st, 4, code_changed=False)[0].startswith("hold:")
+
+    def test_a_round_that_only_regenerates_files_is_no_progress(self, churn):
+        st = self.state()
+        self.round(churn, st, 0)
+        self.round(churn, st, 1, code_changed=True, hand_changed=False)
+        assert self.round(churn, st, 2, code_changed=True, hand_changed=False)[0].startswith("hold:")
+
+    def test_a_new_failing_check_keeps_the_loop_going(self, churn):
+        st = self.state()
+        self.round(churn, st, 0)
+        self.round(churn, st, 1, code_changed=False)
+        assert self.round(churn, st, 2, checks=("det", "test"), code_changed=False) == ["#7389"]
+        assert self.round(churn, st, 3, checks=("test",), code_changed=False) == ["#7389"]
+
+    def test_a_crashed_run_is_no_round(self, churn):
+        st = self.state()
+        self.round(churn, st, 0)
+        self.round(churn, st, 1, code_changed=False)
+        assert self.round(churn, st, 2, status="crashed") == ["#7389"]
+
+    def test_unread_checks_never_stop_a_loop(self, churn):
+        st = self.state()
+        self.round(churn, st, 0)
+        self.round(churn, st, 1, code_changed=False)
+        churn.CI_CHECKS.clear()
+        _run(churn, "5119-2", issue=5119, pr=7389, started="2026-11-01T02:00Z", status="done", code_changed=False,
+             finished=churn.iso(churn.now()))
+        st["queue"] = []
+        assert churn.queue_pr_fixes(st, self.RED, triage=lambda n: None) == ["#7389"]
+
+    def test_a_conflict_still_gets_its_fix(self, churn):
+        st = self.state()
+        self.round(churn, st, 0)
+        self.round(churn, st, 1, code_changed=False)
+        _run(churn, "5119-2", issue=5119, pr=7389, started="2026-11-01T02:00Z", status="done", code_changed=False,
+             finished=churn.iso(churn.now()))
+        st["queue"] = []
+        snap = {"7389": pr(labels=("shepherd:needs-fix",), branch="churn/5119-x", ms="dirty")}
+        assert churn.queue_pr_fixes(st, snap, update=lambda n: False) == ["#7389"]
+
+    def test_a_later_verdict_lifts_the_hold_and_gets_fresh_rounds(self, churn):
+        st = self.state()
+        for i, changed in enumerate((True, False, False)):
+            self.round(churn, st, i, code_changed=changed)
+        st["prs"][0]["verdict"] = "send-back"  # as `churn pr reviewed` replaces it
+        st["prs"][0]["reviewed_head"] = "other"
+        assert self.gate(churn, st, ("det",)) == ["#7389"]
+        assert self.round(churn, st, 3, code_changed=False) == ["#7389"]
+
+    def test_it_can_be_turned_off(self, churn, monkeypatch):
+        monkeypatch.setattr(churn, "FIX_LOOP_STOP", 0)
+        st = self.state()
+        for i in range(5):
+            assert self.round(churn, st, i, code_changed=False) == ["#7389"]
+
+    def test_the_workflow_grant_does_not_release_a_fix_loop_hold(self, churn, monkeypatch):
+        monkeypatch.setattr(churn, "standing_workflows", lambda state: True)
+        st = {"prs": [{"number": 7389, "verdict": "hold", "reviewed_head": "aaaa11112222",
+                       "note": "fix loop on det: the workflow file needs a release"}]}
+        assert churn.release_workflow_holds(st, self.RED) == [] and churn.on_hold(st, "7389")
+
+
+@pytest.mark.parametrize("report,want", [
+    (REPORT, "squid-protocol/cics-crucible#48 is still open and no newer tag exists."),
+    ("I merged main.\n\n- **What clears it:** merge `x#48`, cut a tag.\n- **Cause:** the pin.", "merge x#48, cut a tag."),
+    ("- **What\u2019s needed:** a pin bump.", "a pin bump."),
+    ("- **Cause:** the pin lacks the case.\n- **CI:** red.", "the pin lacks the case."),
+    ("I merged main. The det check stays red until the pin moves. CI is pending.", "The det check stays red until the pin moves."),
+    ("I merged main and pushed it.", "no blocker named: read run 1-a"),
+])
+def test_run_blocker_reads_the_report_by_rule(churn, report, want):
+    _run(churn, "1-a")
+    (churn.RUNS / "1-a" / "out.json").write_text(json.dumps({"result": report}))
+    assert churn.run_blocker("1-a") == want
+
+
+def test_run_blocker_without_a_report_names_the_run(churn):
+    assert churn.run_blocker("1-gone") == "no blocker named: read run 1-gone"
+
+
+def test_own_hand_commits_tells_real_fixes_from_regenerated_files(churn, monkeypatch):
+    def fake(files):
+        monkeypatch.setattr(churn, "run", lambda *a, **k: subprocess.CompletedProcess([], 0, "\n".join(files) + "\n", ""))
+        return churn.own_hand_commits("/wt", "abc")
+    assert fake(["tests/equivalence/zecs-zecs001/case.json"]) is True  # data by hand: REGENERATED_RE would pass it
+    assert fake(["tests/tools/det_coverage_ledger.py"]) is True  # a tool GENERATED_RE's `ledger` matches
+    assert fake(["tests/equivalence/det_sweep_coverage/a.json", "docs/ci.md"]) is False
+
+
 def _held(reviewed_head="aaaa11112222", verdict="hold", queue=()):
     return {"prs": [{"number": 7389, "issue": 5119, "reviewed_head": reviewed_head, "verdict": verdict}],
             "queue": list(queue), "running": []}
