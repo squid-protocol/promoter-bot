@@ -2142,6 +2142,95 @@ def test_ci_backlog_is_minutes_of_work_over_the_pool(churn):
     assert row["backlog_min"] == b["backlog_min"] and row["job_wait_p50"] == 3.0 and "by_workflow" not in row
 
 
+def _backwards_job(churn):
+    return {**_job(churn, 30, 2, 0), "name": "tested-tree", "completed_at": churn.iso(churn.now() - churn.dt.timedelta(hours=2))}
+
+
+def test_a_job_finishing_before_it_started_never_counts_as_negative_time(churn):
+    # 2026-11-01: GitHub showed a retried run's job finishing 47 min before it started; learned costs went negative
+    c = churn.ci_run_cost([_job(churn, 30, 2, 10), _backwards_job(churn)])
+    assert c["runner_min"] == 10 and "tested-tree" in c["bad_jobs"][0]
+    only = churn.ci_run_cost([_backwards_job(churn)])
+    assert only["runner_min"] == 0 and only["bad_jobs"] and only["wall_min"] == 0
+
+
+def test_the_profile_skips_a_run_with_impossible_job_times_and_says_which(churn):
+    run = {"id": 7, "path": ".github/workflows/smoke-test.yml", "conclusion": "success", "run_attempt": 2}
+    def gh(path):
+        if "/jobs" in path:
+            return {"jobs": [_job(churn, 30, 2, 10), _backwards_job(churn)]}
+        return {"workflow_runs": [run] if "status=completed" in path else []}
+    st = {"ci_profile": {"workflows": {"smoke-test.yml": {"runner_min": 12.0, "wall_min": 9.0, "jobs": 2, "n": 4}}, "waits": []}}
+    notes = churn.ci_profile_sample(st, gh=gh)
+    assert st["ci_profile"]["workflows"]["smoke-test.yml"]["runner_min"] == 12.0  # untouched: 7's cost is unknown
+    assert any("skipped run 7" in n and "attempt 2" in n and "tested-tree" in n for n in notes)
+
+
+@pytest.mark.parametrize("bad", [-51.5, 0, 0.0, -1e9, 1e9, float("nan"), float("inf"), float("-inf"), "x", [], {}, True - 2])
+def test_no_stored_price_can_stop_admission_on_an_empty_pool(churn, bad):
+    # The invariant: only room and the queue wait refuse launches. Whatever the store holds, an empty pool admits.
+    prof = {"per_push_rm": bad, "target_util": 0.55, "workflows": {}}
+    adm = churn.ci_admission({"ci_profile": prof}, {"pool": 20, "queued_rm": 0, "active_rm": 0}, {})
+    assert adm["admit"] > 0 and adm["per_launch_rm"] > 0 and adm["cost_fallback"]
+
+
+@pytest.mark.parametrize("bad", [-1, 0, 5, float("nan"), "x", None])
+def test_no_stored_target_util_can_stop_admission_on_an_empty_pool(churn, bad):
+    st = {"ci_profile": {"per_push_rm": 40, "target_util": bad}}
+    assert churn.ci_admission(st, {"pool": 20, "queued_rm": 0, "active_rm": 0}, {})["admit"] > 0
+
+
+def test_healing_drops_what_cannot_be_real_and_keeps_the_rest(churn):
+    good = {"runner_min": 12.0, "wall_min": 9.0, "n": 4}
+    st = {"ci_profile": {"per_push_rm": -51.5, "target_util": 7, "workflows": {
+        "smoke-test.yml": good, "ruff.yml": {"runner_min": 0.0, "n": 1}, "ground.yml": {"runner_min": -63.5, "n": 95},
+        "det.yml": {"runner_min": float("nan")}, "huge.yml": {"runner_min": 1e9}, "gone.yml": {},
+        "wall.yml": {"runner_min": 3.0, "wall_min": -2.0}}}}
+    notes = churn.heal_ci_profile(st)
+    assert set(st["ci_profile"]["workflows"]) == {"smoke-test.yml", "ruff.yml"} and len(notes) == 7
+    assert "per_push_rm" not in st["ci_profile"] and "target_util" not in st["ci_profile"]
+    assert churn.heal_ci_profile(st) == [] and churn.heal_ci_profile({}) == []
+
+
+def test_healing_lets_the_dropped_workflow_be_sampled_first(churn):
+    st = {"ci_profile": {"workflows": {"ground.yml": {"runner_min": -63.5, "n": 95}}}}
+    churn.heal_ci_profile(st)
+    assert churn.workflow_cost(st["ci_profile"], "ground.yml", churn.ci_profile_cfg(st))["runner_min"] == 5.0
+
+
+def test_a_negative_workflow_cost_never_reaches_the_per_push_price(churn):
+    prof = {"workflows": {"a.yml": {"runner_min": -63.5}, "b.yml": {"runner_min": 12}}}
+    runs = [{"event": "pull_request", "path": ".github/workflows/a.yml", "head_sha": s, "conclusion": "success",
+             "status": "completed"} for s in "abc"]
+    assert churn.per_push_cost(runs, prof, churn.ci_profile_cfg({})) == 12
+
+
+def test_the_last_guard_admits_one_and_says_so_when_admission_refuses_an_empty_ci(churn):
+    empty = {"queued": 0, "median_wait_min": 0}
+    st = {"queue": [{"issue": 1}], "ci_admission": {"admit": 0, "room_rm": 763}, "ci_backlog": {"backlog_min": 0.0}}
+    assert churn.admission_stall(st, empty) is None and st["ci_admission"]["admit"] == 0  # not yet
+    st["ci_admission_idle_since"] = churn.iso(churn.now() - churn.dt.timedelta(minutes=31))
+    note = churn.admission_stall(st, empty)
+    assert "empty CI" in note and st["ci_admission"]["admit"] == 1 and st["ci_admission"]["failopen"]
+    assert churn.ci_mode(st, empty)[0] == "calm"
+
+
+@pytest.mark.parametrize("st_over, q", [
+    ({"ci_admission": {"admit": 2}}, {"queued": 0}),                # admitting
+    ({}, {"queued": 40, "median_wait_min": 12}),                    # a real queue
+    ({"ci_backlog": {"backlog_min": 30.0}}, {"queued": 0}),         # real work in hand
+    ({"queue": []}, {"queued": 0}),                                 # nothing to launch
+    ({}, {"queued": 0, "error": "gh down"}),                        # can't see CI: not known empty
+])
+def test_the_last_guard_leaves_a_real_hold_alone(churn, st_over, q):
+    old = churn.iso(churn.now() - churn.dt.timedelta(hours=3))
+    st = {"queue": [{"issue": 1}], "ci_admission": {"admit": 0}, "ci_backlog": {"backlog_min": 0.0},
+          "ci_admission_idle_since": old, **st_over}
+    want = st["ci_admission"]["admit"]
+    assert churn.admission_stall(st, q) is None and st["ci_admission"]["admit"] == want
+    assert "ci_admission_idle_since" not in st
+
+
 def test_per_push_cost_counts_finished_runs_per_pushed_sha(churn):
     # #38 step 2: the newest completed runs read 9 runner-min a push (heavy runs still going); a closed window doesn't
     prof = {"workflows": {"smoke-test.yml": {"runner_min": 12}, "det-sweep.yml": {"runner_min": 30},
@@ -3258,13 +3347,14 @@ def test_retro_data_gathers_the_weeks_facts_without_a_model(churn, tmp_path):
     _run(churn, "2-old", issue=2, started="2026-01-01T00:00Z", status="done", cost_usd=99.0)
     inbox = tmp_path / "inbox.md"
     inbox.write_text("- [x] old (PR #1)\n- [ ] new lesson (PR #2)\n")
-    log_text = ("# Scorecard 2026-10-17 (UTC day)\n- Spend: $7\n- Merged: 3 PRs\n\n- 2026-10-17T01:00Z [churn] noise\n"
+    day = str((churn.now() - dt.timedelta(days=1)).date())  # relative: a fixed date ages out and blocks every self-sync
+    log_text = (f"# Scorecard {day} (UTC day)\n- Spend: $7\n- Merged: 3 PRs\n\n- {day}T01:00Z [churn] noise\n"
                 "# Scorecard 2025-01-01 (UTC day)\n- Spend: $1\n")
     d = churn.retro_data({}, churn.now() - dt.timedelta(days=7), log_text=log_text, inbox=inbox)
     assert d["runs"] == 2 and d["cost_usd"] == 17.0 and d["statuses"] == {"budget": 1, "done": 1}
     assert d["kinds"] == {"new_work": 1, "send_back": 1} and d["budget_hits"][0]["run"] == "1-a"
     assert "class table" in d["send_backs"][0]["message"] and d["denials"]["Bash"]["n"] == 1
-    assert d["scorecards"] == {"2026-10-17": ["Spend: $7", "Merged: 3 PRs"]}
+    assert d["scorecards"] == {day: ["Spend: $7", "Merged: 3 PRs"]}
     assert d["unticked_lessons"] == ["- [ ] new lesson (PR #2)"]
 
 

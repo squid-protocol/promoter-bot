@@ -4765,15 +4765,72 @@ def ci_profile_cfg(state: dict) -> dict:
 
 
 def ci_run_cost(jobs: list[dict]) -> dict | None:
-    """Runner-minutes, wall minutes, job count and per-job queue waits of one completed run; None if no job ran."""
-    ran = [(c, s, e) for j in jobs if j.get("conclusion") != "skipped"
-           and (c := parse_iso(j.get("created_at"))) and (s := parse_iso(j.get("started_at")))
-           and (e := parse_iso(j.get("completed_at")))]
-    if not ran:
+    """Runner-minutes, wall minutes, job count and per-job queue waits of one completed run; None if no job ran.
+    GitHub can report a job finishing before it started (seen on retried runs, 2026-11-01): `bad_jobs` names those, and
+    ci_profile_sample skips such a run. Their time is unknown, so it never counts as negative time here."""
+    timed = [(j, c, s, e) for j in jobs if j.get("conclusion") != "skipped"
+             and (c := parse_iso(j.get("created_at"))) and (s := parse_iso(j.get("started_at")))
+             and (e := parse_iso(j.get("completed_at")))]
+    if not timed:
         return None
+    ran = [(c, s, e) for _, c, s, e in timed if e >= s]
+    bad = [f"{j.get('name', '?')} {iso(s)}..{iso(e)}" for j, _, s, e in timed if e < s]
+    if not ran:
+        return {"runner_min": 0.0, "wall_min": 0.0, "jobs": 0, "waits": [], "bad_jobs": bad}
     return {"runner_min": sum((e - s).total_seconds() for _, s, e in ran) / 60,
-            "wall_min": (max(e for *_, e in ran) - min(c for c, *_ in ran)).total_seconds() / 60,
-            "jobs": len(ran), "waits": [max(0.0, (s - c).total_seconds() / 60) for c, s, _ in ran]}
+            "wall_min": max(0.0, (max(e for *_, e in ran) - min(c for c, *_ in ran)).total_seconds() / 60),
+            "jobs": len(ran), "waits": [max(0.0, (s - c).total_seconds() / 60) for c, s, _ in ran],
+            **({"bad_jobs": bad} if bad else {})}
+
+
+CI_JOB_MAX_MIN = 360  # GitHub ends a hosted job at 6 h: a run can't cost more than the whole pool for that long
+
+
+def as_float(x) -> float:
+    """x as a float, NaN when it isn't one: a range check on the result fails for junk, NaN and infinity alike."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def workflow_cost_ok(rm, state: dict) -> bool:
+    """A workflow run's runner-minutes can be real: never negative, never over the pool for GitHub's job limit."""
+    return 0 <= as_float(rm) <= int(ci_profile_cfg(state)["pool"]) * CI_JOB_MAX_MIN
+
+
+def per_push_ok(rm, state: dict) -> bool:
+    """A push's price can be real: above zero (a zero or negative price makes admission refuse everything, whatever
+    the room) and under the pool's capacity over the horizon (a dearer one can never be admitted either)."""
+    return 0 < as_float(rm) <= int(ci_profile_cfg(state)["pool"]) * float(ci_admission_cfg(state)["horizon_min"])
+
+
+def target_util_ok(u, state: dict) -> bool:
+    cfg = ci_admission_cfg(state)
+    return float(cfg["util_min"]) <= as_float(u) <= float(cfg["util_max"])
+
+
+def heal_ci_profile(state: dict) -> list[str]:
+    """Drop every learned CI cost that can't be real, so it is relearned instead of steering admission. 2026-11-01: five
+    workflows went negative, per_push_rm followed, and admission admitted nothing on an empty pool for hours."""
+    prof = state.get("ci_profile")
+    if not isinstance(prof, dict):
+        return []
+    notes = []
+    wfs = prof.get("workflows") if isinstance(prof.get("workflows"), dict) else {}
+    for wf, w in list(wfs.items()):
+        w = w if isinstance(w, dict) else {}
+        wall = w.get("wall_min")
+        if not workflow_cost_ok(w.get("runner_min"), state) or (wall is not None and not as_float(wall) >= 0):
+            notes.append(f"ci profile: dropped {wf}'s learned cost {w.get('runner_min')!r} runner-min (not a real cost)")
+            del wfs[wf]
+    if prof.get("per_push_rm") is not None and not per_push_ok(prof["per_push_rm"], state):
+        notes.append(f"ci profile: dropped per_push_rm {prof['per_push_rm']!r} (not a real cost)")
+        del prof["per_push_rm"]
+    if prof.get("target_util") is not None and not target_util_ok(prof["target_util"], state):
+        notes.append(f"ci profile: dropped target_util {prof['target_util']!r} (outside its limits)")
+        del prof["target_util"]
+    return notes
 
 
 def ci_profile_sample(state: dict, gh=None, ignore=(), want=()) -> list[str]:
@@ -4819,6 +4876,7 @@ def ci_profile_sample(state: dict, gh=None, ignore=(), want=()) -> list[str]:
                      key=lambda r: n_of(os.path.basename(str(r.get("path", "")))))
     picked = picked[:int(cfg["sample_runs"])]
     a, n = float(cfg["alpha"]), 0
+    rejected: list[str] = []
     for r in picked:
         try:
             jobs = gh(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100").get("jobs", [])
@@ -4827,8 +4885,13 @@ def ci_profile_sample(state: dict, gh=None, ignore=(), want=()) -> list[str]:
         seen.add(r["id"])
         if not (c := ci_run_cost(jobs)):
             continue
+        wf = os.path.basename(str(r.get("path", "")))
+        if c.get("bad_jobs") or not workflow_cost_ok(c["runner_min"], state) or c["wall_min"] < 0:
+            rejected.append(f"ci profile: skipped run {r['id']} ({wf}, attempt {r.get('run_attempt')}): "
+                            f"{c['runner_min']:.1f} runner-min, impossible job times {c.get('bad_jobs', [])[:3]}")
+            continue
         n += 1
-        w = prof["workflows"].setdefault(os.path.basename(str(r.get("path", ""))), {"n": 0})
+        w = prof["workflows"].setdefault(wf, {"n": 0})
         for k in ("runner_min", "wall_min", "jobs"):
             w[k] = round(c[k] if not w["n"] else (1 - a) * float(w.get(k, c[k])) + a * c[k], 2)
         w["n"], w["t"] = w["n"] + 1, iso(now())
@@ -4846,8 +4909,13 @@ def ci_profile_sample(state: dict, gh=None, ignore=(), want=()) -> list[str]:
                     f"{lo.strftime('%Y-%m-%dT%H:%M:%SZ')}..{hi.strftime('%Y-%m-%dT%H:%M:%SZ')}").get("workflow_runs", [])
     except RuntimeError:
         window = []
+    notes += rejected
     if (pp := per_push_cost(window, prof, cfg)) is not None:
-        prof["per_push_rm"] = round(pp if prof.get("per_push_rm") is None else (1 - a) * float(prof["per_push_rm"]) + a * pp, 1)
+        if per_push_ok(pp, state):
+            old = prof.get("per_push_rm")
+            prof["per_push_rm"] = round(pp if not per_push_ok(old, state) else (1 - a) * float(old) + a * pp, 1)
+        else:
+            notes.append(f"ci profile: ignored per-push reading {pp:.1f} runner-min (not a real cost)")
     if note := adjust_target_util(state):
         notes.append(note)
     return notes
@@ -5042,27 +5110,56 @@ def ci_admission(state: dict, backlog: dict, q: dict | None = None) -> dict:
     room. Crucible-repo work runs on its own repo's CI and is not priced here."""
     cfg, pcfg = ci_admission_cfg(state), ci_profile_cfg(state)
     prof = state.get("ci_profile") or {}
-    u = float(prof.get("target_util", cfg["util_init"]))
-    per_push = float(prof.get("per_push_rm") or 2 * float(pcfg["default_runner_min"]))
+    u = float(prof["target_util"]) if target_util_ok(prof.get("target_util"), state) else float(cfg["util_init"])
+    default_push = max(1.0, 2 * float(pcfg["default_runner_min"]))
+    per_push = float(prof["per_push_rm"]) if per_push_ok(prof.get("per_push_rm"), state) else default_push
     per_launch = per_push * float(cfg["pushes_per_pr"])
+    if not per_launch > 0:  # never let a price refuse launches: only room and the queue wait may
+        per_launch = default_push
     live = [r for r in claude_slot_holders(state) if not r.get("repo")]
     committed = len(live) * per_launch
     in_hand = float(backlog.get("queued_rm") or 0) + float(backlog.get("active_rm") or 0)
     room = u * int(backlog.get("pool") or pcfg["pool"]) * float(cfg["horizon_min"]) - in_hand - committed
     out = {"target_util": round(u, 3), "per_launch_rm": round(per_launch), "committed_rm": round(committed),
-           "room_rm": round(room), "admit": max(0, int(room // per_launch)) if per_launch > 0 else 0}
+           "room_rm": round(room), "admit": max(0, int(room // per_launch))}
+    if prof.get("per_push_rm") is not None and not per_push_ok(prof["per_push_rm"], state):
+        out["cost_fallback"] = f"stored per_push_rm {prof['per_push_rm']!r} is not a real cost"
     qw, hold = (q or {}).get("median_wait_min"), float(cfg["hold_queue_wait_min"])
     if qw is not None and "error" not in (q or {}) and float(qw) > hold:
         out.update(admit=0, held=f"queued runs' median wait {qw} min over {hold:g}")
     return out
 
 
+ADMISSION_STALL_MIN = 30  # the last guard: whatever the cause, an empty CI must not stop launches for longer than this
+ADMISSION_IDLE_BACKLOG_MIN = 5.0
+
+
+def admission_stall(state: dict, q: dict) -> str | None:
+    """Admit one launch, and return a note for the owner, once admission has refused launches for ADMISSION_STALL_MIN
+    while CI has nothing queued and under ADMISSION_IDLE_BACKLOG_MIN of work in hand. Those are the readings admission
+    exists to act on, so refusing there is a bug, whichever one: this does not depend on knowing its cause."""
+    adm, backlog = state.get("ci_admission") or {}, state.get("ci_backlog") or {}
+    idle = (not adm.get("admit") and "error" not in q and not q.get("queued") and state.get("queue")
+            and as_float(backlog.get("backlog_min")) < ADMISSION_IDLE_BACKLOG_MIN)
+    if not idle:
+        state.pop("ci_admission_idle_since", None)
+        return None
+    since = state.setdefault("ci_admission_idle_since", iso(now()))
+    if now() - parse_iso(since) < dt.timedelta(minutes=ADMISSION_STALL_MIN):
+        return None
+    adm.update(admit=1, failopen=f"refusing on an empty CI since {since}")
+    return (f"admission refused launches on an empty CI since {since}: room {adm.get('room_rm')} runner-min, "
+            f"{adm.get('per_launch_rm')} per launch, {backlog.get('backlog_min')} min of backlog. Admitting one at a "
+            "time until it recovers; this is a churn bug")
+
+
 def workflow_cost(prof: dict, wf: str, cfg: dict) -> dict:
     """The learned cost of workflow file `wf`, else the median of known workflows, else default_runner_min."""
     known = prof.get("workflows") or {}
-    if wf in known:
+    if wf in known and as_float(known[wf].get("runner_min")) >= 0:
         return known[wf]
-    rms = sorted(float(w.get("runner_min", 0)) for w in known.values()) or [float(cfg["default_runner_min"])]
+    rms = sorted(rm for w in known.values() if (rm := as_float(w.get("runner_min", 0))) >= 0) \
+        or [float(cfg["default_runner_min"])]
     return {"runner_min": rms[len(rms) // 2], "wall_min": None, "jobs": None}
 
 
@@ -7437,6 +7534,8 @@ def cmd_tick(a) -> int:
                 occ_fresh = True
             want = [*collections.Counter(cq.get("by_workflow") or {}).elements(),
                     *(os.path.basename(str(r.get("path", ""))) for r in inprog or [])]
+            for note in heal_ci_profile(state):
+                log(note)
             for note in (ci_profile_sample(state, ignore=ign, want=want) if QUOTA_MODE == "ok" else []):
                 log(note, quiet=True)  # GitHub calls outside the state lock; skipped when the API quota is lean
             live_waits = live_pr_job_waits(state, inprog, jobs=occ.get("jobs"))
@@ -7452,6 +7551,7 @@ def cmd_tick(a) -> int:
                     log(note)
                 st["ci_backlog"] = {**ci_backlog(st, cq, inprog), "t": iso(now())}
                 st["ci_admission"] = {**ci_admission(st, st["ci_backlog"], cq), "t": iso(now())}  # #38: decides the mode
+                stall = admission_stall(st, cq)
                 mode, why = ci_mode(st, cq)
                 if mode != st.get("ci_mode", "calm"):
                     log(f"CI mode {st.get('ci_mode', 'calm')} -> {mode} ({why}); "
@@ -7463,6 +7563,9 @@ def cmd_tick(a) -> int:
                 log_ci_snapshot(st, cq)
             for note in throttled:
                 log(note)
+            if stall:
+                log(stall, quiet=True)
+                notify("admission-stall", "churn: admission stuck on an empty CI", stall, priority="high", tags="warning")
             state = load_state()
         if not a.dry_run:
             try:
@@ -8371,6 +8474,8 @@ def cmd_status(a) -> int:
     if ad := state.get("ci_admission"):
         lw = sorted(x[2] for x in (state.get("ci_profile") or {}).get("live_waits", []))
         print(f"CI admission: admits {ad.get('admit')} launch(es) now" + (f" (HELD: {ad['held']})" if ad.get("held") else "")
+              + (f" (FAIL-OPEN: {ad['failopen']})" if ad.get("failopen") else "")
+              + (f" (DEFAULT PRICE: {ad['cost_fallback']})" if ad.get("cost_fallback") else "")
               + f": room {ad.get('room_rm')} "
               f"runner-min at target_util {ad.get('target_util')}, {ad.get('per_launch_rm')} per launch, "
               f"{ad.get('committed_rm')} committed by live workers; live PR job wait p50 "
