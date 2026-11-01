@@ -1902,6 +1902,40 @@ def test_the_owners_hold_survives_a_new_head_and_ends_when_the_pr_closes(churn):
     assert churn.prune_pr_fixes(st, {"6905": pr(state="closed")}) == ["#6905"] and st["queue"] == []
 
 
+def _held(reviewed_head="aaaa11112222", verdict="hold", queue=()):
+    return {"prs": [{"number": 7389, "issue": 5119, "reviewed_head": reviewed_head, "verdict": verdict}],
+            "queue": list(queue), "running": []}
+
+
+def test_a_held_pr_gets_no_fix_at_its_head_or_after_a_new_head(churn):
+    red = {"7389": pr(labels=("shepherd:needs-fix",), branch="churn/5119-x")}
+    assert churn.queue_pr_fixes(_held(), red) == []
+    moved = _held(reviewed_head="ffff00001111")  # main was merged in after the hold: still held
+    assert churn.queue_pr_fixes(moved, red) == [] and moved["queue"] == []
+    assert churn.queue_pr_fixes(_held(), {"7389": pr(ms="dirty", branch="churn/5119-x")}) == []  # no branch update
+
+
+def test_a_later_verdict_lifts_the_hold_and_the_fix_comes_back(churn, monkeypatch):
+    monkeypatch.setattr(churn, "recent_fix_runs", lambda *a: 0)
+    monkeypatch.setattr(churn, "ci_triage", lambda n: ["test"])
+    st = _held(verdict="send-back")
+    assert churn.queue_pr_fixes(st, {"7389": pr(labels=("shepherd:needs-fix",), branch="churn/5119-x")}) == ["#7389"]
+
+
+def test_a_fix_queued_before_the_hold_is_dropped_but_an_owner_park_stays(churn):
+    fix = {**item(5119, pr=7389), "auto": "pr-fix", "head": "aaaa11112222"}
+    st = _held(queue=[fix])
+    assert churn.prune_pr_fixes(st, {"7389": pr()}) == ["#7389"] and st["queue"] == []
+    parked = _held(queue=[{**fix, "needs_owner": True}])
+    assert churn.prune_pr_fixes(parked, {"7389": pr()}) == [] and parked["queue"]
+
+
+def test_a_held_pr_stays_listed_as_held_after_a_new_head(churn):
+    st = _held(reviewed_head="ffff00001111")
+    assert churn.owner_holds(st, {"7389": pr()}) == ["7389"]
+    assert churn.prs_needing_work({"7389": pr()}, state=st) == []
+
+
 # ---------------------------------------------------------------- stale PRs: regraft (owner 2026-10-24)
 def _stale(churn, monkeypatch, behind=560, files=("tests/equivalence/det_sweep_coverage/a.json",)):
     monkeypatch.setattr(churn, "behind_main", lambda entry, n, head, compare=None: behind)

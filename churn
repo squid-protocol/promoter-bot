@@ -5957,6 +5957,9 @@ def prune_pr_fixes(state: dict, snap: dict) -> list[str]:
         if v is not None and q.get("owner_hold") and v.get("state") == "open":
             keep.append(q)  # the owner's hold: a new head does not lift it, only the PR closing or merging
             continue
+        if v is not None and q.get("auto") == "pr-fix" and not q.get("needs_owner") and on_hold(state, str(q["pr"])):
+            out.append(f"#{q['pr']}")  # queued before the hold: a held PR takes no automatic fix
+            continue
         if v is not None and (v.get("state") != "open" or (q.get("head") and v.get("head") and q["head"] != v["head"])):
             out.append(f"#{q['pr']}")
             continue
@@ -6221,13 +6224,16 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
     on it and no queue item for it, gets a fix item at the FRONT of the queue (key "pr").
     2026-10-16: so does a PR reviewed send-back at its current head. #5204's send-back waited for #5201; when #5201
     merged a tick dropped the fix item ("clean, nothing to fix"), the head never moved, and 5 items blocked on it idled
-    the slots ~20 h. A send-back stays a need until the head changes."""
+    the slots ~20 h. A send-back stays a need until the head changes.
+    2026-11-01: a PR on hold gets no fix item at all, not even a branch update: #7389 waited on an unreleased crucible
+    case, yet 21 fix rounds merged main into it, each moving the head and re-running full CI (269 workflow runs)."""
     live = [r for r in state.get("running", []) if pid_alive(r.get("pid"))]
     added = [f"expired:{x}" for x in expire_owner_parks(state)]
     queued = {int(p) for q in state.get("queue", []) for p in [q.get("pr"), *q.get("also_prs", [])] if p}
     issue_of = {pr_num(p): p.get("issue") for p in state.get("prs", []) if isinstance(p, dict)}
     for n, v in snap.items():
-        if v.get("state") != "open" or int(n) in queued or pr_in_hand(n, v, live) or flaked(state, n, v):
+        if (v.get("state") != "open" or int(n) in queued or pr_in_hand(n, v, live) or flaked(state, n, v)
+                or on_hold(state, n)):
             continue
         sent_back = verdict_at_head(state, n, v) == "send-back"
         why = [w for w, hit in (("conflicts with main", v.get("mergeable_state") == "dirty"),
@@ -6348,6 +6354,13 @@ def verdict_at_head(state: dict, n: str, v: dict) -> str | None:
     return None
 
 
+def on_hold(state: dict, n: str) -> bool:
+    """PR n's latest verdict is `hold`, at any head: a hold lasts until a later verdict replaces it. A new head must not
+    lift it, or the first automatic push ends the hold that was meant to stop automatic pushes."""
+    p = next((p for p in state.get("prs", []) if isinstance(p, dict) and pr_num(p) == int(n)), None)
+    return (p or {}).get("verdict") == "hold"
+
+
 HOLD_WORKFLOW_RE = re.compile(r"workflow|\.github/|allow_workflows", re.I)
 
 
@@ -6374,7 +6387,7 @@ def release_workflow_holds(state: dict, snap: dict) -> list[str]:
 
 def owner_holds(state: dict, snap: dict) -> list[str]:
     """Open PRs the tick put on hold at their current head: they wait on the owner, not on churn."""
-    return [n for n, v in snap.items() if v.get("state") == "open" and verdict_at_head(state, n, v) == "hold"]
+    return [n for n, v in snap.items() if v.get("state") == "open" and on_hold(state, n)]
 
 
 def fix_merge_labels(state: dict, snap: dict, dry_run: bool = False) -> list[str]:
@@ -6416,7 +6429,7 @@ def prs_needing_work(snap: dict, live: list[dict] | None = None, state: dict | N
             continue
         if live and pr_in_hand(n, v, live):
             continue
-        if state is not None and verdict_at_head(state, n, v) in ("hold", "merge"):
+        if state is not None and (on_hold(state, n) or verdict_at_head(state, n, v) == "merge"):
             continue  # hold: waits on the owner; merge at this head: fix_merge_labels puts the labels back
         if state is not None and (owner_parked(state, n) or flaked(state, n, v) or clean_at_head(state, n, v)):
             continue  # 2026-10-16 audit: three such PRs held all normal churn with nothing scheduled to clear them
