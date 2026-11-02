@@ -1318,7 +1318,7 @@ def record_limit(state: dict, reset: dt.datetime, source: str, text: str = "") -
     if len(recent) >= LIMIT_LOOP_HITS:
         notify("limit-loop", f"churn: hit the usage limit {len(recent)} times in {LONG_PAUSE_H} h",
                "Each pause ended straight into the limit again: the reset time is probably misread (a weekly limit?). "
-               f"Check /usage; `touch {STOP}` stops churn." + (f" Last message: {said}" if said else ""),
+               "Check /usage; `churn stop --hours H --reason R` stops churn." + (f" Last message: {said}" if said else ""),
                priority="high", cooldown_h=12, tags="repeat")
     if win > 0:
         # The ledger counts churn's own runs only; other sessions share the limit, so `win` is churn's share at the
@@ -3714,6 +3714,7 @@ def blocked_by(q: dict, snap: dict | None, state: dict | None = None) -> list[in
 # a need stays until the state shows it met (reviewed_head == head, followup done, PR fixed) -- or it stalls after
 # STALL_AFTER model ticks and waits for the owner.
 STALL_AFTER = 3
+STALL_REARM_H = float(_CFG.get("stall_rearm_h", 2))
 
 
 # #30 (nyx 2026-10-20): a queued item whose scope an open PR of the same issue already covered waited 6 h, then
@@ -3968,17 +3969,30 @@ def owner_items(state: dict, snap: dict) -> list[str]:
 
 def count_attempts(state: dict, keys: list[str]) -> tuple[list[str], list[str]]:
     """Bump the model-tick attempt count of each need; keys past STALL_AFTER stop triggering (owner decides).
-    Returns (keys still active, keys newly stalled). Counts of needs that went away are dropped."""
+    Returns (keys still active, keys newly stalled). Counts of needs that went away are dropped.
+    2026-11-01 (nyx): "focus starved" stalled at 14:50Z and was never asked again; the box sat empty until an owner
+    stop 7 h later. A stall now re-arms after STALL_REARM_H (the state may have changed: a wait expired, a PR merged),
+    and the rescue (`churn rescue`) is the escalation past that."""
     att = {k: v for k, v in state.get("attempts", {}).items() if k in keys}
+    since = {k: v for k, v in (state.get("stalled_at") or {}).items() if k in keys}
     active, stalled = [], []
     for k in keys:
         if att.get(k, 0) >= STALL_AFTER:
+            t = parse_iso(since.get(k))
+            if t and now() - t >= dt.timedelta(hours=STALL_REARM_H):
+                att[k] = 0  # re-armed: the model is asked again
+                since.pop(k, None)
+                state["stalled"] = [s for s in state.get("stalled", []) if s != k]
+                active.append(k)
+                continue
             if k not in state.get("stalled", []):
                 stalled.append(k)
+                since[k] = iso(now())
             continue
         active.append(k)
     state["attempts"] = att
     state["stalled"] = [k for k in state.get("stalled", []) if k in keys] + stalled
+    state["stalled_at"] = since
     return active, stalled
 
 
@@ -4803,10 +4817,90 @@ def end_dead_wait_loops(state: dict, procs: dict | None = None, kill=os.kill) ->
     return lines
 
 
+# ---------------------------------------------------------------- stop file
+# 2026-11-01 (nyx): a session wrote churn.stop for "an owner experiment" at 21:41Z; the experiment ended ~00:16Z, the
+# file stayed until the owner noticed at 10:54Z, and every alert stayed silent because a stop file meant "on purpose".
+# A stop now carries an expiry (`churn stop --hours H --reason R`, default STOP_DEFAULT_H) and lifts itself; an
+# open-ended stop (`--indefinite`, or a bare `touch`) pages the owner every STOP_REMIND_H while it lasts.
+STOP_DEFAULT_H = float(_CFG.get("stop_default_h", 8))
+STOP_REMIND_H = float(_CFG.get("stop_remind_h", 6))
+
+
+def stop_info() -> dict | None:
+    """The stop file as {reason, until, by, t} (a plain-text file: reason = its text, no expiry), or None."""
+    try:
+        text = STOP.read_text().strip()
+        mtime = dt.datetime.fromtimestamp(STOP.stat().st_mtime, dt.timezone.utc)
+    except OSError:
+        return None
+    try:
+        d = json.loads(text)
+        if isinstance(d, dict):
+            return {"t": d.get("t") or iso(mtime), **d}
+    except ValueError:
+        pass
+    return {"reason": text[:300], "until": None, "by": "file", "t": iso(mtime)}
+
+
+def is_stopped() -> bool:
+    """Is churn stopped? An expired stop is lifted here (logged, the owner told), so every reader sees the same answer."""
+    info = stop_info()
+    if info is None:
+        return False
+    until = parse_iso(info.get("until"))
+    if until is None or now() < until:
+        return True
+    with contextlib.suppress(OSError):
+        STOP.unlink()
+    msg = f"stop expired at {iso(until)}, churn resumes (was: {info.get('reason') or 'no reason given'})"
+    log(msg)
+    with contextlib.suppress(Exception):
+        notify(f"stop-expired-{iso(until)}", "churn: resumed", msg, cooldown_h=0, tags="arrow_forward")
+    return False
+
+
+def cmd_stop(a) -> int:
+    """`churn stop [--hours H | --indefinite] --reason R`: stop launching (running workers finish). `churn start` lifts it."""
+    if not a.reason:
+        raise SystemExit("churn stop --reason \"why\" [--hours H | --indefinite]")
+    until = None if a.indefinite else iso(now() + dt.timedelta(hours=float(a.hours or STOP_DEFAULT_H)))
+    by = "tick/worker" if os.environ.get("CHURN_RUN") else "owner"
+    STOP.write_text(json.dumps({"reason": a.reason[:300], "until": until, "by": by, "t": iso(now())}) + "\n")
+    msg = f"stopped by {by} until {until or 'churn start (indefinite)'}: {a.reason[:200]}"
+    log(msg)
+    print(msg)
+    return 0
+
+
+def cmd_start(a) -> int:
+    owner_only("churn start")  # a stop is the owner's (or expires); the rescue and workers never lift one
+    info = stop_info()
+    if info is None:
+        print("not stopped")
+        return 0
+    STOP.unlink(missing_ok=True)
+    msg = f"started (stop lifted; was: {info.get('reason') or 'no reason'}, since {info.get('t')})"
+    log(msg)
+    print(msg)
+    return 0
+
+
+def stop_reminder() -> tuple[str, str, str] | None:
+    """A page for a stop with no expiry that has lasted STOP_REMIND_H: the overnight 2026-11-01 stop said nothing."""
+    info = stop_info()
+    t = parse_iso((info or {}).get("t"))
+    if not info or info.get("until") or not t or now() - t < dt.timedelta(hours=STOP_REMIND_H):
+        return None
+    hours = (now() - t).total_seconds() / 3600
+    return ("stopped-long", f"churn: stopped for {hours:.0f} h",
+            (f"churn.stop has no expiry ({info.get('reason') or 'no reason given'}). Nothing launches. "
+             "`churn start` resumes; `churn stop --hours H --reason R` sets an end."))
+
+
 def watchdog_checks(gh_ok=None, timer_active=None, state=None) -> list[tuple[str, str, str]]:
     """(key, title, message) for each problem the gate cannot report itself."""
-    if STOP.exists():
-        return []  # stopped on purpose
+    if is_stopped():
+        return [r] if (r := stop_reminder()) else []  # stopped on purpose; an open-ended stop still reminds
     out = []
     if state is None:
         with contextlib.suppress(Exception):
@@ -4865,7 +4959,7 @@ def work_stop_reasons(state: dict, b: dict | None, snap: dict | None) -> list[st
 def work_stop_check(state: dict, b: dict | None, snap: dict | None) -> str | None:
     """Page once when no Claude worker has run for WORK_STOP_ALERT_MIN (unless churn was stopped on purpose); say so
     when one runs again. Returns what it sent, for the log."""
-    if STOP.exists():
+    if is_stopped():
         return None
     cfg = notify_cfg()
     if claude_slot_holders(state):
@@ -4897,9 +4991,206 @@ def work_stop_check(state: dict, b: dict | None, snap: dict | None) -> str | Non
     return f"no workers for {idle_min / 60:.1f} h: " + " | ".join(why)
 
 
+# ---------------------------------------------------------------- rescue
+# Owner 2026-11-02, after nyx sat idle ~21 h (an empty filler window, a stall never re-asked, then an open-ended stop):
+# "plan for issues reactively and fix them like we are, and also build a proactive Opus rescue". When no Claude worker
+# has run for rescue.after_h and nothing legitimate explains it (a stop file, a usage-limit pause, a battery pause,
+# offline, max_workers 0, box RED), the hourly watchdog starts ONE detached Opus session as the factory's on-call:
+# diagnose why the box is idle, use churn's own levers to get workers running, and report. Working assumptions (owner):
+# work is better than no work; recent owner goals beat older ones; the host's priorities (config) order the rest.
+# It never lifts a stop, changes limits/policy, merges, or edits churn itself; a churn bug becomes a promoter-bot issue.
+RESCUE_FILLER_MAX = 6
+RESCUE_DEFAULT = {
+    "enabled": False, "after_h": 2.0, "cooldown_h": 4.0, "max_per_day": 3, "model": "opus", "budget_usd": 10.0,
+    "timeout_min": 60,
+    "priorities": [
+        ("Recent owner goals first: the current focus issues, then issues the owner named in churn-log.md in the last "
+         "48 h (lines with 'owner'), newest first."),
+        "Then open scope:core / scope:sweep issues of the repo that one PR can move, smallest first.",
+    ],
+    "rules": [],
+}
+
+
+def rescue_cfg() -> dict:
+    return {**RESCUE_DEFAULT, **(_CFG.get("rescue") or {})}
+
+
+def rescue_blockers(state: dict, b: dict | None) -> list[str]:
+    """Legitimate reasons the box is idle: the rescue must not run over these."""
+    out = []
+    if is_stopped():
+        out.append("stop file")
+    if (p := parse_iso(state.get("paused_until"))) and now() < p:
+        out.append(f"usage-limit pause until {iso(p)}")
+    if state.get("workers_paused"):
+        out.append(f"workers_paused: {state['workers_paused']}")
+    if state.get("offline"):
+        out.append("offline")
+    if int(state.get("max_workers", 1)) < 1:
+        out.append("max_workers 0")
+    if b and b.get("verdict") == "RED":
+        out.append("box RED")
+    return out
+
+
+def rescue_due(state: dict, b: dict | None, cfg: dict | None = None) -> str | None:
+    """Why a rescue should start now, or None."""
+    cfg = cfg or rescue_cfg()
+    if not cfg.get("enabled"):
+        return None
+    r = state.get("rescue") or {}
+    if r.get("pid") and pid_alive(r.get("pid")) and not r.get("finished"):
+        return None
+    if claude_slot_holders(state) or rescue_blockers(state, b):
+        return None
+    starts = [t for x in r.get("history", []) if (t := parse_iso(x.get("t")))]
+    if starts and now() - max(starts) < dt.timedelta(hours=float(cfg["cooldown_h"])):
+        return None
+    if sum(now() - t < dt.timedelta(hours=24) for t in starts) >= int(cfg["max_per_day"]):
+        return None
+    since = max([t for t in (last_worker_activity(state), parse_iso(notify_cfg().get("idle_seen")),
+                             parse_iso(r.get("finished"))) if t], default=None)
+    if since is None or now() - since < dt.timedelta(hours=float(cfg["after_h"])):
+        return None
+    return f"no Claude worker for {(now() - since).total_seconds() / 3600:.1f} h (since {iso(since)})"
+
+
+def rescue_brief(why: str, state: dict, b: dict | None, snap: dict | None, cfg: dict) -> str:
+    causes = "\n".join(f"- {x}" for x in work_stop_reasons(state, b, snap))
+    prios = "\n".join(f"{i}. {p}" for i, p in enumerate(cfg.get("priorities") or [], 1))
+    rules = "\n".join(f"- {r}" for r in cfg.get("rules") or [])
+    return f"""You are the churn RESCUE on this host: the code factory's on-call engineer, started by `churn watchdog`.
+Why now: {why}. What the gate can see:
+{causes}
+
+Your job: get Claude workers running again in this session, leave churn able to keep going on its own, and report.
+Owner's working assumptions: work is better than no work; recent owner goals beat older ones; follow the priorities below.
+
+1. Diagnose (read-only, ~5 min): `churn status`, `churn focus`, `churn queue`, and the tail of {H}/churn-log.md and
+   {H}/churn-quiet.log since the idle spell began. Name the cause in one line (empty/hollow focus, owner-gated queue,
+   an item waiting on something already done, a stalled need, a gate error, a stuck run, ...).
+2. Unblock, cheapest first: an expired or moot wait (`churn queue wait`/`rm`); a focus issue with no queued next step
+   (queue its next checklist line with `churn queue add --issue N --task ...`); a gate error (run `churn tick --dry-run`
+   and quote the traceback). If the focus itself has no launchable work, open filler for yourself
+   (`churn focus filler --hours <=12 --max <={RESCUE_FILLER_MAX} --reason "..."`) and queue up to {FILLER_QUEUE_MAX}
+   one-PR items with `churn queue add --filler --issue N --task ...`, chosen by the priorities below. Read each issue
+   first (`gh issue view N -R {REPO}`): open, unclaimed by another host, not an epic, a slice one PR can land.
+3. Launch: run `churn tick` and confirm in `churn status` that a worker is running. If the box or CI admission holds
+   the launch, that is fine: say so.
+4. Report as your final message, plain words, at most 12 lines: CAUSE / WHAT I DID / RUNNING NOW / FOR THE OWNER
+   (decisions only the owner can make, and churn bugs worth fixing).
+
+Priorities for choosing work:
+{prios}
+
+Hard rules:
+- Never remove or change {STOP}, `churn policy`, max_workers, pace or budgets; never add shepherd:merge or merge PRs.
+- Never edit churn's code or install; never do the issue work yourself (workers do); never `churn worker` an Opus run.
+- A churn bug: file ONE promoter-bot issue (search for a duplicate first) with the log lines that show it.
+- If nothing safe can launch, launch nothing and say exactly what the owner must decide.
+{rules}
+"""
+
+
+def launch_rescue(why: str, state: dict, b: dict | None, snap: dict | None) -> str:
+    cfg = rescue_cfg()
+    rid = "rescue-" + now().strftime("%Y%m%dT%H%MZ")
+    rd = RUNS / rid
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / "brief.md").write_text(rescue_brief(why, state, b, snap, cfg))
+    pid = spawn_detached(f"churn-{rid}", [sys.executable, SELF, "_rescue", rid], TICK_CWD, rd / "launcher.log",
+                         props=[f"RuntimeMaxSec={int(cfg['timeout_min']) * 60 + 300}"])
+    with edit_state() as st:
+        r = st.setdefault("rescue", {})
+        r.update(run_id=rid, pid=pid, t=iso(now()), why=why, finished=None)
+        r["history"] = (r.get("history") or [])[-20:] + [{"run_id": rid, "t": iso(now()), "why": why}]
+    log(f"rescue: started {rid} (pid {pid}): {why}")
+    notify(f"rescue-{rid}", "churn: rescue started", f"{why}. An Opus session is getting workers going; its report "
+           "follows.", priority="high", cooldown_h=0, tags="ambulance")
+    return rid
+
+
+def cmd_rescue_run(a) -> int:
+    """`churn _rescue RUN_ID` (detached): run the rescue session, then book it, log the report and tell the owner."""
+    cfg = rescue_cfg()
+    rd = RUNS / a.run_id
+    prompt = (rd / "brief.md").read_text()
+    cmd = claude_cmd(prompt, str(cfg["model"]), float(cfg["budget_usd"]))
+    env = plan_env(CHURN_RESCUE="1", CHURN_RUN_ID=a.run_id)
+    try:
+        rc, out = _claude_timed(cmd, str(TICK_CWD), env, rd / "out.json", rd / "err.log", int(cfg["timeout_min"]) * 60)
+    except Exception as e:  # noqa: BLE001 -- the report below must still go out
+        rc, out = 1, {"result": f"rescue crashed: {e}", "is_error": True}
+    cost, tokens = run_cost(out)
+    result = str(out.get("result") or "").strip()
+    with edit_state() as st:
+        st.setdefault("usage", {}).setdefault("log", []).append(
+            {"t": iso(now()), "model": f"orchestrator-rescue-{cfg['model']}", "tokens": tokens,
+             "cost_usd": round(cost, 2), "issue": 0})
+        if out.get("is_error") and (reset := limit_reset(result)):
+            record_limit(st, reset, "rescue", result)
+        st.setdefault("rescue", {}).update(finished=iso(now()), rc=rc, cost_usd=round(cost, 2))
+    (rd / "report.md").write_text(result + "\n")
+    log(f"rescue: {a.run_id} done (${cost:.2f}, rc {rc}): " + " ".join(result.split())[:600])
+    notify(f"rescue-done-{a.run_id}", "churn: rescue report", result[:900] or f"no report (rc {rc}); see {rd}",
+           priority="high", cooldown_h=0, tags="ambulance")
+    return 0
+
+
+def _claude_timed(cmd: list[str], cwd: str, env: dict, out_path: Path, err_path: Path, timeout_s: int) -> tuple[int, dict]:
+    with open(out_path, "w") as out, open(err_path, "w") as err:
+        try:
+            rc = subprocess.call(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                 timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            rc = 124
+    try:
+        return rc, json.loads(out_path.read_text())
+    except (OSError, ValueError):
+        return rc, {"result": f"no JSON result (rc {rc}); see {err_path}", "is_error": rc != 0}
+
+
+def rescue_check(state: dict, b: dict | None, snap: dict | None) -> str | None:
+    if why := rescue_due(state, b):
+        return launch_rescue(why, state, b, snap)
+    return None
+
+
+def cmd_rescue(a) -> int:
+    """`churn rescue` (status), `churn rescue brief` (print what it would be told), `churn rescue now` (owner: start one
+    now if nothing legitimate holds the box, skipping the idle time and cooldown)."""
+    state = load_state()
+    cfg = rescue_cfg()
+    b = None
+    with contextlib.suppress(Exception):
+        b = box(state)
+    snap = json.loads(SNAP.read_text()) if SNAP.exists() else {}
+    if a.action == "brief":
+        print(rescue_brief("(preview)", state, b, snap, cfg))
+        return 0
+    if a.action == "now":
+        owner_only("churn rescue now")
+        r = state.get("rescue") or {}
+        if r.get("pid") and pid_alive(r.get("pid")) and not r.get("finished"):
+            raise SystemExit(f"a rescue is already running: {r.get('run_id')}")
+        if bl := rescue_blockers(state, b):
+            raise SystemExit("not starting: " + "; ".join(bl))
+        print(launch_rescue("started by the owner", state, b, snap))
+        return 0
+    r = state.get("rescue") or {}
+    print(f"rescue: {'enabled' if cfg['enabled'] else 'disabled'} (after {cfg['after_h']} h idle, cooldown "
+          f"{cfg['cooldown_h']} h, max {cfg['max_per_day']}/day, {cfg['model']}, ${cfg['budget_usd']})")
+    if r:
+        print(f"  last: {r.get('run_id')} started {r.get('t')}, finished {r.get('finished') or 'running'}: {r.get('why')}")
+    print(f"  due now: {rescue_due(state, b, cfg) or 'no'}; holds: {', '.join(rescue_blockers(state, b)) or 'none'}")
+    return 0
+
+
 def cmd_watchdog(a) -> int:
     for key, title, msg in watchdog_checks():
-        notify(key, title, msg, priority="urgent" if key == "gh-auth" else "high", tags="warning")
+        notify(key, title, msg, priority="urgent" if key == "gh-auth" else "high", tags="warning",
+               **({"cooldown_h": STOP_REMIND_H} if key == "stopped-long" else {}))
         log(f"watchdog: {title}" + (f": {msg}" if key.startswith("stuck-") else ""), quiet=not key.startswith("stuck-"))
     with contextlib.suppress(Exception):  # an alert bug must never fail the watchdog
         state = load_state()
@@ -4909,6 +5200,14 @@ def cmd_watchdog(a) -> int:
         snap = json.loads(SNAP.read_text()) if SNAP.exists() else {}
         if sent := work_stop_check(state, b, snap):
             log(f"watchdog: {sent[:400]}")
+    try:  # its own guard: a rescue bug is logged, never silent, and never fails the watchdog
+        state = load_state()
+        b = None
+        with contextlib.suppress(Exception):
+            b = box(state)
+        rescue_check(state, b, json.loads(SNAP.read_text()) if SNAP.exists() else {})
+    except Exception as e:  # noqa: BLE001
+        log(f"rescue: check failed: {type(e).__name__}: {e}"[:300])
     return 0
 
 
@@ -4931,7 +5230,7 @@ def cmd_poll(a) -> int:
     start the gate at once when one changed: a red check the shepherd labelled needs-fix, a push, a merge. The gate
     then queues and launches the fix with no model tick, so a red check waits ~2 min, not up to 10, for its fix."""
     state = load_state()
-    if STOP.exists() or state.get("workers_paused") or (
+    if is_stopped() or state.get("workers_paused") or (
             (p := parse_iso(state.get("paused_until"))) and now() < p) or state.get("offline"):
         return 0
     watched = [pr_num(p) for p in state.get("prs", [])]
@@ -5814,6 +6113,20 @@ def focus_share(state: dict, hours: float = 24) -> dict:
     return out
 
 
+def off_focus_held(state: dict, snap: dict | None) -> list[str]:
+    """Off-focus queue items that cannot launch now, each with why ("#5649 waits until ..."), for the starved prompt."""
+    out = []
+    for x in state.get("queue", []):
+        if x.get("backend") == "agy" or in_focus(state, x):
+            continue
+        why = ("needs the owner" if x.get("needs_owner") else
+               f"waits {w}" if (w := waiting(x)) else
+               "blocked by " + ", ".join(f"#{n}" for n in bl) if (bl := blocked_by(x, snap, state)) else None)
+        if why:
+            out.append(f"#{x.get('issue')} {why}")
+    return out[:8]
+
+
 def filler_live(state: dict, snap: dict | None) -> bool:
     """An open filler window that has an off-focus item it can launch. 2026-10-28 04:13-08:13 a window opened over a
     queue of owner-parked items only: nothing launched, and an open window muted starvation, so the box sat empty 4 h."""
@@ -5828,7 +6141,20 @@ def focus_need(state: dict, snap: dict | None) -> str | None:
     why = idle_causes(state, snap, state.get("ci_mode", "calm"))
     queued = sorted({f"#{x['issue']}" for x in state.get("queue", []) if in_focus(state, x)})
     lad = (f.get("ladder") or {}).get("anchor")
-    return (f"focus starved: a worker slot has been free for {f.get('idle_passes')} gate passes and no work of the focus "
+    # 2026-11-01 (nyx): a window opened over one off-focus item that waited until after the window closed (#5649, also
+    # conditional on a release tag). Three ticks read "filler is already open, #5649 is queued" and added nothing; the
+    # need then stalled and the box sat empty 7 h. Say plainly that an open window with nothing launchable is no answer.
+    held = off_focus_held(state, snap)
+    if filler_open(state):
+        w = filler_window(state)
+        head = (f"FILLER WINDOW IS OPEN (until {w.get('until')}, {w.get('launched', 0)}/{w.get('max', FILLER_MAX)} "
+                f"launched) BUT NOTHING IN IT CAN LAUNCH NOW"
+                + (f" ({'; '.join(held)})" if held else " (no off-focus items queued)")
+                + f". 'Already open' is not an answer: add up to {FILLER_QUEUE_MAX} small, self-contained items that "
+                f"can launch NOW with `churn queue add --filler --issue <n> --task ...`, or fix a trivial focus blocker. ")
+    else:
+        head = ""
+    return head + (f"focus starved: a worker slot has been free for {f.get('idle_passes')} gate passes and no work of the focus "
             f"'{f.get('name')}' ({', '.join(f'#{n}' for n in focus_issues(state))}) can launch ({why}; focus items "
             f"queued: {', '.join(queued) or 'none'}). 1) Look for a TRIVIAL blocker of focus work and fix it: a focus "
             f"item waiting on something already done (`churn queue wait` expired, a merged --after-pr), a focus issue "
@@ -5840,7 +6166,10 @@ def focus_need(state: dict, snap: dict | None) -> str | None:
             f"2) Only if the focus is truly out of launchable work for now (blocked on "
             f"CI, an owner ruling, another host's claim, or done), open filler: `churn focus filler --hours <1-"
             f"{FILLER_HOURS_MAX}> --reason \"<one plain sentence: why the focus cannot use the slot>\"`. Filler launches "
-            f"the off-focus queue items already queued; if there are none, add at most {FILLER_QUEUE_MAX} small, "
+            f"the off-focus queue items already queued that can launch now (an item that waits, is blocked or needs the "
+            f"owner does not count"
+            + (f"; right now: {'; '.join(held)}" if held else "")
+            + f"); if none can, add at most {FILLER_QUEUE_MAX} small, "
             f"self-contained ones with `churn queue add --filler --issue <n> --task ...` (burned estates, open scope:core "
             f"or scope:sweep issues, one PR each, never an epic). Say in your summary which of the two you did.")
 
@@ -5851,6 +6180,7 @@ def focus_need(state: dict, snap: dict | None) -> str | None:
 # is skipped (the ladder refill slices it by estate), and so is an issue another host claims or this host skips.
 FOCUS_REFILL_READS = 6
 FOCUS_REFILL_EVERY_H = 2
+FOCUS_THIN = 2  # this few open focus issues left after dropping closed ones pages the owner
 
 
 def focus_refill(state: dict) -> list[str]:
@@ -5861,12 +6191,15 @@ def focus_refill(state: dict) -> list[str]:
     checked = focus_cfg(state).get("refill_checked") or {}
     due = [n for n in focus_issues(state) if n not in busy and n != ladder_anchor(state)
            and not ((t := parse_iso(checked.get(str(n)))) and now() - t < dt.timedelta(hours=FOCUS_REFILL_EVERY_H))]
-    out, items, seen = [], [], {}
+    out, items, seen, closed = [], [], {}, []
     for n in due[:FOCUS_REFILL_READS]:
         seen[str(n)] = iso(now())
         try:
             i = gh_json(f"repos/{REPO}/issues/{n}")
         except (RuntimeError, ValueError):
+            continue
+        if i.get("state") == "closed":
+            closed.append(n)
             continue
         if i.get("state") != "open" or foreign_claim(i) or host_skips(i):
             continue
@@ -5878,6 +6211,19 @@ def focus_refill(state: dict) -> list[str]:
         f["refill_checked"] = {**(f.get("refill_checked") or {}), **seen}
         have = {x.get("issue") for x in st.get("queue", [])}
         st.setdefault("queue", []).extend(x for x in items if x["issue"] not in have)
+        # 2026-11-01 (nyx): 4 of the 8 focus issues were closed and nothing said so; the focus looked bigger than it
+        # was. A closed issue is done: it leaves the focus (logged, and named in `churn focus` as dropped).
+        if closed:
+            f["issues"] = [n for n in f.get("issues") or [] if int(n) not in closed]
+            f["dropped_closed"] = (f.get("dropped_closed") or [])[-20:] + [{"issue": n, "t": iso(now())} for n in closed]
+            left = len(f["issues"])
+    if closed:
+        out.append(f"focus: dropped closed {', '.join(f'#{n}' for n in closed)} -> {left} open focus issue(s)")
+        if left <= FOCUS_THIN:
+            notify("focus-thin", "focus nearly empty",
+                   f"{focus_cfg(load_state()).get('name')}: {left} open issue(s) left after dropping closed "
+                   f"{', '.join(f'#{n}' for n in closed)}. Widen it (`churn focus add N..`); until then filler and the "
+                   "rescue keep the box busy.", priority="high", cooldown_h=12)
     return out
 
 
@@ -6013,7 +6359,8 @@ def cmd_focus(a) -> int:
                 f.pop("filler", None)
                 msg = "filler closed"
             else:
-                tick = bool(os.environ.get("CHURN_RUN"))
+                rescue = bool(os.environ.get("CHURN_RESCUE"))  # the rescue runs because the box sat idle: no gate wait
+                tick = bool(os.environ.get("CHURN_RUN")) and not rescue
                 if tick and not starving(st):
                     raise SystemExit("focus filler: the tick may open filler only while the gate reports the focus "
                                      "starved; focus work can launch now")
@@ -6023,7 +6370,8 @@ def cmd_focus(a) -> int:
                     raise SystemExit("focus filler --hours H --reason \"why the focus cannot use the slot\"")
                 hours = min(float(a.hours or 6), FILLER_HOURS_MAX)
                 f["filler"] = {"until": iso(now() + dt.timedelta(hours=hours)), "reason": a.reason[:300],
-                               "by": "tick" if tick else "owner", "launched": 0, "max": int(a.max or FILLER_MAX),
+                               "by": "rescue" if rescue else "tick" if tick else "owner", "launched": 0,
+                               "max": min(int(a.max or FILLER_MAX), RESCUE_FILLER_MAX) if rescue else int(a.max or FILLER_MAX),
                                "t": iso(now())}
                 f["idle_passes"] = 0
                 msg = f"filler open for {hours:g} h (max {f['filler']['max']} launches, {f['filler']['by']}): {a.reason[:200]}"
@@ -7850,7 +8198,7 @@ def cmd_tick(a) -> int:
     except BlockingIOError:
         DIRTY.touch()  # the running tick loops once more when it sees this
         return 0
-    if STOP.exists() and not a.dry_run:  # a dry run only reports, so it may preview a stopped churn
+    if not a.dry_run and is_stopped():  # a dry run only reports, so it may preview a stopped churn
         log("stopped (churn.stop present)", quiet=True)
         return 0
     for _ in range(2):
@@ -8842,7 +9190,9 @@ def cmd_factory(a) -> int:
 # ---------------------------------------------------------------- status
 def cmd_status(a) -> int:
     state = load_state()
-    print(f"paused_until: {state.get('paused_until')}  workers_paused: {state.get('workers_paused')}  stop file: {STOP.exists()}")
+    si = stop_info()
+    stop = f"until {si.get('until') or 'churn start'} ({si.get('reason')})" if si else "none"
+    print(f"paused_until: {state.get('paused_until')}  workers_paused: {state.get('workers_paused')}  stop file: {stop}")
     for r in state.get("running", []):
         alive = pid_alive(r.get("pid")) if r.get("pid") else "n/a"
         print(f"running: {r.get('agent')} #{r.get('issue')} {r.get('model')} since {r.get('started')} alive={alive}")
@@ -9707,6 +10057,16 @@ def main() -> int:
     fo.add_argument("--reason", help="filler: one plain sentence, why the focus cannot use the slot; prereq: where "
                                      "the focus issue needs it")
     fo.add_argument("--max", type=int, help=f"filler: launches the window allows (default {FILLER_MAX})")
+    sp = sub.add_parser("stop", help=f"stop launching (running workers finish); lifts itself after --hours "
+                                     f"(default {STOP_DEFAULT_H:g}) unless --indefinite")
+    sp.add_argument("--hours", type=float)
+    sp.add_argument("--indefinite", action="store_true", help="no expiry: pages the owner every stop_remind_h")
+    sp.add_argument("--reason", help="one plain sentence: why, and what ends it")
+    sub.add_parser("start", help="lift a stop now")
+    rp = sub.add_parser("rescue", help="the idle-box rescue (an Opus on-call session): status / brief / now")
+    rp.add_argument("action", nargs="?", default="status", choices=["status", "brief", "now"])
+    rr = sub.add_parser("_rescue")
+    rr.add_argument("run_id")
     sub.add_parser("watchdog", help="hourly: page the owner if the gate stopped, the timer died or gh lost its login")
     sub.add_parser("poll", help="every 2 min: one gh call; start the gate at once when a watched PR changed")
     sub.add_parser("sync", help="sync pulse now: test origin/main and fast-forward this install (the gate does it hourly)")
@@ -9805,6 +10165,14 @@ def main() -> int:
         if note:
             log(note)
         return 0
+    if a.cmd == "rescue":
+        return cmd_rescue(a)
+    if a.cmd == "_rescue":
+        return cmd_rescue_run(a)
+    if a.cmd == "stop":
+        return cmd_stop(a)
+    if a.cmd == "start":
+        return cmd_start(a)
     if a.cmd == "watchdog":
         return cmd_watchdog(a)
     if a.cmd == "factory":

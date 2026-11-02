@@ -22,7 +22,16 @@ What it does, in plain terms:
 - **Housekeeping.** Removes finished worktrees, reaps stale containers, keeps a daily scorecard.
 - **Alerts (ntfy).** Gate crashes, Claude or GitHub login failures, disk RED, long or looping usage limits, worker
   failure streaks, owner items waiting 12 h, a stale gate (hourly watchdog), a reboot, and a summary after an
-  internet outage.
+  internet outage. A stop with no expiry pages every `stop_remind_h` (6).
+- **Stop (`churn stop --hours H --reason R` / `churn start`).** A stop lifts itself after `--hours` (default
+  `stop_default_h`, 8); `--indefinite` or a bare `touch churn.stop` never expires but keeps reminding the owner.
+- **Rescue (`churn rescue` status / `brief` / `now`; off unless `rescue.enabled`).** When no Claude worker has run
+  for `rescue.after_h` (2) and nothing legitimate explains it (a stop, a usage-limit or battery pause, offline,
+  max_workers 0, box RED), the hourly watchdog starts one detached Opus session as on-call: it diagnoses the idle box,
+  uses churn's own levers (unblock waits, queue focus steps, open filler, `churn tick`) and reports to the owner. It
+  never lifts a stop, changes limits, merges or edits churn. The host's config orders its choice of work:
+  `"rescue": {"enabled": true, "priorities": ["..."], "rules": ["..."], "after_h": 2, "cooldown_h": 4,
+  "max_per_day": 3, "model": "opus", "budget_usd": 10}`. A stalled need is asked again after `stall_rearm_h` (2).
 
 Installed as `~/.local/bin/promoter-bot -> ./churn`; `~/.local/bin/churn` stays as an alias, and the systemd units,
 state files (`churn-state.json`, `churn-log.md`, ...) and `churn/*` branch names keep their old names.

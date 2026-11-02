@@ -5534,3 +5534,141 @@ def test_credit_cli_ticks_switch_and_knobs(credit, capsys):
         churn.cmd_credit(ns("set", "key_file", "/tmp/x"))
     churn.cmd_credit(ns("ticks", "off"))
     assert churn.credit_cfg(churn.load_state())["ticks"] is False
+
+
+# --- 2026-11-01 nyx idle day: an empty filler window, a stall that never re-armed, a hollow focus, an open-ended stop --
+
+def test_an_open_filler_window_with_only_a_waiting_item_tells_the_tick_to_add_work(churn, monkeypatch):
+    later = churn.iso(churn.now() + churn.dt.timedelta(hours=5))
+    f = _focus(churn, monkeypatch, filler={"until": churn.iso(churn.now() + churn.dt.timedelta(hours=4)),
+                                           "launched": 0, "max": 4}, idle_passes=churn.STARVE_PASSES)
+    put(churn, focus=f, max_workers=1, queue=[item(5649, wait_until=later, wait_set=churn.iso(churn.now()))])
+    need = churn.focus_need(churn.load_state(), {})
+    assert need.startswith("FILLER WINDOW IS OPEN") and "#5649 waits until" in need and "not an answer" in need
+
+
+def test_a_stalled_need_is_asked_again_after_the_rearm_time(churn, monkeypatch):
+    st = {}
+    for _ in range(churn.STALL_AFTER):
+        churn.bump_attempts(st, churn.count_attempts(st, ["focus starved"])[0])
+    assert churn.count_attempts(st, ["focus starved"]) == ([], ["focus starved"])
+    assert churn.count_attempts(st, ["focus starved"]) == ([], [])  # still stalled, reported once
+    st["stalled_at"]["focus starved"] = churn.iso(churn.now() - churn.dt.timedelta(hours=churn.STALL_REARM_H + 0.1))
+    assert churn.count_attempts(st, ["focus starved"]) == (["focus starved"], [])
+    assert st["attempts"]["focus starved"] == 0 and st["stalled"] == [] and "focus starved" not in st["stalled_at"]
+
+
+def test_the_refill_drops_closed_focus_issues_and_pages_when_the_focus_runs_thin(churn, monkeypatch):
+    pages = []
+    monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: pages.append(key) or True)
+    issues = {n: {"number": n, "state": "closed", "title": "done", "body": "", "labels": []} for n in (5229, 7179)}
+    issues[6271] = {"number": 6271, "state": "open", "title": "open", "body": "- [x] a\n", "labels": []}
+    monkeypatch.setattr(churn, "gh_json", lambda path: issues[int(path.rsplit("/", 1)[1])])
+    monkeypatch.setattr(churn, "host_skips", lambda i: None)
+    monkeypatch.setattr(churn, "foreign_claim", lambda i: None)
+    put(churn, focus=_focus(churn, monkeypatch, issues=[5229, 6271, 7179]))
+    out = churn.focus_refill(churn.load_state())
+    assert churn.load_state()["focus"]["issues"] == [6271] and "dropped closed #5229, #7179" in out[-1]
+    assert pages == ["focus-thin"]
+
+
+def test_a_stop_with_an_expiry_lifts_itself_and_an_open_ended_one_reminds(churn, monkeypatch):
+    import os
+    sent = []
+    monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: sent.append(key) or True)
+    churn.cmd_stop(argparse.Namespace(hours=2, indefinite=False, reason="owner experiment"))
+    assert churn.is_stopped() and churn.stop_info()["reason"] == "owner experiment"
+    d = json.loads(churn.STOP.read_text())
+    d["until"] = churn.iso(churn.now() - churn.dt.timedelta(minutes=1))
+    churn.STOP.write_text(json.dumps(d))
+    assert not churn.is_stopped() and not churn.STOP.exists() and sent[-1].startswith("stop-expired")
+    churn.STOP.write_text("Paused by the owner: keep churn paused during an experiment.\n")  # the 11-01 kind
+    assert churn.is_stopped() and churn.stop_reminder() is None  # fresh
+    old = churn.time.time() - (churn.STOP_REMIND_H + 1) * 3600
+    os.utime(churn.STOP, (old, old))
+    assert [k for k, _, _ in churn.watchdog_checks(gh_ok=True, timer_active=True)] == ["stopped-long"]
+    churn.cmd_start(argparse.Namespace())
+    assert not churn.STOP.exists()
+    with pytest.raises(SystemExit):
+        churn.cmd_stop(argparse.Namespace(hours=None, indefinite=False, reason=None))
+
+
+# --- the rescue (owner 2026-11-02): an Opus on-call session when the box sits idle with no legitimate reason ----------
+
+def _rescue_on(churn, monkeypatch, **kw):
+    monkeypatch.setitem(churn._CFG, "rescue", {"enabled": True, **kw})
+
+
+def _idle_for(churn, hours):
+    return {"log": [{"t": churn.iso(churn.now() - churn.dt.timedelta(hours=hours)), "issue": 1, "model": "sonnet"}]}
+
+
+def test_the_rescue_starts_only_after_an_unexplained_idle_spell(churn, monkeypatch):
+    monkeypatch.setattr(churn, "notify_cfg", dict)
+    green = {"verdict": "GREEN", "free_slots": 1}
+    st = {"max_workers": 1, "running": [], "usage": _idle_for(churn, 3)}
+    assert churn.rescue_due(st, green) is None  # disabled by default
+    _rescue_on(churn, monkeypatch)
+    assert "no Claude worker for 3.0 h" in churn.rescue_due(st, green)
+    assert churn.rescue_due({**st, "usage": _idle_for(churn, 1)}, green) is None  # not idle long enough
+    assert churn.rescue_due({**st, "workers_paused": "battery 14%"}, green) is None
+    assert churn.rescue_due({**st, "paused_until": churn.iso(churn.now() + churn.dt.timedelta(hours=1))}, green) is None
+    assert churn.rescue_due(st, {"verdict": "RED"}) is None
+    churn.STOP.write_text("owner experiment")
+    assert churn.rescue_due(st, green) is None  # never over a stop
+    churn.STOP.unlink()
+    monkeypatch.setattr(churn, "claude_slot_holders", lambda s: [{"run_id": "x"}])
+    assert churn.rescue_due(st, green) is None  # a worker is running
+
+
+def test_the_rescue_keeps_a_cooldown_a_daily_cap_and_one_at_a_time(churn, monkeypatch):
+    monkeypatch.setattr(churn, "notify_cfg", dict)
+    _rescue_on(churn, monkeypatch, max_per_day=2)
+    green = {"verdict": "GREEN", "free_slots": 1}
+    ago = lambda h: churn.iso(churn.now() - churn.dt.timedelta(hours=h))
+    st = {"max_workers": 1, "running": [], "usage": _idle_for(churn, 9)}
+    st["rescue"] = {"pid": 4242, "finished": None, "history": [{"t": ago(1)}]}
+    assert churn.rescue_due(st, green) is None  # one is running
+    st["rescue"] = {"pid": 4242, "finished": ago(0.5), "history": [{"t": ago(1)}]}
+    assert churn.rescue_due(st, green) is None  # cooldown
+    st["rescue"] = {"finished": ago(5), "history": [{"t": ago(6)}]}
+    assert churn.rescue_due(st, green)  # the last one did not get work going: another after the cooldown
+    st["rescue"]["history"].append({"t": ago(12)})
+    assert churn.rescue_due(st, green) is None  # 2 in 24 h: the daily cap
+
+
+def test_the_rescue_brief_carries_the_hosts_priorities_and_the_hard_rules(churn, monkeypatch):
+    _rescue_on(churn, monkeypatch, priorities=["Recent owner goals", "CICS breadth beyond the burned estates"],
+               rules=["No mutation work on this host."])
+    text = churn.rescue_brief("idle 3 h", {"queue": [], "running": []}, None, {}, churn.rescue_cfg())
+    assert "1. Recent owner goals" in text and "2. CICS breadth" in text and "No mutation work" in text
+    assert "Never remove or change" in text and "churn tick" in text and "CAUSE / WHAT I DID" in text
+
+
+def test_a_rescue_may_open_filler_without_the_gate_starving_but_never_lift_a_stop(churn, monkeypatch):
+    monkeypatch.setattr(churn, "notify", lambda *a, **kw: True)
+    put(churn, focus=_focus(churn, monkeypatch))
+    monkeypatch.setenv("CHURN_RUN", "1")
+    monkeypatch.setenv("CHURN_RESCUE", "1")
+    churn.cmd_focus(_filler_ns(hours=6, max=50))
+    w = churn.load_state()["focus"]["filler"]
+    assert w["by"] == "rescue" and w["max"] == churn.RESCUE_FILLER_MAX
+    churn.STOP.write_text("owner")
+    with pytest.raises(SystemExit, match="owner only"):
+        churn.cmd_start(argparse.Namespace())
+    assert churn.STOP.exists()
+
+
+def test_the_rescue_run_books_its_cost_and_reports_to_the_owner(churn, monkeypatch):
+    sent = []
+    monkeypatch.setattr(churn, "notify", lambda key, title, msg, **kw: sent.append((title, msg)) or True)
+    monkeypatch.setattr(churn, "_claude_timed", lambda *a: (0, {"result": "CAUSE: hollow focus\nRUNNING NOW: #4108",
+                                                                 "total_cost_usd": 1.5}))
+    put(churn, rescue={"run_id": "rescue-x", "pid": 1})
+    (churn.RUNS / "rescue-x").mkdir(parents=True)
+    (churn.RUNS / "rescue-x" / "brief.md").write_text("brief")
+    churn.cmd_rescue_run(argparse.Namespace(run_id="rescue-x"))
+    st = churn.load_state()
+    assert st["rescue"]["finished"] and st["usage"]["log"][-1]["model"] == "orchestrator-rescue-opus"
+    assert sent == [("churn: rescue report", "CAUSE: hollow focus\nRUNNING NOW: #4108")]
+    assert churn.last_worker_activity(st) is None  # the rescue is not a worker
