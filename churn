@@ -129,7 +129,15 @@ PLAN_SHARE = 0.25  # share of the worker budget the plan phase may use
 # (when "paused"), or any time (when "always", or while a grant is about to expire). Overridable in state["credit"].
 CREDIT_DEFAULT = {"enabled": True, "key_file": _CFG.get("credit_key_file", str(Path.home() / ".config/promoter-bot/anthropic-credit.key")),
                   "model": "sonnet", "max_running": 1, "when": "paused", "floor_usd": 1.0, "min_run_usd": 3.0,
-                  "expiry_rush_days": 3}
+                  "expiry_rush_days": 3,
+                  # Credit ticks (owner 2026-11-02, a transition): while the PLAN is paused on its limit and this switch is
+                  # on (`churn credit ticks on`), the gate runs in full on API credit: the model tick that reviews, merges
+                  # and sends back bills the key (capped per tick), and every Claude launch or send-back while paused goes
+                  # on the credit lane, never the plan. Off, a $0 balance or no key: the pause stops everything as before.
+                  # This relaxes the 2026-10-17 rule above only for a plan pause, and only behind this switch.
+                  "ticks": False, "tick_cap_sonnet": 1.5, "tick_cap_opus": 4.0, "ticks_per_hour": 3, "tick_day_usd": 25.0}
+CREDIT_TICK_KNOBS = {"tick_cap_sonnet": float, "tick_cap_opus": float, "ticks_per_hour": int, "tick_day_usd": float,
+                     "floor_usd": float, "max_running": int, "min_run_usd": float}
 CREDIT_OUT_RE = re.compile(r"credit balance is too low|insufficient (?:credit|balance|funds)|spend(?:ing)? limit|"
                            r"billing", re.I)
 API_KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")  # either one moves `claude -p` off the plan onto the API
@@ -1902,6 +1910,17 @@ def cmd_worker(a) -> int:
         backfill = (getattr(a, "lane", None) or next((q.get("lane") for q in state.get("queue", []) if q.get("issue") == issue
                                                      and not q.get("pr")), None)) == "backfill"
         credit = getattr(a, "lane", None) == "credit"
+        if not credit and credit_pause(state):
+            # Owner 2026-11-02: with credit ticks on, no plan session starts while the plan is paused (not even --force,
+            # which the precheck's resend uses): a launch or send-back bills API credit on the credit lane, or waits.
+            ok, why = credit_ready(state, True)
+            if not ok:
+                raise SystemExit(f"the plan is paused until {state.get('paused_until')} and credit ticks are on, so this "
+                                 f"launch would bill API credit, but the credit lane can't take it now: {why}")
+            ccfg = credit_cfg(state)
+            room = credit_balance(state)["balance"] - credit_committed(state) - float(ccfg["floor_usd"])
+            a.budget_usd = round(min(float(getattr(a, "budget_usd", None) or WORKER_BUDGET[model]), room), 2)
+            credit = True
         if not a.force and not backfill and not credit and len(live) >= cap:
             raise SystemExit(f"{len(live)} Claude worker(s) already running (cap {cap} for this mix: state.max_workers, or "
                              "rate.max_workers_burst with no Opus while the block can carry it); --force to override")
@@ -1940,8 +1959,8 @@ def cmd_worker(a) -> int:
                                  [f"CPUQuota={quota}"] if quota else None)
     (rd / "meta.json").write_text(json.dumps(meta, indent=2))
     with edit_state() as state:
-        lane = getattr(a, "lane", None) or next((q.get("lane") for q in state.get("queue", []) if q.get("issue") == issue
-                                                 and not q.get("pr")), None)
+        lane = "credit" if credit else getattr(a, "lane", None) or next(
+            (q.get("lane") for q in state.get("queue", []) if q.get("issue") == issue and not q.get("pr")), None)
         scope = next((q.get("scope") for q in state.get("queue", []) if q.get("issue") == issue and q.get("scope")), None)
         state.setdefault("running", []).append(
             {"agent": f"churn {run_id}", "run_id": run_id, "pid": meta["pid"], "issue": issue, "model": model,
@@ -1952,7 +1971,7 @@ def cmd_worker(a) -> int:
             w["launched"] = int(w.get("launched", 0)) + 1
         state.setdefault("usage", {}).setdefault("launches", []).append(meta["started"])
         state["usage"]["launches"] = state["usage"]["launches"][-50:]
-    log(f"launched {model} worker {run_id} (#{issue}{', FILLER' if filler else ''}{', resumes ' + meta['resume_of'] if resume_of else ''}"
+    log(f"launched {model} worker {run_id} (#{issue}{', FILLER' if filler else ''}{', API credit' if credit else ''}{', resumes ' + meta['resume_of'] if resume_of else ''}"
         f"{', plan first' if plan else ''}{', checks agy ' + meta['check_of'] if meta['check_of'] else ''}) pid {meta['pid']} in {wt}")
     print(json.dumps({"run_id": run_id, "pid": meta["pid"], "worktree": str(wt), "branch": branch}))
     return 0
@@ -2228,6 +2247,53 @@ def credit_ready(state: dict, plan_paused: bool) -> tuple[bool, str]:
     if cfg["when"] == "paused" and not plan_paused and not rush:
         return False, "waiting for a plan limit pause (when=paused)"
     return True, "expiring credit" if rush and not plan_paused else "ready"
+
+
+def plan_paused(state: dict) -> bool:
+    return bool((p := parse_iso(state.get("paused_until"))) and now() < p)
+
+
+def credit_pause(state: dict) -> bool:
+    """The plan is paused on its limit and credit ticks are on: every Claude session started now bills API credit (or
+    does not start). With the switch off this is never true and launches behave as before."""
+    return plan_paused(state) and bool(credit_cfg(state)["ticks"])
+
+
+def credit_tick_cap(cfg: dict, model: str) -> float:
+    return float(cfg["tick_cap_opus" if model == "opus" else "tick_cap_sonnet"])
+
+
+def credit_tick_log(state: dict, hours: float) -> list[dict]:
+    cut = now() - dt.timedelta(hours=hours)
+    return [e for e in (state.get("credit") or {}).get("log", [])
+            if e.get("kind") == "tick" and (t := parse_iso(e.get("t"))) and t > cut]
+
+
+def credit_ticks_ready(state: dict) -> tuple[bool, str]:
+    """Whether a paused plan's gate may run on API credit now (model tick included), and why not."""
+    cfg, c = credit_cfg(state), state.get("credit") or {}
+    if not cfg["ticks"]:
+        return False, "off (`churn credit ticks on`)"
+    if not cfg["enabled"]:
+        return False, "credit lane off (`churn credit on`)"
+    if not c.get("grants"):
+        return False, "no credit recorded (`churn credit add USD`)"
+    if c.get("blocked"):
+        return False, f"blocked: {c['blocked']}"
+    if (p := parse_iso(c.get("paused_until"))) and now() < p:
+        return False, f"API rate limit, paused until {iso(p)}"
+    if not credit_key(cfg):
+        return False, f"no API key in {cfg['key_file']}"
+    cap = max(credit_tick_cap(cfg, "sonnet"), credit_tick_cap(cfg, "opus"))  # the gate picks the model later
+    left = credit_balance(state)["balance"] - credit_committed(state) - float(cfg["floor_usd"])
+    if left < cap:
+        return False, f"${left:.2f} above the floor and launches in flight: below one tick cap ${cap:.2f}"
+    if len(hour := credit_tick_log(state, 1)) >= int(cfg["ticks_per_hour"]):
+        return False, f"{len(hour)} credit ticks in the last hour (ticks_per_hour {cfg['ticks_per_hour']})"
+    day = sum(float(e.get("cost_usd") or 0) for e in credit_tick_log(state, 24))
+    if day + cap > float(cfg["tick_day_usd"]):
+        return False, f"credit ticks spent ${day:.2f} in 24 h (tick_day_usd {cfg['tick_day_usd']})"
+    return True, "ready"
 
 
 def credit_committed(state: dict) -> float:
@@ -7001,8 +7067,8 @@ def direct_launches(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
     """Launch, with no model tick, the gate's launch picks that need no brief written (direct_spec), in pick order;
     stop at the first pick that needs the model so priority is kept. Same slot, pace and PR-hold rules as gate()."""
     state = load_state()
-    if state.get("workers_paused"):
-        return []
+    if state.get("workers_paused") or (credit_pause(state) and not credit_ready(state, True)[0]):
+        return []  # a credit pause launches only what the credit lane can take (cmd_worker would refuse the rest)
     if not dry_run:
         with edit_state() as st:  # held plans age out; the first run seeds them from the runs dir
             cut = now() - dt.timedelta(hours=HELD_PLAN_MAX_H)
@@ -7128,7 +7194,8 @@ The daily scorecard is written by the gate itself; don't write a daily summary.
 """
 
 
-def model_tick(reasons: list[str], model: str, state: dict, b: dict) -> dict:
+def model_tick(reasons: list[str], model: str, state: dict, b: dict, credit: dict | None = None) -> dict:
+    """credit: {"key", "cap", "balance"} when the plan is paused and this tick bills API credit (credit ticks)."""
     td = RUNS / "ticks"
     td.mkdir(parents=True, exist_ok=True)
     stamp = now().strftime("%Y%m%dT%H%M%SZ")
@@ -7147,6 +7214,14 @@ def model_tick(reasons: list[str], model: str, state: dict, b: dict) -> dict:
         f"of {state.get('max_workers', 2)} (agy-lane runs: {sum(1 for r in state.get('running', []) if r.get('backend') == 'agy')}, "
         "they do NOT count toward the cap).\n"
     )
+    if credit:
+        ccfg = credit_cfg(state)
+        status += (
+            f"ON API CREDIT: the Claude plan is paused on its limit until {state.get('paused_until')}. This tick bills "
+            f"the API credit (cap ${credit['cap']:.2f}), and so does every `churn worker` launch and `churn send-back` "
+            f"while the plan is paused (credit lane, at most {ccfg['max_running']} credit worker(s) at once; churn refuses "
+            f"the rest). Credit left: ${credit['balance']:.2f}. Keep launches minimal: review the reports, record "
+            "verdicts, label merges and send back what needs it; leave optional or new work for the plan's reset.\n")
     # 2026-10-18 cost audit: the skill's ~37 KB body lands AFTER the command args, so a per-tick status in the args made
     # every tick re-write ~22k cache tokens (~79% of a tick's cost). The prompt is now byte-identical across ticks (the
     # skill body stays cached for the hour) and this tick's status is a file the tick reads first.
@@ -7162,13 +7237,13 @@ def model_tick(reasons: list[str], model: str, state: dict, b: dict) -> dict:
         + TICK_CLI
         + "Reply in 2-4 lines."
     )
-    cmd = claude_cmd(prompt, model, TICK_BUDGET[model], allowed=TICK_ALLOWED)
+    cmd = claude_cmd(prompt, model, credit["cap"] if credit else TICK_BUDGET[model], allowed=TICK_ALLOWED)
     cmd += ["--disallowedTools", f"Edit({STATE})", f"Write({STATE})", f"Edit({SNAP})", f"Write({SNAP})"]
     out_path = td / f"{stamp}-{model}.json"
     try:
         with open(out_path, "w") as out, open(td / f"{stamp}-{model}.err", "w") as err:
             subprocess.run(cmd, cwd=TICK_CWD, stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=TICK_TIMEOUT_S,
-                           env=plan_env())
+                           env=plan_env(**({"ANTHROPIC_API_KEY": credit["key"]} if credit else {})))
     except subprocess.TimeoutExpired:
         log(f"model tick ({model}) timed out after {TICK_TIMEOUT_S // 60} min; see {out_path}")
     try:
@@ -7725,6 +7800,47 @@ def cmd_claims(a) -> int:
     return 0
 
 
+def run_model_tick(reasons: list[str], model: str, state: dict, b: dict, needs: dict, on_credit: bool = False) -> dict:
+    """Run the model tick and book it: on the plan (usage ledger, a limit pauses churn) or, while the plan is paused
+    with credit ticks on, on API credit (credit ledger tagged kind=tick; a billing failure holds only the credit lane)."""
+    credit = None
+    if on_credit:
+        ccfg = credit_cfg(state)
+        if not (key := credit_key(ccfg)):
+            log("credit tick skipped: the API key went missing since the gate checked it")
+            return {}
+        credit = {"key": key, "cap": credit_tick_cap(ccfg, model), "balance": credit_balance(state)["balance"]}
+    log(f"model tick ({model}{', API credit' if credit else ''}): " + " | ".join(reasons)[:600])
+    with edit_state() as st:
+        bump_attempts(st, list(needs))
+    out = model_tick(reasons, model, state, b, credit=credit)
+    cost, tokens = run_cost(out)
+    result = str(out.get("result") or "")
+    with edit_state() as state:
+        entry = {"t": iso(now()), "model": f"orchestrator-{model}", "tokens": tokens, "cost_usd": round(cost, 2), "issue": 0}
+        if credit:  # API credit, not plan usage: pacing never learns from it
+            state.setdefault("credit", {}).setdefault("log", []).append({**entry, "kind": "tick"})
+            if (why := credit_failure(out, result)) is not None:
+                credit_hold(state, why, "the model tick", result)
+        else:
+            state.setdefault("usage", {}).setdefault("log", []).append(entry)
+            if out.get("is_error") and (reset := limit_reset(result)):
+                record_limit(state, reset, "tick", result)
+        state["last_model_tick"] = iso(now())
+    if out.get("is_error") and not credit:
+        auth_alert(result, "the model tick")
+    if out.get("is_error") and OFFLINE_RE.search(result):
+        with edit_state() as st:  # not a real attempt: it must not count toward STALL_AFTER
+            st["attempts"] = {k: max(0, v - (k in needs)) for k, v in st.get("attempts", {}).items()}
+            st.setdefault("offline", {}).setdefault("since", iso(now()))
+    denials = out.get("permission_denials") or []
+    log(f"model tick done ${cost:.2f}{' (API credit)' if credit else ''}"
+        f"{f', {len(denials)} permission denials' if denials else ''}: " + " ".join(result.split())[:400])
+    if not out or out.get("is_error"):
+        log("model tick failed or hit a limit: its needs stay open for the next tick")
+    return out
+
+
 def cmd_tick(a) -> int:
     H.mkdir(parents=True, exist_ok=True)
     TICK_LOCK.touch(exist_ok=True)
@@ -7761,7 +7877,13 @@ def cmd_tick(a) -> int:
                 if note := run_sync_pulse():
                     log(note)
         paused = parse_iso(state.get("paused_until"))
-        if paused and now() < paused:  # Claude's limit; agy has its own quota and API credit its own bill: both go on
+        on_credit = False
+        if paused and now() < paused and (ct := credit_ticks_ready(state))[0]:
+            on_credit = True  # owner 2026-11-02: credit ticks keep the review/merge loop going on API credit
+            log(f"plan paused until {iso(paused)}: the gate runs on API credit (credit ticks)", quiet=True)
+        elif paused and now() < paused:  # Claude's limit; agy has its own quota and API credit its own bill: both go on
+            if credit_cfg(state)["ticks"]:
+                log(f"credit ticks held: {ct[1]}", quiet=True)
             did = []
             agy_items = any(q.get("backend") == "agy" for q in state.get("queue", []))
             if agy_items or credit_ready(state, True)[0]:
@@ -7904,13 +8026,14 @@ def cmd_tick(a) -> int:
             except (RuntimeError, OSError, ValueError, SystemExit) as e:
                 log(f"claims sync skipped: {str(e)[:160]}", quiet=True)
             state = load_state()
-        did = lanes(b, snap, False, a.dry_run)
-        if direct := direct_launches(b, snap, a.dry_run):
+        did = lanes(b, snap, on_credit, a.dry_run)  # on credit: agy only, as in any plan pause (no Claude checkers)
+        if direct := direct_launches(b, snap, a.dry_run):  # on credit: cmd_worker puts these on the credit lane
             did += [f"direct launch {d}" for d in direct]
-        did += credit_lane(b, snap, False, a.dry_run)  # when=always, or credit about to expire
-        did += retro_lane(b, snap, a.dry_run)  # the RSI lane: always on, whatever the focus
-        did += conflict_lane(b, snap, a.dry_run)
-        if host_role("retro"):  # the experiment lane runs where the retro does (one host)
+        did += credit_lane(b, snap, on_credit, a.dry_run)  # when=always, or credit about to expire, or the pause
+        if not on_credit:  # a credit pause keeps launches to the review/merge loop: RSI and experiments wait
+            did += retro_lane(b, snap, a.dry_run)  # the RSI lane: always on, whatever the focus
+            did += conflict_lane(b, snap, a.dry_run)
+        if host_role("retro") and not on_credit:  # the experiment lane runs where the retro does (one host)
             did += experiment_lane(b, snap, a.dry_run)
             last_sweep = parse_iso(state.get("experiment_sweep"))
             if not a.dry_run and QUOTA_MODE == "ok" and (last_sweep is None or now() - last_sweep > dt.timedelta(hours=1)):
@@ -7976,9 +8099,11 @@ def cmd_tick(a) -> int:
         needs = {k: wants[k] for k in active}
         force = ([f"forced: {r}" for r in a.reason or []] or ["forced"]) if a.force else []
         reasons, model = gate(state, b, force, needs, snap)
+        if on_credit and not credit_ready(load_state(), True)[0]:  # plan slots look free, but a launch now would be refused
+            reasons = [r for r in reasons if not r.startswith("launch slot")]
         if not a.dry_run:
             note_box(state, b)
-            idle_now = (slot_free(state, b) and not state.get("workers_paused")
+            idle_now = (slot_free(state, b) and not state.get("workers_paused") and not on_credit
                         and not any(r.startswith("launch slot") for r in reasons))
             with edit_state() as st:  # consecutive ticks with a free slot and nothing launchable (calm backfill waits on it)
                 st["idle_streak"] = int(st.get("idle_streak", 0)) + 1 if idle_now else 0
@@ -7994,29 +8119,7 @@ def cmd_tick(a) -> int:
             if a.dry_run:
                 print(json.dumps({"model": model, "reasons": reasons, "lanes": did}, indent=1))
                 return 0
-            log(f"model tick ({model}): " + " | ".join(reasons)[:600])
-            with edit_state() as st:
-                bump_attempts(st, list(needs))
-            out = model_tick(reasons, model, state, b)
-            cost, tokens = run_cost(out)
-            result = str(out.get("result") or "")
-            with edit_state() as state:
-                state.setdefault("usage", {}).setdefault("log", []).append(
-                    {"t": iso(now()), "model": f"orchestrator-{model}", "tokens": tokens, "cost_usd": round(cost, 2), "issue": 0})
-                state["last_model_tick"] = iso(now())
-                if out.get("is_error") and (reset := limit_reset(result)):
-                    record_limit(state, reset, "tick", result)
-            if out.get("is_error"):
-                auth_alert(result, "the model tick")
-            if out.get("is_error") and OFFLINE_RE.search(result):
-                with edit_state() as st:  # not a real attempt: it must not count toward STALL_AFTER
-                    st["attempts"] = {k: max(0, v - (k in needs)) for k, v in st.get("attempts", {}).items()}
-                    st.setdefault("offline", {}).setdefault("since", iso(now()))
-            denials = out.get("permission_denials") or []
-            log(f"model tick done ${cost:.2f}{f', {len(denials)} permission denials' if denials else ''}: "
-                + " ".join(result.split())[:400])
-            if not out or out.get("is_error"):
-                log("model tick failed or hit a limit: its needs stay open for the next tick")
+            run_model_tick(reasons, model, state, b, needs, on_credit)
         if not (DIRTY.exists() and DIRTY.stat().st_mtime >= started):
             break
     return 0
@@ -8773,6 +8876,7 @@ def cmd_status(a) -> int:
     ok, why = credit_ready(state, bool((p := parse_iso(state.get("paused_until"))) and now() < p))
     if (state.get("credit") or {}).get("grants"):
         print(f"credit lane: ${credit_balance(state)['balance']:.2f} left; {'launches next tick' if ok else why}")
+        print(credit_ticks_line(state))
     print(f"RSI lane: retro: {retro_due(state)[1]}; conflicts: {conflict_due(state)[1]}")
     if gq := state.get("gh_quota"):
         print(f"GitHub API: {gq.get('remaining')}/{gq.get('limit')} left, resets "
@@ -9266,7 +9370,8 @@ CONFIG_KEYS = {
 
 def cmd_credit(a) -> int:
     """`churn credit` (status), `add USD [--expires D] [--note N]`, `sync USD` (the Console's balance), `on`, `off`,
-    `when paused|always`, `model haiku|sonnet|opus`."""
+    `when paused|always`, `model haiku|sonnet|opus`, `ticks on|off` (the gate on credit during a plan pause),
+    `set KNOB V` (tick caps, floor, max_running)."""
     if a.action in ("add", "sync") and a.value is None:
         raise SystemExit(f"credit {a.action} needs an amount in USD")
     with edit_state() as st:
@@ -9293,6 +9398,16 @@ def cmd_credit(a) -> int:
             if a.value not in WORKER_BUDGET:
                 raise SystemExit(f"credit model: one of {sorted(WORKER_BUDGET)}")
             c["model"] = a.value
+        elif a.action == "ticks":
+            if a.value not in ("on", "off"):
+                raise SystemExit("credit ticks: on | off")
+            c["ticks"] = a.value == "on"
+            log(f"credit ticks {a.value}: " + ("while the plan is paused, the gate, its model tick and every Claude launch "
+                                              "bill API credit" if c["ticks"] else "a plan pause stops the review loop again"))
+        elif a.action == "set":
+            if a.value not in CREDIT_TICK_KNOBS or getattr(a, "value2", None) is None:
+                raise SystemExit(f"credit set: one of {sorted(CREDIT_TICK_KNOBS)} and a value")
+            c[a.value] = CREDIT_TICK_KNOBS[a.value](a.value2)
         state = st
     cfg, bal = credit_cfg(state), credit_balance(state)
     ok, why = credit_ready(state, bool((p := parse_iso(state.get("paused_until"))) and now() < p))
@@ -9301,7 +9416,22 @@ def cmd_credit(a) -> int:
     print(f"balance ${bal['balance']:.2f} = granted ${bal['granted']:.2f} - spent ${bal['spent']:.2f} - expired "
           f"${bal['expired']:.2f}" + (f"; next expiry {bal['next_expiry']}" if bal["next_expiry"] else ""))
     print(f"runs: {len((state.get('credit') or {}).get('log', []))}; now: {'ready' if ok else why}")
+    print(credit_ticks_line(state))
     return 0
+
+
+def credit_ticks_line(state: dict) -> str:
+    """One line for `churn credit` and `churn status`: the credit-ticks switch, its caps, its spend and whether it runs."""
+    cfg = credit_cfg(state)
+    day = credit_tick_log(state, 24)
+    allt = [e for e in (state.get("credit") or {}).get("log", []) if e.get("kind") == "tick"]
+    ok, why = credit_ticks_ready(state)
+    return (f"credit ticks: {'on' if cfg['ticks'] else 'off'} (cap sonnet ${float(cfg['tick_cap_sonnet']):.2f} / opus "
+            f"${float(cfg['tick_cap_opus']):.2f} a tick, {cfg['ticks_per_hour']}/h, ${float(cfg['tick_day_usd']):.2f}/24h); "
+            f"spent ${sum(float(e.get('cost_usd') or 0) for e in day):.2f} in {len(day)} ticks over 24 h, "
+            f"${sum(float(e.get('cost_usd') or 0) for e in allt):.2f} in {len(allt)} all time; "
+            + ("ON CREDIT NOW (plan paused)" if ok and plan_paused(state) else
+               f"{'would run' if ok else why}{'' if plan_paused(state) else ' (only while the plan is paused)'}"))
 
 
 def cmd_rsi(a) -> int:
@@ -9539,9 +9669,12 @@ def main() -> int:
     wg.add_argument("--dry-run", action="store_true")
     wg.add_argument("--limit", type=int)
     wg.add_argument("--grace-h", type=float)
-    cr = sub.add_parser("credit", help="API-credit lane: status (default) / add USD / sync USD / on / off / when / model")
-    cr.add_argument("action", nargs="?", default="status", choices=["status", "add", "sync", "on", "off", "when", "model"])
+    cr = sub.add_parser("credit", help="API-credit lane: status (default) / add USD / sync USD / on / off / when / model / "
+                                       "ticks on|off / set KNOB V")
+    cr.add_argument("action", nargs="?", default="status",
+                    choices=["status", "add", "sync", "on", "off", "when", "model", "ticks", "set"])
     cr.add_argument("value", nargs="?")
+    cr.add_argument("value2", nargs="?", help="set: the knob's value")
     cr.add_argument("--expires", help="add: the grant's expiry date (YYYY-MM-DD)")
     cr.add_argument("--note")
     rs = sub.add_parser("rsi", help="the RSI lane: status (default) / conflicts / now|on|off JOB / set conflicts KEY V")

@@ -10,6 +10,7 @@ import datetime as dt
 import importlib.machinery
 import importlib.util
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -5362,3 +5363,174 @@ def test_a_named_source_defect_is_settled_not_untracked(churn):
 def test_the_cause_prompt_says_a_cancelled_run_is_no_failure(churn):
     """2026-10-29..31: 22 runs that found only cancelled checks were labelled env, and drew a false rise on the quality chart."""
     assert "cancelled or superseded runs are no failure: other, not env" in churn.CAUSE_PROMPT
+
+
+# ---------------------------------------------------------------- credit ticks (owner 2026-11-02)
+class _FellThrough(Exception):
+    pass
+
+
+def _paused(churn, ticks=True, usd=100, **credit_kw):
+    put(churn, paused_until=_later(churn, hours=12),
+        credit={"grants": [{"t": "2026-10-01T00:00Z", "usd": usd}], **({"ticks": True} if ticks else {}), **credit_kw})
+
+
+def _gate_mocks(churn, monkeypatch):
+    """The paused branch's own calls, stubbed; the full gate path is detected by its first PR snapshot."""
+    monkeypatch.setattr(churn, "refresh_tools", lambda: None)
+    monkeypatch.setattr(churn, "box", lambda: {"verdict": "GREEN", "free_slots": 1, "reasons": []})
+    lanes = []
+    monkeypatch.setattr(churn, "credit_lane", lambda b, s, p, d=False: lanes.append(p) or [])
+    monkeypatch.setattr(churn, "pr_snapshot", lambda *a, **k: (_ for _ in ()).throw(_FellThrough()))
+    return lanes
+
+
+TICK_NS = argparse.Namespace(dry_run=False, force=False, reason=[])
+
+
+def test_a_plan_pause_with_credit_ticks_off_returns_early_as_before(credit, monkeypatch):
+    churn, _, _ = credit
+    _paused(churn, ticks=False)
+    lanes = _gate_mocks(churn, monkeypatch)
+    assert churn.cmd_tick(TICK_NS) == 0 and lanes == [True]  # the credit worker lane still runs; no review, no snapshot
+    assert "credit ticks: off" in churn.credit_ticks_line(churn.load_state())
+
+
+def test_a_plan_pause_with_credit_ticks_on_and_funded_runs_the_whole_gate(credit, monkeypatch):
+    churn, _, _ = credit
+    _paused(churn)
+    _gate_mocks(churn, monkeypatch)
+    with pytest.raises(_FellThrough):
+        churn.cmd_tick(TICK_NS)
+    assert "ON CREDIT NOW" in churn.credit_ticks_line(churn.load_state())
+
+
+@pytest.mark.parametrize("why,kw", [("below one tick cap", {"usd": 4.5}),  # $3.50 above the $1 floor < the $4 opus cap
+                                    ("no API key", {"nokey": True}),
+                                    ("rate limit", {"paused_until": "2099-01-01T00:00Z"}),
+                                    ("credit ticks in the last hour", {"ticks_per_hour": 1}),
+                                    ("in 24 h", {"tick_day_usd": 3.0})])
+def test_credit_ticks_fall_back_to_the_early_return_when_they_cannot_run(credit, monkeypatch, why, kw):
+    churn, key, _ = credit
+    if kw.pop("nokey", False):
+        key.unlink()
+    _paused(churn, usd=kw.pop("usd", 100), log=[{"t": churn.iso(churn.now()), "kind": "tick", "cost_usd": 1.0}], **kw)
+    _gate_mocks(churn, monkeypatch)
+    assert churn.cmd_tick(TICK_NS) == 0  # no _FellThrough: today's early return
+    assert why in churn.credit_ticks_ready(churn.load_state())[1]
+
+
+def _fake_claude(churn, monkeypatch, out):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw["env"]))
+        kw["stdout"].write(json.dumps(out))
+    monkeypatch.setattr(churn.subprocess, "run", fake_run)
+    return calls
+
+
+def test_a_credit_tick_bills_the_key_with_its_cap_and_books_the_credit_ledger(credit, monkeypatch):
+    churn, _, _ = credit
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-stray")
+    _paused(churn)
+    calls = _fake_claude(churn, monkeypatch, {"result": "reviewed #7", "total_cost_usd": 0.9})
+    box = {"verdict": "GREEN", "free_slots": 1, "reasons": []}
+    churn.run_model_tick(["review: run A"], "sonnet", churn.load_state(), box, {}, on_credit=True)
+    [(cmd, env)] = calls
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-test" and cmd[cmd.index("--max-budget-usd") + 1] == "1.5"
+    st = churn.load_state()
+    assert st["usage"]["log"] == []  # never plan spend
+    [e] = st["credit"]["log"]
+    assert e["kind"] == "tick" and e["cost_usd"] == 0.9 and e["model"] == "orchestrator-sonnet"
+    assert churn.credit_balance(st)["balance"] == 99.1
+    assert "ON API CREDIT" in churn.TICK_STATUS.read_text() and "$100.00" in churn.TICK_STATUS.read_text()
+    churn.run_model_tick(["review: B"], "opus", churn.load_state(), box, {}, on_credit=True)
+    assert calls[1][0][calls[1][0].index("--max-budget-usd") + 1] == "4.0"
+
+
+def test_a_credit_tick_rate_limit_holds_the_credit_lane_not_the_plan(credit, monkeypatch):
+    churn, _, _ = credit
+    _paused(churn)
+    before = churn.load_state()["paused_until"]
+    _fake_claude(churn, monkeypatch, {"is_error": True, "api_error_status": 429, "result": "rate_limit_error"})
+    churn.run_model_tick(["review"], "sonnet", churn.load_state(), {}, {}, on_credit=True)
+    st = churn.load_state()
+    assert st["credit"]["paused_until"] and st["paused_until"] == before
+
+
+def test_a_plan_tick_drops_any_api_key_and_books_plan_usage(credit, monkeypatch):
+    churn, _, _ = credit
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-stray")
+    put(churn, credit={"grants": [{"t": "2026-10-01T00:00Z", "usd": 100}], "ticks": True})  # on, but no pause
+    calls = _fake_claude(churn, monkeypatch, {"result": "ok", "total_cost_usd": 2.0})
+    churn.run_model_tick(["review"], "sonnet", churn.load_state(), {}, {})
+    [(cmd, env)] = calls
+    assert "ANTHROPIC_API_KEY" not in env and cmd[cmd.index("--max-budget-usd") + 1] == "6"
+    st = churn.load_state()
+    assert st["usage"]["log"][0]["cost_usd"] == 2.0 and not st["credit"].get("log")
+    assert "ON API CREDIT" not in churn.TICK_STATUS.read_text()
+
+
+def _worker_ns(tmp_path, **kw):
+    return argparse.Namespace(**{"resume_run": None, "issue": 5, "model": "sonnet", "task": "t", "brief": "b",
+                                 "brief_file": None, "worktree": str(tmp_path), "branch": "churn/5-x", "repo": None,
+                                 "force": False, "lane": None, "plan": False, "check_of": None, **kw})
+
+
+def test_launches_and_send_backs_in_a_credit_pause_go_on_the_credit_lane(credit, monkeypatch, tmp_path):
+    churn, _, _ = credit
+    monkeypatch.setattr(churn, "spawn_detached", lambda *a, **k: -1)  # pid_alive(-1) is False: not a live credit run
+    _paused(churn)
+    assert churn.cmd_worker(_worker_ns(tmp_path)) == 0
+    [r] = churn.load_state()["running"]
+    meta = churn._run_meta(r["run_id"])
+    assert r["lane"] == "credit" and meta["lane"] == "credit" and meta["budget_usd"] == 15.0
+    with churn.edit_state() as st:
+        st["running"] = []
+    prev = churn.RUNS / "5-prev"
+    prev.mkdir()
+    (prev / "meta.json").write_text(json.dumps({"run_id": "5-prev", "issue": 5, "model": "opus", "task": "t",
+                                                "worktree": str(tmp_path), "branch": "churn/5-x", "session_id": "s1",
+                                                "status": "done"}))
+    with churn.edit_state() as st:
+        st["credit"]["grants"][0]["usd"] = 12  # the cap follows the balance: $12 - $1 floor
+    for d in churn.RUNS.glob("5-2*"):  # the first launch's run dir: a send-back in the same minute takes the same id
+        shutil.rmtree(d)
+    assert churn.cmd_worker(argparse.Namespace(resume_run="5-prev", message="fix x", force=False, plan=False)) == 0
+    [r] = churn.load_state()["running"]
+    meta = churn._run_meta(r["run_id"])
+    assert r["lane"] == "credit" and meta["lane"] == "credit" and meta["budget_usd"] == 11.0 and meta["resume_of"] == "5-prev"
+
+
+def test_a_credit_pause_refuses_a_launch_the_lane_cannot_take_even_forced(credit, monkeypatch, tmp_path):
+    churn, _, _ = credit
+    monkeypatch.setattr(churn, "spawn_detached", lambda *a, **k: 4242)
+    _paused(churn, max_running=0)
+    with pytest.raises(SystemExit, match="plan is paused"):
+        churn.cmd_worker(_worker_ns(tmp_path, force=True))
+    assert churn.load_state()["running"] == []
+
+
+def test_with_credit_ticks_off_a_paused_launch_is_unchanged(credit, monkeypatch, tmp_path):
+    churn, _, _ = credit
+    monkeypatch.setattr(churn, "spawn_detached", lambda *a, **k: 4242)
+    _paused(churn, ticks=False)
+    assert churn.cmd_worker(_worker_ns(tmp_path)) == 0
+    [r] = churn.load_state()["running"]
+    assert "lane" not in r and "lane" not in churn._run_meta(r["run_id"]) and "budget_usd" not in churn._run_meta(r["run_id"])
+
+
+def test_credit_cli_ticks_switch_and_knobs(credit, capsys):
+    churn, _, _ = credit
+    ns = lambda action, value=None, value2=None: argparse.Namespace(action=action, value=value, value2=value2,
+                                                                     expires=None, note=None)
+    churn.cmd_credit(ns("ticks", "on"))
+    churn.cmd_credit(ns("set", "tick_cap_opus", "3"))
+    c = churn.credit_cfg(churn.load_state())
+    assert c["ticks"] is True and c["tick_cap_opus"] == 3.0
+    assert "credit ticks: on" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        churn.cmd_credit(ns("set", "key_file", "/tmp/x"))
+    churn.cmd_credit(ns("ticks", "off"))
+    assert churn.credit_cfg(churn.load_state())["ticks"] is False
