@@ -74,3 +74,17 @@ shows it.
   A code or test file past the thresholds launches one capped Opus session, which splits it without changing behaviour,
   following the repo's `hot-file-split` skill. A week with no candidate spends nothing. Set it up with
   `churn rsi set conflicts issue N`, where N is a standing issue in the target repo.
+
+## The credit lane
+
+Prepaid API credit (`churn credit add USD`; key in `~/.config/promoter-bot/anthropic-credit.key`) runs extra workers
+whose `claude -p` bills the API, with their own ledger, floor and `max_running`. `churn credit` shows it.
+
+**Credit ticks** (opt-in, off by default: `churn credit ticks on|off`). While the plan is paused on its limit, churn
+normally stops reviewing. With this switch on and the lane funded, the gate runs in full during the pause: the model
+tick that reviews, merges and sends back bills the API key (capped per tick), and every Claude launch or send-back while
+paused goes on the credit lane (key, credit budget cap, credit ledger) or is refused, never on the plan. The tick's status
+file tells it so. RSI and experiment launches wait for the reset. Caps (`churn credit set KNOB V`): `tick_cap_sonnet`
+$1.50, `tick_cap_opus` $4, `ticks_per_hour` 3, `tick_day_usd` $25 of ticks per 24 h, plus the lane's `floor_usd` and
+`max_running`. With the switch off, no key, a rate-limit hold, or not enough credit for one tick, a pause behaves as it
+always has. `churn status` and `churn credit` show the switch, its spend, and whether it is running now.
