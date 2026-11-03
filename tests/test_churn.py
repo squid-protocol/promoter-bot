@@ -5960,3 +5960,17 @@ def test_a_shared_red_issue_closed_with_no_merge_sends_the_prs_back_to_their_fix
     assert any("closed as not main's" in x for x in added) and UNLOCK in st["shared_red"]["not_main"]
     added = churn.queue_pr_fixes(st, SNAP_SHARED, triage=tri, open_issue=lambda sigs, n: 1 / 0)
     assert {q.get("pr") for q in st["queue"]} == {7, 9}  # main was green: each PR's own fixer has it again
+
+
+def test_a_program_refused_by_design_is_settled_and_listed_apart(churn):
+    # owner 2026-11-03 (#5106): DBB epscsmrd.cbl stays at L0 as a stated boundary, not untranslated work
+    reps = [{"file": "docs/language_status/evidence_report/dbb-mortgage-application/report.json", "programs": [
+        {"program": "zBuilder/MortgageApplication/cobol/epscsmrd.cbl", "level": "L0",
+         "translation": {"hole_count": 7, "gap_classes": ["CEEHDLR"]},
+         "ladder_exclusion": {"kind": "refused_by_design", "issue": "#5106", "reason": "LE / SOAP: no oracle"}},
+        {"program": "src/OTHER.cbl", "level": "L0", "translation": {"hole_count": 2}}]}]
+    m = churn.goal_measure(reps, [])
+    assert [d["program"] for d in m["refused_by_design"]] == ["zBuilder/MortgageApplication/cobol/epscsmrd.cbl"]
+    assert [u["program"] for u in m["untranslated"]] == ["src/OTHER.cbl"] and m["untracked"] == ["src/OTHER.cbl"]
+    assert m["source_defects"] == [] and "1 not translated whole (2 holes)" in churn.goal_summary(m)
+    assert churn.goal_summary(m).endswith("; 1 refused by design")
