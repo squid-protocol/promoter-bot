@@ -5674,53 +5674,195 @@ def test_the_rescue_run_books_its_cost_and_reports_to_the_owner(churn, monkeypat
     assert churn.last_worker_activity(st) is None  # the rescue is not a worker
 
 
-def test_a_dry_ladder_family_is_not_requeued_until_something_moves(churn, monkeypatch):
-    """2026-11-03: each new measure requeued commarea-mismatch; 4 runs in a row said "no data-only lift" (no PR)."""
-    f = _focus(churn, monkeypatch, ladder={"anchor": 6072, "skip": []})
-    below = {"cics-crucible/commarea-mismatch": [["CAADSB", "L2"], ["CAGMZ", "L1"]], "zecs": [["ZECS001", "L1"]]}
-    st = {"queue": [], "running": [], "prs": [], "focus": f, "goal": {"measure": {"t": "2026-11-03T09:32Z", "below": below}}}
-    fam = churn.ladder_mark_dry(st, "[ladder:cics-crucible/commarea-mismatch] ladder slice of #6072", "6072-a")
-    assert fam == "cics-crucible/commarea-mismatch"
-    assert churn.ladder_mark_dry(st, "Fix _same_commarea comparing PIC X fields", "6072-b") is None  # not a ladder task
-    st["goal"]["measure"]["t"] = churn.iso(churn.now() + churn.dt.timedelta(minutes=1))  # a newer measure, same levels
-    assert [x["task"].split("]")[0] for x in churn.ladder_items(st, {})] == ["[ladder:zecs"]
-    st["queue"] = []
-    st["goal"]["measure"] = {"t": churn.iso(churn.now() + churn.dt.timedelta(minutes=2)),
-                             "below": {**below, "cics-crucible/commarea-mismatch": [["CAGMZ", "L1"]]}}  # CAADSB lifted
-    assert "[ladder:cics-crucible/commarea-mismatch" in [x["task"].split("]")[0] for x in churn.ladder_items(st, {})]
-    churn.ladder_mark_dry(st, "[ladder:zecs] slice", "6072-c")
-    st["focus"]["ladder_dry"]["zecs"]["t"] = churn.iso(churn.now() - churn.dt.timedelta(hours=churn.LADDER_DRY_H + 1))
-    assert churn.ladder_dry(st, "zecs", [["ZECS001", "L1"]]) is None  # expired: try again
+# ---------------------------------------------------------------- solver lane (owner 2026-11-02)
+SOLVER_BURNED = 'BURNED_NAMES = {\n    "aws-mainframe-modernization-carddemo",\n    "zecs",\n}\n'
 
 
-def test_a_prerequisite_merge_clears_the_dry_marks(churn, monkeypatch):
-    f = _focus(churn, monkeypatch, ladder={"anchor": 6072},
-               prereqs=[{"issue": 7589, "for": 6072, "reason": "harness gaps", "t": churn.iso(churn.now())}])
-    st = {"focus": f, "prs": [{"number": 7594, "issue": 7589}, {"number": 7600, "issue": 4242}],
-          "goal": {"measure": {"t": "2026-11-03T09:32Z", "below": {"zecs": [["ZECS001", "L1"]]}}}}
-    churn.ladder_mark_dry(st, "[ladder:zecs] slice", "6072-a")
-    churn.settle_closed(st, {"7600": pr(state="merged", merged=True, branch="churn/4242-x")})
-    assert st["focus"].get("ladder_dry")  # not a prerequisite of the anchor: kept
-    notes = churn.settle_closed(st, {"7594": pr(state="merged", merged=True, branch="churn/7589-x")})
-    assert "ladder_dry" not in st["focus"] and st["goal"]["measure_due"]
-    assert any("dry marks cleared" in n for n in notes)
+def _solver_git(root, *args):
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=root, check=True)
 
 
-def test_reap_marks_a_prless_commitless_ladder_run_dry(churn, monkeypatch):
-    f = _focus(churn, monkeypatch, ladder={"anchor": 6072})
-    below = {"zecs": [["ZECS001", "L1"]]}
-    for rid, found_pr, changed in (("6072-a", None, False), ("6072-b", 7599, True), ("6072-c", None, True)):
-        rd = churn.RUNS / rid
-        rd.mkdir(parents=True)
-        (rd / "meta.json").write_text(json.dumps({"worktree": str(rd), "branch": f"churn/{rid}", "issue": 6072,
-                                                  "model": "sonnet", "task": "[ladder:zecs] ladder slice of #6072"}))
-        (rd / "exit").write_text("0\n")
-        (rd / "out.json").write_text(json.dumps({"result": "no PR", "session_id": "s"}))
-        monkeypatch.setattr(churn, "worktree_pr", lambda wt, issue=None, p=found_pr, r=rid: (f"churn/{r}", p))
-        monkeypatch.setattr(churn, "own_commits", lambda wt, head, c=changed: c)
-        monkeypatch.setattr(churn, "own_hand_commits", lambda wt, head: False)
-        st = {"prs": [], "focus": {**f}, "goal": {"measure": {"t": "2026-11-03T09:32Z", "below": below}},
-              "running": [{"run_id": rid, "pid": 0, "issue": 6072, "model": "sonnet"}]}
-        churn.reap(st)
-        dry = (st["focus"].get("ladder_dry") or {}).get("zecs")
-        assert bool(dry) == (rid == "6072-a"), rid  # a PR or a commit is progress: no mark
+def _solver_repo(tmp_path, solver=True, backend=True):
+    """A fake gitgalaxy main checkout: estate4_draw, strengthen, the solver (optional) and five cases."""
+    root = tmp_path / "gg"
+    tools, eq = root / "tests/tools", root / "tests/equivalence"
+    for d in (tools, eq / "det_sweep_coverage", eq / "infeasible_outcomes"):
+        d.mkdir(parents=True, exist_ok=True)
+    (tools / "estate4_draw.py").write_text(SOLVER_BURNED)
+    (tools / "strengthen.py").write_text("# strengthen\n")
+    if solver:
+        (tools / "branch_solver.py").write_text("def reach(): ...\n" + ("def backend(case, prompt_file, work): ...\n"
+                                                                       if backend else ""))
+
+    def case(name, corpus, kind, uncovered, covered, total, infeasible=()):
+        (eq / name).mkdir()
+        (eq / name / "case.json").write_text(json.dumps({"corpus": corpus, "kind": kind, "program": name.upper()}, indent=1))
+        (eq / "det_sweep_coverage" / f"{name}.json").write_text(json.dumps(
+            {"branches": {"covered": covered, "total": total}, "uncovered": {"branches": uncovered}}))
+        if infeasible:
+            (eq / "infeasible_outcomes" / f"{name}.json").write_text(json.dumps(
+                {"case": name, "entries": [{"line": int(k.split(":")[0]), "outcome": k.split(":")[1]} for k in infeasible]}))
+
+    case("carddemo-a", "aws-mainframe-modernization-carddemo", "cics", ["10:true", "11:false", "12:true"], 7, 10,
+         infeasible=["12:true"])  # 2 net gaps
+    case("carddemo-b", "aws-mainframe-modernization-carddemo", "cics", ["20:true"], 9, 10, infeasible=["20:true"])  # 0 net
+    case("census-c", "some-census-repo", "cics", ["1:true", "2:true", "3:true", "4:true"], 0, 4)  # not a burned estate
+    case("carddemo-d", "aws-mainframe-modernization-carddemo", "batch", ["1:true", "2:true", "3:true"], 0, 3)  # no inputs
+    case("zecs-e", "zecs", "call", ["5:true", "6:false", "7:true", "paragraph:X"], 1, 4)  # 3 net (a paragraph row is not one)
+    _solver_git(root, "init", "-q")
+    _solver_git(root, "add", "-A")
+    _solver_git(root, "commit", "-q", "-m", "main")
+    return root
+
+
+def _solver_commit(root, msg="change"):
+    _solver_git(root, "add", "-A")
+    _solver_git(root, "commit", "-q", "-m", msg)
+
+
+GREEN_SLOT = {"verdict": "GREEN", "free_slots": 1, "reasons": []}
+
+
+def _held_lines(churn) -> int:
+    return churn.QUIET_LOG.read_text().count("solver lane held") if churn.QUIET_LOG.exists() else 0
+
+
+def test_solver_gaps_take_burned_call_and_cics_cases_net_of_stated_infeasible_outcomes(churn, tmp_path):
+    root = _solver_repo(tmp_path)
+    gaps = churn.solver_gaps(root)
+    assert [(g["case"], g["gaps"]) for g in gaps] == [("zecs-e", ["5:true", "6:false", "7:true"]),
+                                                      ("carddemo-a", ["10:true", "11:false"])]
+    assert churn.solver_estates(root) == {"aws-mainframe-modernization-carddemo", "zecs", "cics-crucible"}
+
+
+def test_solver_pick_skips_a_case_tried_at_the_same_inputs_until_main_changes_them(churn, tmp_path, monkeypatch):
+    root = _solver_repo(tmp_path)
+    monkeypatch.setattr(churn, "TOOLS", root)
+    first = churn.solver_pick(churn.load_state())
+    assert first["case"] == "zecs-e"
+    with churn.edit_state() as st:
+        churn.solver_record(st, "zecs-e", first["key"], "no gain", "solver-zecs-e-1")
+    second = churn.solver_pick(churn.load_state())
+    assert second["case"] == "carddemo-a"  # tried: the next case
+    with churn.edit_state() as st:
+        churn.solver_record(st, "carddemo-a", second["key"], "no gain", "solver-carddemo-a-1")
+    assert churn.solver_pick(churn.load_state()) is None  # everything tried at today's inputs: nothing to do
+    (root / "README").write_text("an unrelated commit on main")
+    _solver_commit(root)
+    assert churn.solver_pick(churn.load_state()) is None  # main moved, but not under these cases
+    (root / "tests/equivalence/infeasible_outcomes/carddemo-a.json").unlink()
+    _solver_commit(root, "a reviewer retracted the infeasible entry")
+    third = churn.solver_pick(churn.load_state())
+    assert third["case"] == "carddemo-a"  # its inputs changed (3 net gaps now): worth another try
+    with churn.edit_state() as st:
+        churn.solver_record(st, "carddemo-a", third["key"], "no gain", "solver-carddemo-a-2")
+    assert churn.solver_pick(churn.load_state()) is None
+    (root / "tests/tools/branch_solver.py").write_text("def backend(case, prompt_file, work): return []\n")
+    _solver_commit(root, "a better solver")
+    again = churn.solver_pick(churn.load_state())
+    assert again["case"] == "carddemo-a" and again["key"] != third["key"]  # the solver changed: every case again
+    with churn.edit_state() as st:
+        churn.solver_record(st, "carddemo-a", again["key"], "no gain", "solver-carddemo-a-3")
+    assert churn.solver_pick(churn.load_state())["case"] == "zecs-e"
+
+
+def test_solver_lane_is_off_by_default_and_reads_nothing(churn, tmp_path, monkeypatch):
+    monkeypatch.setattr(churn, "TOOLS", _solver_repo(tmp_path))
+    monkeypatch.setattr(churn, "run", lambda *a, **kw: pytest.fail("an idle lane must not run anything"))
+    monkeypatch.setattr(churn, "solver_gaps", lambda root=None: pytest.fail("an idle lane must not read the cases"))
+    assert churn.solver_lane(GREEN_SLOT, {}) == []
+    assert "solver" not in churn.load_state()
+    assert churn.solver_cfg(churn.load_state())["enabled"] is False
+
+
+@pytest.mark.parametrize("solver,backend,why", [(False, False, "is not on main"), (True, False, "no strengthen backend")])
+def test_solver_lane_stays_quiet_while_main_lacks_the_solver(churn, tmp_path, monkeypatch, solver, backend, why):
+    monkeypatch.setattr(churn, "TOOLS", _solver_repo(tmp_path, solver=solver, backend=backend))
+    spawned = []
+    put(churn, solver={"enabled": True})
+    monkeypatch.setattr(churn, "solver_gaps", lambda root=None: pytest.fail("no solver: no case is read"))
+    monkeypatch.setattr(churn, "solver_z3", lambda: pytest.fail("no solver: no z3 probe"))
+    assert churn.solver_lane(GREEN_SLOT, {}, spawn=lambda *a: spawned.append(a) or 1) == []
+    assert spawned == [] and why in churn.load_state()["solver"]["hold"]
+    before = _held_lines(churn)
+    assert churn.solver_lane(GREEN_SLOT, {}, spawn=lambda *a: spawned.append(a) or 1) == []
+    assert spawned == [] and _held_lines(churn) == before  # the same hold is logged once, not every tick
+
+
+@pytest.mark.parametrize("b", [{"verdict": "GREEN", "free_slots": 0}, {"verdict": "YELLOW", "free_slots": 1},
+                               {"verdict": "RED", "free_slots": 0}])
+def test_solver_lane_waits_for_a_free_heavy_slot(churn, tmp_path, monkeypatch, b):
+    monkeypatch.setattr(churn, "TOOLS", _solver_repo(tmp_path))
+    monkeypatch.setattr(churn, "solver_gaps", lambda root=None: pytest.fail("no slot: no case is read"))
+    put(churn, solver={"enabled": True})
+    spawned = []
+    assert churn.solver_lane(b, {}, spawn=lambda *a: spawned.append(a) or 1) == []
+    assert spawned == [] and "no free heavy slot" in churn.load_state()["solver"]["hold"]
+
+
+def test_solver_lane_starts_one_run_and_holds_while_it_lives(churn, tmp_path, monkeypatch):
+    monkeypatch.setattr(churn, "TOOLS", _solver_repo(tmp_path))
+    monkeypatch.setattr(churn, "solver_z3", lambda: True)
+    put(churn, solver={"enabled": True})
+    assert churn.solver_lane(GREEN_SLOT, {}, dry_run=True) == ["solver run on zecs-e (3 net branch gaps, 1/4)"]
+    assert "running" not in churn.load_state()["solver"]
+    spawned = []
+    did = churn.solver_lane(GREEN_SLOT, {}, spawn=lambda unit, cmd, *a: spawned.append(cmd) or 4242)
+    assert did == ["solver run on zecs-e (3 net branch gaps, 1/4)"] and spawned[0][-2] == "_solver"
+    s = churn.load_state()["solver"]
+    assert s["running"]["case"] == "zecs-e" and s["running"]["pid"] == 4242
+    meta = json.loads((churn.RUNS / s["running"]["run_id"] / "meta.json").read_text())
+    assert meta["key"] == s["running"]["key"] and meta["gaps"] == ["5:true", "6:false", "7:true"]
+    assert churn.solver_lane(GREEN_SLOT, {}, spawn=lambda *a: pytest.fail("one run at a time")) == []
+    # the runner died without a record: booked as crashed, so the same case is not started again at once
+    monkeypatch.setattr(churn, "pid_alive", lambda pid: False)
+    put(churn, solver={**churn.load_state()["solver"], "history": []})  # no cooldown in the way
+    churn.solver_lane(GREEN_SLOT, {}, spawn=lambda unit, cmd, *a: spawned.append(cmd) or 7)
+    s = churn.load_state()["solver"]
+    assert s["attempts"]["zecs-e"]["outcome"] == "crashed"
+
+
+def test_solver_lane_holds_on_missing_z3_daily_cap_and_cooldown(churn, tmp_path, monkeypatch):
+    monkeypatch.setattr(churn, "TOOLS", _solver_repo(tmp_path))
+    monkeypatch.setattr(churn, "solver_z3", lambda: False)
+    put(churn, solver={"enabled": True})
+    assert churn.solver_lane(GREEN_SLOT, {}, spawn=lambda *a: pytest.fail("no z3")) == []
+    assert "z3 missing" in churn.solver_hold(churn.load_state(), GREEN_SLOT)
+    t = churn.iso(churn.now() - dt.timedelta(minutes=5))
+    put(churn, solver={"enabled": True, "history": [{"case": "x", "t": t, "outcome": "no gain"}]})
+    assert churn.solver_hold(churn.load_state(), GREEN_SLOT).startswith("cooldown until")
+    put(churn, solver={"enabled": True, "max_per_day": 1, "history": [{"case": "x", "t": t, "outcome": "no gain"}]})
+    assert "max_per_day 1" in churn.solver_hold(churn.load_state(), GREEN_SLOT)
+    put(churn, solver={"enabled": True}, workers_paused="owner")
+    assert churn.solver_hold(churn.load_state(), GREEN_SLOT).startswith("workers paused")
+
+
+@pytest.mark.parametrize("res,want", [
+    ({"coverage_before": {"covered": 3, "total": 9}, "coverage_after": {"covered": 5, "total": 9}, "accepted": ["a"],
+      "proven_after": True}, ("gain", 3, 5, 9)),
+    ({"coverage_before": {"covered": 3, "total": 9}, "coverage_after": {"covered": 5, "total": 9}, "accepted": ["a"],
+      "proven_after": False}, ("port differs", 3, 5, 9)),
+    ({"coverage_before": {"covered": 3, "total": 9}, "coverage_after": {"covered": 3, "total": 9}, "accepted": [],
+      "proven_after": True}, ("no gain", 3, 3, 9)),
+])
+def test_solver_verdict(churn, res, want):
+    assert churn.solver_verdict(res) == want
+
+
+def test_solver_case_text_keeps_the_committed_indentation(churn):
+    assert churn.solver_case_text({"a": [1]}, '{\n "a": []\n}\n') == '{\n "a": [\n  1\n ]\n}\n'
+    assert churn.solver_case_text({"a": 1}, '{\n  "a": 0\n}\n') == '{\n  "a": 1\n}\n'
+
+
+def test_the_solver_runner_books_its_attempt_even_when_it_crashes(churn, monkeypatch):
+    rid = "solver-zecs-e-x"
+    (churn.RUNS / rid).mkdir(parents=True)
+    (churn.RUNS / rid / "meta.json").write_text(json.dumps({"case": "zecs-e", "key": "k1", "run_id": rid,
+                                                            "worktree": "/nonexistent/wt"}))
+    put(churn, solver={"enabled": True, "running": {"run_id": rid, "pid": 1, "case": "zecs-e"}})
+    monkeypatch.setattr(churn, "solver_attempt", lambda meta, rd, cfg: 1 / 0)
+    monkeypatch.setattr(churn, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, "", ""))
+    churn.cmd_solver_run(argparse.Namespace(run_id=rid))
+    s = churn.load_state()["solver"]
+    assert s["running"] is None and s["attempts"]["zecs-e"]["outcome"] == "error"
+    assert s["attempts"]["zecs-e"]["key"] == "k1" and "ZeroDivisionError" in s["attempts"]["zecs-e"]["detail"]
