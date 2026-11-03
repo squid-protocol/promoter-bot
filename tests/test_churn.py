@@ -5866,3 +5866,97 @@ def test_the_solver_runner_books_its_attempt_even_when_it_crashes(churn, monkeyp
     s = churn.load_state()["solver"]
     assert s["running"] is None and s["attempts"]["zecs-e"]["outcome"] == "error"
     assert s["attempts"]["zecs-e"]["key"] == "k1" and "ZeroDivisionError" in s["attempts"]["zecs-e"]["detail"]
+
+
+# ---------------------------------------------------------------- shared red: a PR-only check main broke (2026-11-03)
+SNAP_SHARED = {"7": {"state": "open", "head": "h7", "branch": "churn/70-x", "labels": ["shepherd:needs-fix"],
+                     "mergeable_state": "blocked"},
+               "9": {"state": "open", "head": "h9", "branch": "churn/90-y", "labels": ["shepherd:needs-fix"],
+                     "mergeable_state": "blocked"}}
+UNLOCK = "det::cruc-hc-file-unlock"
+
+
+def shared_triage(churn, table):
+    def t(n):
+        checks, sigs = table[n]
+        churn.CI_CHECKS[n], churn.CI_SIGS[n] = checks, sigs
+        return ["real"]
+    return t
+
+
+def test_red_sigs_reads_tests_and_det_cases_of_real_failures_only(churn):
+    failed = [{"check": "det", "triage": "real", "cases": ["cruc-hc-file-unlock"], "tests": []},
+              {"check": "full-suite part 1/4", "triage": "real", "tests": ["tests/a.py::t"]},
+              {"check": "shard 1/2", "triage": "infra", "cases": ["cruc-x"]}]
+    assert churn.red_sigs(failed) == [UNLOCK, "full-suite part 1/4::tests/a.py::t"]
+
+
+def test_two_issues_failing_the_same_det_case_get_one_main_fix_and_no_pr_workers(churn):
+    # #7587 (#7486) and #7593 (#7589): det red on cruc-hc-file-unlock, left on main by #7585
+    st = {"prs": [], "queue": [], "running": []}
+    opened = []
+    added = churn.queue_pr_fixes(st, SNAP_SHARED, triage=shared_triage(churn, {7: (["det"], [UNLOCK]), 9: (["det"], [UNLOCK])}),
+                                 open_issue=lambda sigs, n: opened.append((sorted(sigs), n)) or 500)
+    assert [q.get("pr") for q in st["queue"]] == [None]  # PR 7's fix item, queued before PR 9 showed it, is withdrawn
+    (q,) = st["queue"]
+    assert q["issue"] == 500 and q["auto"] == "shared-red" and q["lane"] == "ci" and "Fixes #500" in q["task"]
+    assert opened == [([UNLOCK], "9")]  # one issue for the pair
+    assert sorted(x for x in added if x.startswith("shared:")) == ["shared:#7 -> #500 (also on #9)",
+                                                                    "shared:#9 -> #500 (also on #7)"]
+    assert "#7" not in added
+    assert {p["number"]: p["flake_head"] for p in st["prs"]} == {7: "h7", 9: "h9"}
+    assert st["shared_red"]["issues"][0]["prs"] == [7, 9]
+    assert churn.queue_pr_fixes(st, SNAP_SHARED, triage=lambda n: 1 / 0) == []  # marked: not judged again this head
+    assert churn.in_focus is not churn.real_in_focus and churn.real_in_focus(st, q)  # red main's work beats the focus
+
+
+def test_a_pr_with_its_own_red_besides_the_shared_one_keeps_its_fixer(churn):
+    st = {"prs": [], "queue": [], "running": []}
+    churn.queue_pr_fixes(st, SNAP_SHARED, triage=shared_triage(
+        churn, {7: (["det", "Ruff Audit"], [UNLOCK]), 9: (["det"], [UNLOCK])}), open_issue=lambda sigs, n: 500)
+    assert {q.get("pr") for q in st["queue"]} == {7, None}  # 9 waits on #500; 7 still has a lint failure of its own
+
+
+@pytest.mark.parametrize("table", [{7: (["det"], [UNLOCK]), 9: (["det"], ["det::cruc-other"])},  # different cases
+                                   {7: (["det"], [UNLOCK]), 9: (["det"], [])}])  # no case named: unknown, not shared
+def test_different_or_unnamed_reds_are_not_shared(churn, table):
+    st = {"prs": [], "queue": [], "running": []}
+    churn.queue_pr_fixes(st, SNAP_SHARED, triage=shared_triage(churn, table), open_issue=lambda sigs, n: 1 / 0)
+    assert {q.get("pr") for q in st["queue"]} == {7, 9}
+
+
+def test_two_prs_of_one_issue_are_not_a_shared_red(churn):
+    snap = {**SNAP_SHARED, "9": {**SNAP_SHARED["9"], "branch": "churn/70-z"}}
+    st = {"prs": [{"number": 9, "issue": 70}], "queue": [], "running": []}
+    churn.queue_pr_fixes(st, snap, triage=shared_triage(churn, {7: (["det"], [UNLOCK]), 9: (["det"], [UNLOCK])}),
+                         open_issue=lambda sigs, n: 1 / 0)
+    assert "shared_red" not in st or not st["shared_red"].get("issues")
+
+
+def test_a_merged_shared_red_fix_updates_the_waiting_prs_once(churn, monkeypatch):
+    st = {"prs": [], "queue": [], "running": []}
+    churn.queue_pr_fixes(st, SNAP_SHARED, triage=shared_triage(churn, {7: (["det"], [UNLOCK]), 9: (["det"], [UNLOCK])}),
+                         open_issue=lambda sigs, n: 500)
+    st["prs"].append({"number": 600, "issue": 500})
+    updated = []
+    monkeypatch.setattr(churn, "update_branch", lambda n: updated.append(n) or True)
+    snap = {**SNAP_SHARED, "600": pr(state="closed", merged=True, branch="churn/500-fix", closes=True)}
+    notes = churn.settle_closed(st, snap)
+    assert sorted(updated) == [7, 9] and "shared red #500 fixed: updated with main #7, #9" in notes
+    assert not st["shared_red"]["issues"] and not st["shared_red"]["prs"]
+    assert all("flake_head" not in p and p["updated_from"] == f"h{p['number']}" for p in st["prs"])
+
+
+def test_a_shared_red_issue_closed_with_no_merge_sends_the_prs_back_to_their_fixers(churn):
+    st = {"prs": [], "queue": [], "running": []}
+    tri = shared_triage(churn, {7: (["det"], [UNLOCK]), 9: (["det"], [UNLOCK])})
+    churn.queue_pr_fixes(st, SNAP_SHARED, triage=tri, open_issue=lambda sigs, n: 500)
+    st["queue"] = []
+    for p in st["prs"]:  # the shared mark expires (FLAKE_HOURS): the PRs are judged again
+        p.pop("flake_head")
+    st["shared_red"]["issues"][0]["at"] = "2026-01-01T00:00Z"  # an issue past FIX_SETTLE_MIN: its state is read
+    added = churn.queue_pr_fixes(st, SNAP_SHARED, triage=tri, read=lambda path: {"state": "closed"},
+                                 open_issue=lambda sigs, n: 1 / 0)
+    assert any("closed as not main's" in x for x in added) and UNLOCK in st["shared_red"]["not_main"]
+    added = churn.queue_pr_fixes(st, SNAP_SHARED, triage=tri, open_issue=lambda sigs, n: 1 / 0)
+    assert {q.get("pr") for q in st["queue"]} == {7, 9}  # main was green: each PR's own fixer has it again
