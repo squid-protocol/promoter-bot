@@ -4175,8 +4175,8 @@ GENERATED_AUTO = ("refill", "followup-next")  # a next slice queued on purpose a
 
 
 def _foldable(x: dict) -> bool:
-    return bool(x.get("issue")) and not x.get("pr") and x.get("auto") != "main-red" and not x.get("main_red_pr") \
-        and not str(x.get("task", "")).startswith(("Fix PR", "Main is red:")) and bool(task_paths(x.get("task", "")))
+    return bool(x.get("issue")) and not x.get("pr") and x.get("auto") not in ("main-red", "shared-red") \
+        and not x.get("main_red_pr") and not str(x.get("task", "")).startswith(("Fix PR", "Main is red:", SHARED_RED_TITLE)) and bool(task_paths(x.get("task", "")))
 
 
 def fold_covered(state: dict, snap: dict) -> list[str]:
@@ -4238,6 +4238,8 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
         if v.get("merged") and owner:
             with contextlib.suppress(Exception):  # #30: a merged slice retires queued items it already did
                 notes += drop_merged_covered(state, int(owner), n)
+            with contextlib.suppress(Exception):  # a merged fix of a shared red: update the PRs that waited on it
+                notes += release_shared_red(state, int(owner), True)
             anchor = ladder_anchor(state)
             if anchor and (focus_cfg(state).get("ladder_dry")) and int(owner) in {
                     int(x.get("issue", 0)) for x in focus_prereqs(state) if int(x.get("for", 0)) == int(anchor)}:
@@ -6454,8 +6456,8 @@ def prune_prereqs(state: dict) -> list[str]:
 def in_focus(state: dict, x: dict) -> bool:
     """May item / launch x run under the focus? With no focus set only red main and the exempt lanes run: churn never
     roams free (the free-roaming refill was where the drift came from). Filler is decided separately (filler_open)."""
-    if x.get("auto") == "main-red" or str(x.get("task", "")).startswith("Main is red:"):
-        return True  # a red main blocks every merge, the focus's too
+    if x.get("auto") in ("main-red", "shared-red") or str(x.get("task", "")).startswith(("Main is red:", SHARED_RED_TITLE)):
+        return True  # a red main blocks every merge, the focus's too (a shared red is main's red on PR-only checks)
     if x.get("lane") in FOCUS_EXEMPT_LANES:
         return True
     if x.get("filler_pr"):
@@ -6479,7 +6481,7 @@ def main_red_branch(branch: str | None) -> bool:
     """A red-main run opened this branch, so its PR's fixes are red-main work too (the fix item's task is "Fix PR")."""
     if not branch or not (m := re.match(r"churn/(\d+)-", branch)):
         return False
-    return any(str(mt.get("task", "")).startswith("Main is red:") and mt.get("branch") == branch
+    return any(str(mt.get("task", "")).startswith(("Main is red:", SHARED_RED_TITLE)) and mt.get("branch") == branch
                for d in RUNS.glob(f"{m.group(1)}-*") if (mt := _run_meta(d.name)))
 
 
@@ -6882,7 +6884,7 @@ def focus_pick(state: dict, snap: dict | None, mode: str, focus: bool) -> tuple[
     q = [(i, x) for i, x in enumerate(state.get("queue", [])) if not x.get("needs_owner") and x.get("backend") != "agy"
          and in_focus(state, x) == focus and not blocked_by(x, snap, state) and not waiting(x)
          and not plan_overlap(state, x) and not estate_wait(state, x)]
-    for want in (lambda x: x.get("pr"), lambda x: x.get("auto") == "main-red", lambda x: x.get("lane") == "ci"):
+    for want in (lambda x: x.get("pr"), lambda x: x.get("auto") in ("main-red", "shared-red"), lambda x: x.get("lane") == "ci"):
         if hit := next(((i, x) for i, x in q if want(x)), None):
             return hit  # a PR fix finishes work in hand; a red main blocks every PR
     cfg = ci_cfg(state)
@@ -7115,12 +7117,14 @@ def red_main_issues() -> list[dict]:
 NOISE = {"infra", "flake", "main"}  # ci_digest triage the shepherd handles by rerunning (or main's own fix)
 CI_RED: dict[int, str] = {}  # PR -> its failing checks at the last triage, for the fix brief (#19: no tick to read CI)
 CI_CHECKS: dict[int, list[str]] = {}  # PR -> the names of its real failing checks at the last triage (fix_loop_rounds)
+CI_SIGS: dict[int, list[str]] = {}  # PR -> "check::test-or-det-case" per real failure at the last triage (shared_red)
 
 
 def ci_triage(n: int) -> list[str] | None:
     """ci_digest's triage of PR n's failed checks at its current head (origin/main's ci_digest in TOOLS), or None when
     it cannot be read. [] = nothing failing right now (CI still running, or the label is stale)."""
     CI_CHECKS.pop(n, None)
+    CI_SIGS.pop(n, None)
     try:  # ci_digest exits 1 whenever something failed; its JSON is the answer either way
         r = run([sys.executable, str(TOOLS / "tests" / "tools" / "ci_digest.py"), str(n), "--json"], timeout=300)
         failed = json.loads(r.stdout)["failed"]
@@ -7128,6 +7132,7 @@ def ci_triage(n: int) -> list[str] | None:
                               + (f": {' '.join((f.get('tests') or [])[:3])}" if f.get("tests") else "")
                               + (f", repro `{f['repro']}`" if f.get("repro") else "") for f in failed)[:600]
         CI_CHECKS[n] = sorted({str(f.get("check")) for f in failed if f.get("triage") not in NOISE})
+        CI_SIGS[n] = red_sigs(failed)
         return [f.get("triage") for f in failed]
     except (ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired):
         return None
@@ -7139,6 +7144,147 @@ def mark_flake(state: dict, n: str, head: str, note: str) -> None:
         p = {"number": int(n)}
         state.setdefault("prs", []).append(p)
     p.update(flake_head=head, flake_at=iso(now()), flake_note=note[:200])
+
+
+# 2026-11-03: #7587 (#7486) took 3 fix runs for a det red that was main's: #7585 had left cruc-hc-file-unlock NOT
+# PROVEN on main, and #7593 (#7589) failed det on the same line. ci_digest calls a red `main` only when main's newest
+# commit runs that check and fails it, and det, like other PR-only checks, never runs on main, so the red read `real`
+# on every PR that carried it. The cross-PR reading: when open PRs of SHARED_RED_ISSUES or more different issues fail
+# the same check on the same test or det case within SHARED_RED_H, the red is main's. Those PRs get no fix worker; one
+# "Shared red" issue takes one ci-lane fix, and when that fix merges each waiting PR is updated with main once (no
+# worker). A shared-red issue closed with no merge (main was green after all) marks its signatures not-main for
+# SHARED_RED_H, so a real red of two related PRs goes back to their own fixers instead of looping.
+SHARED_RED_H = float(_CFG.get("shared_red_h", 6))
+SHARED_RED_ISSUES = int(_CFG.get("shared_red_issues", 2))  # 0 turns the rule off
+SHARED_RED_TITLE = "Shared red on PRs"
+ROLLUP_CHECKS = {"det", "ground-truth", "full-suite", "equivalence-e2e", "crucible"}  # ci_digest PARTS: no tests of their own
+
+
+def red_sigs(failed: list[dict]) -> list[str]:
+    """ "check::name" for each failing pytest node id and unproven det case of ci_digest's real (not noise) failures."""
+    return sorted({f"{f.get('check')}::{t}" for f in failed if f.get("triage") not in NOISE
+                   for t in [*(f.get("tests") or []), *(f.get("cases") or [])]})
+
+
+def shared_red(state: dict, n: str, issue: int, head: str, checks: list[str], sigs: list[str], snap: dict) -> dict:
+    """Record PR n's real failing checks and red signatures at its head in the book (state["shared_red"]["prs"]),
+    dropping closed PRs and readings older than SHARED_RED_H, then return shared_for(state, n)."""
+    if SHARED_RED_ISSUES <= 0:
+        return {}
+    book = state.setdefault("shared_red", {})
+    cut = now() - dt.timedelta(hours=SHARED_RED_H)
+    book["prs"] = {p: r for p, r in (book.get("prs") or {}).items() if (t := parse_iso(r.get("at"))) and t > cut
+                   and snap.get(p, {}).get("state") == "open"}
+    nm = book.setdefault("not_main", {})
+    for sg in [sg for sg, t in nm.items() if not ((at := parse_iso(t)) and at > cut)]:
+        nm.pop(sg)
+    book["prs"][str(n)] = {"issue": int(issue), "head": head, "checks": sorted(checks), "sigs": sorted(sigs),
+                           "at": iso(now())}
+    return shared_for(state, n)
+
+
+def shared_for(state: dict, n: str) -> dict:
+    """Is PR n's whole red shared? {} when not, else {"sigs": {sig: [other PRs]}, "entry": its shared-red issue entry or
+    None}. Shared: each signature counted is failed by open PRs of SHARED_RED_ISSUES or more different issues, and every
+    real failing check of PR n has such a signature or is a roll-up of those (ci_digest PARTS)."""
+    book = state.get("shared_red") or {}
+    me = (book.get("prs") or {}).get(str(n))
+    if SHARED_RED_ISSUES <= 0 or not me:
+        return {}
+    nm = book.get("not_main") or {}
+    hits = {}
+    for sg in me["sigs"]:
+        if sg in nm:
+            continue
+        others = sorted((p for p, r in book["prs"].items() if p != str(n) and sg in r.get("sigs", [])
+                         and int(r["issue"]) != int(me["issue"])), key=int)
+        if len({int(book["prs"][p]["issue"]) for p in others} | {int(me["issue"])}) >= SHARED_RED_ISSUES:
+            hits[sg] = others
+    if not hits:
+        return {}
+    shared_checks = {sg.split("::", 1)[0] for sg in hits}
+    if any(c not in shared_checks and c not in ROLLUP_CHECKS for c in me["checks"]):
+        return {}  # a real failure of the PR's own besides the shared one: its fixer still has work
+    entry = next((e for e in book.get("issues", []) if set(e["sigs"]) & set(hits)), None)
+    return {"sigs": hits, "entry": entry}
+
+
+def take_shared(state: dict, n: str, head: str, sh: dict, read=None, update=None, open_issue=None) -> list[str] | None:
+    """PR n's red is shared (sh from shared_for): give it no fix worker. The first such PR opens the one shared-red
+    issue and queues its ci-lane fix. Returns the gate's notes, or None when PR n should be judged as usual."""
+    e = sh["entry"]
+    young = e is not None and (t := parse_iso(e.get("at"))) and now() - t < dt.timedelta(minutes=FIX_SETTLE_MIN)
+    if e is not None and not young and issue_closed(int(e["issue"]), read) is True:
+        return [f"shared:{x}" for x in release_shared_red(state, int(e["issue"]), False, update)]  # main was green
+    if e is None:
+        if not (k := (open_issue or shared_red_issue)(sh["sigs"], n)):
+            return None  # could not open the issue: fix as before
+        e = {"issue": k, "sigs": sorted(sh["sigs"]), "prs": [], "at": iso(now())}
+        state.setdefault("shared_red", {}).setdefault("issues", []).append(e)
+        state.setdefault("queue", []).insert(0, {
+            "issue": k, "model": "sonnet", "needs_owner": False, "lane": "ci", "allow_workflows": True,
+            "auto": "shared-red",
+            "task": (f"{SHARED_RED_TITLE} (#{k}): PRs of different issues fail the same checks on the same tests or "
+                     f"det cases ({'; '.join(sorted(sh['sigs']))[:300]}), so main broke them and the check does not "
+                     f"run on main. First run each repro on a clean origin/main (tests/tools/ci_digest.py on one of "
+                     f"the PRs names it). Red there: find the main commit that broke it and fix main in one PR with "
+                     f"tests that says `Fixes #{k}`. Green there: close #{k} with a comment saying so, and open no PR.")})
+    others = sorted({int(p) for ps in sh["sigs"].values() for p in ps})
+    e["prs"] = sorted({int(x) for x in e.get("prs", [])} | {int(n)} | set(others))
+    e["sigs"] = sorted(set(e["sigs"]) | set(sh["sigs"]))
+    mark_flake(state, n, head, f"gate: shared red, main's (#{e['issue']})")
+    return [f"shared:#{n} -> #{e['issue']} (also on {', '.join(f'#{p}' for p in others)})"]
+
+
+def shared_red_issue(sigs: dict, n: str) -> int | None:
+    """Open the one "Shared red" issue its ci-lane fix runs on; its number or None."""
+    prs = sorted({int(n), *(int(p) for ps in sigs.values() for p in ps)})
+    lines = "\n".join(f"- `{s.split('::', 1)[0]}`: `{s.split('::', 1)[1]}`" for s in sorted(sigs))
+    body = (f"Open PRs of different issues fail the same check on the same test or case, so the red came from main "
+            f"(the check does not run on main, so ci_digest cannot see it there):\n\n{lines}\n\nPRs: "
+            f"{', '.join(f'#{p}' for p in prs)}\n\nchurn gives those PRs no fix worker. One run fixes main here; when "
+            f"its PR merges (`Fixes` this issue) churn updates each waiting PR with main. If main is green for these "
+            f"(the repro passes on origin/main), close this issue with that finding: the PRs go back to their own "
+            f"fixers.")
+    first = sorted(sigs)[0].split("::", 1)
+    r = run(["gh", "api", f"repos/{REPO}/issues", "-f", f"title={SHARED_RED_TITLE}: {first[0]} {first[1]}"[:200],
+             "-f", f"body={body}", "--jq", ".number"])
+    return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else None
+
+
+def issue_closed(n: int, read=None) -> bool | None:
+    try:
+        return ((read or gh_json)(f"repos/{REPO}/issues/{n}") or {}).get("state") == "closed"
+    except (RuntimeError, ValueError, AttributeError):
+        return None
+
+
+def release_shared_red(state: dict, issue: int, merged: bool, update=None) -> list[str]:
+    """Shared-red issue `issue` is done. Merged fix: update each waiting PR with main once (no worker). Closed with no
+    merge: its signatures are not main's for SHARED_RED_H, and the PRs go back to their own fixers."""
+    book = state.get("shared_red") or {}
+    entry = next((e for e in book.get("issues", []) if int(e.get("issue", 0)) == int(issue)), None)
+    if entry is None:
+        return []
+    book["issues"].remove(entry)
+    out = []
+    for p in state.get("prs", []):
+        if isinstance(p, dict) and str(pr_num(p)) in {str(x) for x in entry.get("prs", [])}:
+            head = p.pop("flake_head", None)
+            p.pop("flake_at", None)
+            if merged and p.get("update_tried") != f"shared-red:{issue}":
+                p["update_tried"] = f"shared-red:{issue}"  # once per shared red
+                if (update or update_branch)(pr_num(p)):
+                    if head:
+                        p["updated_from"] = head  # carry_reviews keeps its verdict across GitHub's merge commit
+                    out.append(f"#{pr_num(p)}")
+    for x in entry.get("prs", []):
+        (book.get("prs") or {}).pop(str(x), None)  # their next red, if any, is read afresh
+    if not merged:
+        for sg in entry.get("sigs", []):
+            book.setdefault("not_main", {})[sg] = iso(now())
+    kind = "fixed" if merged else "closed as not main's"
+    return [f"shared red #{issue} {kind}: " + (f"updated with main {', '.join(sorted(out, key=lambda x: int(x[1:])))}" if out else "PRs back to their fixers")]
 
 
 def prune_pr_fixes(state: dict, snap: dict) -> list[str]:
@@ -7468,7 +7614,8 @@ def carry_reviews(state: dict, snap: dict, compare=None) -> list[str]:
     return out
 
 
-def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=None, conflicts=None) -> list[str]:
+def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=None, conflicts=None, read=None,
+                   open_issue=None) -> list[str]:
     """Owner 2026-10-13: #5038/#5041 sat conflicting for hours because a tick with no free slot only logged them and
     stuck_seen then hid them. Any watched open PR that is conflicting (dirty) or shepherd:needs-fix, with no live worker
     on it and no queue item for it, gets a fix item at the FRONT of the queue (key "pr").
@@ -7520,6 +7667,11 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
                         if isinstance(p, dict) and pr_num(p) == int(n):
                             p["clean_head"] = v.get("head")
                 continue
+            if (sigs := CI_SIGS.get(int(n))) and (sh := shared_red(state, n, issue, v.get("head", ""),
+                                                               CI_CHECKS.get(int(n)) or [], sigs, snap)):
+                if (notes := take_shared(state, n, v.get("head", ""), sh, read, update, open_issue)) is not None:
+                    added += notes
+                    continue
             if FIX_LOOP_STOP and entry is not None and (checks := CI_CHECKS.get(int(n))) and (
                     rounds := fix_loop_rounds(entry, int(n), issue, checks)) >= FIX_LOOP_STOP:
                 added.append(hold_fix_loop(entry, n, v, checks, rounds))
@@ -7596,6 +7748,14 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
                                                  **({"rescue": True} if rescue else {}),
                                                  **({"head": v["head"]} if v.get("head") else {})})
         added.append(f"#{n}")
+    for q in list(state.get("queue", [])):  # a later PR (this pass or an earlier one) showed this red is shared
+        r = ((state.get("shared_red") or {}).get("prs") or {}).get(str(q.get("pr")))
+        if (q.get("auto") != "pr-fix" or q.get("rescue") or q.get("regraft") or not r or not q.get("head")
+                or r.get("head") != q["head"] or not (sh := shared_for(state, str(q["pr"])))):
+            continue
+        if (notes := take_shared(state, str(q["pr"]), q["head"], sh, read, update, open_issue)) is not None:
+            state["queue"].remove(q)
+            added = [x for x in added if x != f"#{q['pr']}"] + notes
     return added
 
 
@@ -8748,7 +8908,11 @@ def cmd_tick(a) -> int:
             updated = [x[8:] for x in fixes if x.startswith("updated:")]
             expired = [x[8:] for x in fixes if x.startswith("expired:")]
             ended = [x for x in fixes if x.startswith(("restart:", "closed:"))]
-            fixes = [x for x in fixes if not x.startswith(("noise:", "updated:", "expired:", "restart:", "closed:"))]
+            shared = [x[7:] for x in fixes if x.startswith("shared:")]
+            fixes = [x for x in fixes if not x.startswith(("noise:", "updated:", "expired:", "restart:", "closed:",
+                                                           "shared:"))]
+            if shared:
+                log("shared red is main's (no fix worker on these PRs; one ci-lane fix): " + "; ".join(shared))
             if expired:
                 log("owner parks the owner never answered, judged again (stale -> regraft): " + ", ".join(expired))
             if ended:
