@@ -97,3 +97,27 @@ file tells it so. RSI and experiment launches wait for the reset. Caps (`churn c
 $1.50, `tick_cap_opus` $4, `ticks_per_hour` 3, `tick_day_usd` $25 of ticks per 24 h, plus the lane's `floor_usd` and
 `max_running`. With the switch off, no key, a rate-limit hold, or not enough credit for one tick, a pause behaves as it
 always has. `churn status` and `churn credit` show the switch, its spend, and whether it is running now.
+
+## The solver lane
+
+A token-free lane (owner 2026-11-02; off by default: `churn solver on`). It runs gitgalaxy's
+`tests/tools/strengthen.py` with `tests/tools/branch_solver.py backend` as the input source instead of a model, so new
+equivalence inputs cost no tokens. `churn solver` shows it (`pick` names the next case; `forget CASE`, `set KNOB V`).
+
+- **Gate (each tick, also during a plan pause and on credit ticks).** Off, workers paused, a run already live, the
+  solver's `backend` not on origin/main (the gate's `churn-tools` checkout), no free heavy slot (box GREEN with
+  `free_slots` >= 1), `max_per_day` (6) runs in 24 h, `cooldown_min` (30) since the last, or z3 missing in the config
+  `python` (re-checked every `z3_recheck_h`, 6): it stays quiet and keeps the reason for `churn solver`.
+- **Pick.** Burned-estate call / CICS cases (`estate4_draw.BURNED_NAMES` plus cics-crucible) with open net branch gaps:
+  `det_sweep_coverage/<case>.json` uncovered outcomes minus `infeasible_outcomes/<case>.json`, most gaps first. A case
+  is skipped while its fingerprint (the blobs of its case, coverage and infeasible records and of the solver and
+  strengthen scripts at origin/main) matches its last attempt, so it is tried again only when main changes one of them.
+- **Run (`churn _solver RUN`, detached).** A detached gitgalaxy worktree at that main; strengthen (`--rounds 1
+  --no-mutation`) under `heavy-run.sh`. Covered branches up and the case still proven: the candidate case goes over
+  `case.json` (same indentation), `ladder_refresh.py` refreshes the ledgers, and a DRAFT PR opens (no labels; body =
+  strengthen's report plus the refresh log; a failed refresh is flagged at the top). No PR over the 5-file rule or when
+  a watched PR or live worker holds the same `case.json`. A port that differs on a new input is a port gap: no PR, the
+  owner is told. Every outcome is booked under `solver.attempts`; the worktree goes, and so does the work dir unless a
+  person should look at it.
+- **Host config (optional).** `"solver": {"env": {"CICS_CRUCIBLE_PATH": "..."}}` in the config file adds environment
+  for the run; JAVA_HOME (JDK 17) and the corpora path come from the worker environment.
