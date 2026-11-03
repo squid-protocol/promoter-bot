@@ -38,6 +38,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import statistics
@@ -406,7 +407,7 @@ def normalize_state(state: dict) -> list[str]:
         state["max_workers"] = 2
     for gone in ("promoted_issues", "line_partials", "refill"):  # retired 2026-10-25 (the focus replaced them)
         state.pop(gone, None)
-    for key in ("agy", "features", "usage", "credit", "retro", "conflicts", "goal", "focus"):
+    for key in ("agy", "features", "usage", "credit", "retro", "conflicts", "goal", "focus", "solver"):
         if not isinstance(state.get(key, {}), dict):
             quarantine(key, state[key], "not an object")
             state[key] = {}
@@ -2696,6 +2697,414 @@ def conflict_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
     with edit_state() as st:
         st.setdefault("conflicts", {}).update(last=iso(now()), count=n)
     return did
+
+
+# ---------------------------------------------------------------- solver lane
+# Owner 2026-11-02 ("build all of them"; the plan's tokens are tight): a token-free lane. gitgalaxy's strengthen.py
+# proposes new equivalence inputs for a case's uncovered branches and proves each one alone on the GnuCOBOL oracle; with
+# tests/tools/branch_solver.py as its backend (z3 over the det translator's reading of the program, #4175) no model is
+# asked. The lane picks a burned-estate case with open net branch gaps (det_sweep_coverage's uncovered outcomes minus the
+# case's infeasible_outcomes entries) that it has not tried at the current inputs, runs strengthen in a scratch worktree
+# under heavy-run.sh, and when the branches covered went up and the case still proves, refreshes the ledgers
+# (ladder_refresh.py) and opens a DRAFT PR for review. Every attempt is recorded with a fingerprint of what it read (the
+# case, its coverage and infeasible records, the solver and strengthen scripts at origin/main): a case is tried again
+# only when one of those changes on main. Off by default (`churn solver on`); quiet while main lacks the solver's
+# backend; one run at a time, only with a free heavy slot.
+SOLVER_DEFAULT = {"enabled": False, "max_per_day": 6, "cooldown_min": 30, "timeout_min": 120, "rounds": 1,
+                  "issue": 4175, "z3_recheck_h": 6, "env": {}}
+SOLVER_KNOBS = {"max_per_day": int, "cooldown_min": float, "timeout_min": float, "rounds": int, "issue": int,
+                "z3_recheck_h": float}
+SOLVER_SCRIPT = "tests/tools/branch_solver.py"
+SOLVER_TOOLS = ("tests/tools/branch_solver.py", "tests/tools/strengthen.py")
+SOLVER_KINDS = ("call", "cics")  # the inputs strengthen.py can add (a batch case has none yet)
+SOLVER_BRANCH = "solver/"
+# estate4_draw.BURNED_NAMES (mainframe-evidence-policy.md section 2) plus cics-crucible (owner OK 2026-10-31, #6072), as
+# ladder_refresh.case_problems reads them; the repo's own list wins when it parses
+SOLVER_ESTATES = {"aws-mainframe-modernization-carddemo", "cics-banking-sample-application-cbsa", "cics-genapp", "zecs",
+                  "dbb", "mortgageapplication", "dbb-mortgage-application",
+                  "cics-async-api-credit-card-application-example", "cics-crucible"}
+
+
+def solver_cfg(state: dict) -> dict:
+    """Defaults, then the host config's `solver` section (env, paths), then the knobs set with `churn solver`."""
+    host = {k: v for k, v in (_CFG.get("solver") or {}).items() if k in SOLVER_DEFAULT}
+    mine = {k: v for k, v in (state.get("solver") or {}).items() if k in SOLVER_DEFAULT}
+    return {**SOLVER_DEFAULT, **host, **mine}
+
+
+def solver_missing(root: Path | None = None) -> str | None:
+    """Why the gitgalaxy checkout the gate reads (origin/main) cannot run the lane, or None. The backend subcommand
+    landed after the solver itself (#7577, then #7580): both must be there."""
+    f = (root or TOOLS) / SOLVER_SCRIPT
+    try:
+        text = f.read_text(errors="replace")
+    except OSError:
+        return f"{SOLVER_SCRIPT} is not on main"
+    if "def backend(" not in text:
+        return f"{SOLVER_SCRIPT} on main has no strengthen backend yet"
+    if not ((root or TOOLS) / "tests/tools/strengthen.py").is_file():
+        return "tests/tools/strengthen.py is not on main"
+    return None
+
+
+def solver_estates(root: Path | None = None) -> set[str]:
+    with contextlib.suppress(OSError, SyntaxError, ValueError):
+        tree = ast.parse(((root or TOOLS) / "tests/tools/estate4_draw.py").read_text())
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "BURNED_NAMES" for t in node.targets):
+                return {str(x).lower() for x in ast.literal_eval(node.value)} | {"cics-crucible"}
+    return set(SOLVER_ESTATES)
+
+
+def solver_gaps(root: Path | None = None) -> list[dict]:
+    """Burned-estate call / CICS cases with open net branch gaps, most gaps first:
+    [{"case", "gaps": ["LINE:OUTCOME", ...], "covered", "total"}]. No git, no model: the committed records only."""
+    root = root or TOOLS
+    eq = root / "tests/equivalence"
+    estates, out = solver_estates(root), []
+    for cov_f in sorted((eq / "det_sweep_coverage").glob("*.json")):
+        case = cov_f.stem
+        try:
+            cov = json.loads(cov_f.read_text())
+            spec = json.loads((eq / case / "case.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if str(spec.get("corpus", "")).lower() not in estates or spec.get("kind", "batch") not in SOLVER_KINDS:
+            continue
+        # LINE:OUTCOME entries only; `paragraph:NAME` rows there are paragraphs no run entered, not branch outcomes
+        open_ = [g for g in ((cov.get("uncovered") or {}).get("branches")) or [] if re.match(r"\d+:", str(g))]
+        if not open_:
+            continue
+        stated = set()
+        with contextlib.suppress(OSError, ValueError):
+            for e in json.loads((eq / "infeasible_outcomes" / f"{case}.json").read_text()).get("entries", []):
+                stated.add(f"{e.get('line')}:{e.get('outcome')}")
+        net = [g for g in open_ if g not in stated]
+        if net:
+            br = cov.get("branches") or {}
+            out.append({"case": case, "gaps": net, "covered": br.get("covered"), "total": br.get("total")})
+    out.sort(key=lambda x: (-len(x["gaps"]), x["case"]))
+    return out
+
+
+def solver_fingerprints(cases: list[str], root: Path | None = None) -> dict[str, str]:
+    """{case: a hash of the blobs at the checkout's HEAD that an attempt read}, in one `git ls-tree` call."""
+    root = root or TOOLS
+    paths = [*SOLVER_TOOLS, *(p for c in cases for p in (f"tests/equivalence/{c}/case.json",
+                                                         f"tests/equivalence/det_sweep_coverage/{c}.json",
+                                                         f"tests/equivalence/infeasible_outcomes/{c}.json"))]
+    r = run(["git", "-C", str(root), "ls-tree", "HEAD", "--", *paths], timeout=60)
+    blobs = {}
+    for line in r.stdout.splitlines():
+        with contextlib.suppress(ValueError):
+            meta, path = line.split("\t", 1)
+            blobs[path] = meta.split()[2]
+    tools = "|".join(blobs.get(p, "-") for p in SOLVER_TOOLS)
+    out = {}
+    for c in cases:
+        parts = [blobs.get(p, "-") for p in (f"tests/equivalence/{c}/case.json",
+                                             f"tests/equivalence/det_sweep_coverage/{c}.json",
+                                             f"tests/equivalence/infeasible_outcomes/{c}.json")]
+        out[c] = hashlib.sha1(f"{tools}|{'|'.join(parts)}".encode()).hexdigest()[:16]
+    return out
+
+
+def solver_pick(state: dict, root: Path | None = None) -> dict | None:
+    """The case to try next: most net gaps first, skipping a case already tried at the same inputs."""
+    gaps = solver_gaps(root)
+    if not gaps:
+        return None
+    keys = solver_fingerprints([g["case"] for g in gaps], root)
+    tried = (state.get("solver") or {}).get("attempts") or {}
+    for g in gaps:
+        if (tried.get(g["case"]) or {}).get("key") != keys[g["case"]]:
+            return {**g, "key": keys[g["case"]]}
+    return None
+
+
+def solver_live(state: dict) -> dict | None:
+    """The running attempt, while it lives. A run whose pid systemd did not report counts as live for its time cap."""
+    r = (state.get("solver") or {}).get("running")
+    if not r:
+        return None
+    if r.get("pid"):
+        return r if pid_alive(r.get("pid")) else None
+    t, cap = parse_iso(r.get("t")), float(solver_cfg(state)["timeout_min"]) * 2 + 15
+    return r if t and now() - t < dt.timedelta(minutes=cap) else None
+
+
+def solver_history(state: dict, hours: float) -> list[dict]:
+    cut = now() - dt.timedelta(hours=hours)
+    return [h for h in (state.get("solver") or {}).get("history", []) if (t := parse_iso(h.get("t"))) and t > cut]
+
+
+def solver_hold(state: dict, b: dict) -> str | None:
+    """Why the lane does not start a run now, cheapest check first; None = go. Never reads git, GitHub or a model."""
+    cfg, s = solver_cfg(state), state.get("solver") or {}
+    if not cfg["enabled"]:
+        return "off (`churn solver on`)"
+    if state.get("workers_paused"):
+        return f"workers paused: {state['workers_paused']}"
+    if r := solver_live(state):
+        return f"running {r.get('run_id')} ({r.get('case')})"
+    if why := solver_missing():
+        return why
+    if b.get("verdict") != "GREEN" or int(b.get("free_slots", 0)) < 1:
+        return f"no free heavy slot (box {b.get('verdict')}, {b.get('free_slots', 0)} free)"
+    recent = solver_history(state, 24)
+    if len(recent) >= int(cfg["max_per_day"]):
+        return f"{len(recent)} runs in 24 h (max_per_day {cfg['max_per_day']})"
+    last = max((t for h in recent if (t := parse_iso(h.get("t")))), default=None)
+    if last and now() - last < dt.timedelta(minutes=float(cfg["cooldown_min"])):
+        return f"cooldown until {iso(last + dt.timedelta(minutes=float(cfg['cooldown_min'])))}"
+    if (z := parse_iso(s.get("z3_missing"))) and now() - z < dt.timedelta(hours=float(cfg["z3_recheck_h"])):
+        return f"z3 missing in {SELFSCAN_PY} (`pip install -e .[solver]`); next check {iso(z + dt.timedelta(hours=float(cfg['z3_recheck_h'])))}"
+    return None
+
+
+def solver_z3() -> bool:
+    return run([SELFSCAN_PY, "-c", "import z3"], timeout=120).returncode == 0
+
+
+def solver_record(st: dict, case: str, key: str, outcome: str, rid: str, **extra) -> None:
+    s = st.setdefault("solver", {})
+    entry = {"t": iso(now()), "key": key, "outcome": outcome, "run_id": rid,
+             **{k: v for k, v in extra.items() if v is not None}}
+    s.setdefault("attempts", {})[case] = entry
+    s["history"] = (s.get("history") or [])[-49:] + [{"case": case, **entry}]
+    if (s.get("running") or {}).get("run_id") == rid:
+        s["running"] = None
+
+
+def solver_lane(b: dict, snap: dict, dry_run: bool = False, spawn=None) -> list[str]:
+    """At most one solver run: picks a case and starts `churn _solver RUN` detached. Token-free; it takes a heavy slot
+    (heavy-run.sh), never a Claude worker slot."""
+    state = load_state()
+    s = state.get("solver") or {}
+    if (r := s.get("running")) and not solver_live(state) and not dry_run:
+        with edit_state() as st:  # the runner died before it recorded: book it, so the case is not retried at once
+            solver_record(st, r.get("case", "?"), r.get("key", ""), "crashed", r.get("run_id", "?"))
+        log(f"solver: {r.get('run_id')} ({r.get('case')}) ended without a record; booked as crashed")
+        state = load_state()
+    hold = solver_hold(state, b)
+    if hold:
+        if s.get("hold") != hold and not dry_run and solver_cfg(state)["enabled"]:
+            with edit_state() as st:  # the reason is kept for `churn solver`; a change is logged quietly, once
+                st.setdefault("solver", {})["hold"] = hold
+            log(f"solver lane held: {hold}", quiet=True)
+        return []
+    pick = solver_pick(state)
+    if not pick:
+        return []
+    desc = f"solver run on {pick['case']} ({len(pick['gaps'])} net branch gaps, {pick['covered']}/{pick['total']})"
+    if dry_run:
+        return [desc]
+    if not solver_z3():
+        with edit_state() as st:
+            st.setdefault("solver", {})["z3_missing"] = iso(now())
+        log(f"solver lane: z3 is not importable in {SELFSCAN_PY} (the gitgalaxy `solver` extra); held "
+            f"{solver_cfg(state)['z3_recheck_h']} h")
+        return []
+    rid = f"solver-{re.sub(r'[^A-Za-z0-9-]', '-', pick['case'])}-{now().strftime('%Y%m%dT%H%MZ')}"
+    rd = RUNS / rid
+    rd.mkdir(parents=True, exist_ok=True)
+    base = run(["git", "-C", str(TOOLS), "rev-parse", "HEAD"]).stdout.strip()
+    (rd / "meta.json").write_text(json.dumps({**pick, "run_id": rid, "base": base, "lane": "solver",
+                                              "worktree": str(WT / rid)}, indent=1))
+    cfg = solver_cfg(state)
+    pid = (spawn or spawn_detached)(f"churn-{rid}", [sys.executable, SELF, "_solver", rid], TICK_CWD, rd / "launcher.log",
+                                    [f"RuntimeMaxSec={int(float(cfg['timeout_min']) * 2 * 60 + 900)}"])
+    with edit_state() as st:
+        so = st.setdefault("solver", {})
+        so["running"] = {"run_id": rid, "pid": pid, "case": pick["case"], "key": pick["key"], "t": iso(now())}
+        so.pop("hold", None)
+    return [desc]
+
+
+def solver_verdict(res: dict) -> tuple[str, int | None, int | None, int | None]:
+    """(outcome, covered before, covered after, total) from strengthen.json: `gain` (more branches, still proven),
+    `port differs` (more branches, but the port differs on a new input: a port gap for a person), or `no gain`."""
+    cb, ca = res.get("coverage_before") or {}, res.get("coverage_after") or {}
+    before, after, total = cb.get("covered"), ca.get("covered"), ca.get("total") or cb.get("total")
+    if before is None or after is None or after <= before or not res.get("accepted"):
+        return "no gain", before, after, total
+    if not res.get("proven_after"):
+        return "port differs", before, after, total
+    return "gain", before, after, total
+
+
+def solver_env(cfg: dict) -> dict:
+    env = {**os.environ, **{k: WORKER_ENV[k] for k in ("JAVA_HOME", "JDK_17", "GITGALAXY_MAINFRAME_CORPORA")},
+           **{str(k): str(v) for k, v in (cfg.get("env") or {}).items()}}
+    env["PATH"] = f"{Path(SELFSCAN_PY).parent}:{env.get('PATH', '/usr/bin:/bin')}"  # heavy-run.sh execs `python`
+    return env
+
+
+def _run_group(cmd: list[str], cwd: Path, env: dict, logfile: Path, timeout_s: float) -> int:
+    """Run cmd in its own process group, output to logfile; on timeout the whole group is killed (rc 124)."""
+    with open(logfile, "w") as fh:
+        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        try:
+            return p.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(p.pid, 15)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                p.wait(timeout=60)
+            with contextlib.suppress(OSError):
+                os.killpg(p.pid, 9)
+            return 124
+
+
+def solver_case_text(candidate: dict, original: str) -> str:
+    """The candidate case in the committed file's own indentation, so the diff is the new inputs only."""
+    m = re.search(r"\n( +)\"", original)
+    return json.dumps(candidate, indent=len(m.group(1)) if m else 1, ensure_ascii=False) + "\n"
+
+
+def solver_tail(path: Path, n: int = 40) -> str:
+    with contextlib.suppress(OSError):
+        return "\n".join(path.read_text(errors="replace").splitlines()[-n:])
+    return ""
+
+
+def solver_work(rid: str) -> Path:
+    """strengthen's work directory (proof runs: large). Kept only when a person should look at it."""
+    return Path(scratch_cfg(load_state())["path"]) / "solver" / rid
+
+
+def solver_attempt(meta: dict, rd: Path, cfg: dict) -> tuple[str, dict]:
+    """The run itself (no model): strengthen with the solver backend, then on a gain the ledger refresh and the draft
+    PR. Returns (outcome, details)."""
+    case, rid, wt = meta["case"], meta["run_id"], Path(meta["worktree"])
+    r = run(["git", "-C", str(V6), "worktree", "add", "-q", "--detach", str(wt), meta.get("base") or "origin/main"])
+    if r.returncode:
+        return "error", {"detail": f"worktree add: {r.stderr.strip()[:200]}"}
+    env, timeout_s = solver_env(cfg), float(cfg["timeout_min"]) * 60
+    work = solver_work(rid)
+    work.parent.mkdir(parents=True, exist_ok=True)
+    backend = (f"{shlex.quote(SELFSCAN_PY)} tests/tools/branch_solver.py backend {shlex.quote(case)} {{prompt_file}} "
+               "--work {prompt_dir}/solver")
+    rc = _run_group([str(wt / "tests/tools/box/heavy-run.sh"), SELFSCAN_PY, "tests/tools/strengthen.py", "run", case,
+                     "--work", str(work), "--rounds", str(int(cfg["rounds"])), "--no-mutation",
+                     "--backend-command", backend], wt, env, rd / "strengthen.log", timeout_s)
+    for name in ("strengthen.json", "strengthen.md", "candidate_case.json"):
+        with contextlib.suppress(OSError):
+            shutil.copy2(work / name, rd / name)
+    try:
+        res = json.loads((work / "strengthen.json").read_text())
+    except (OSError, ValueError):
+        return "error", {"detail": f"strengthen rc {rc}, no strengthen.json: {solver_tail(rd / 'strengthen.log', 3)}"[:300]}
+    outcome, before, after, total = solver_verdict(res)
+    info = {"before": before, "after": after, "total": total, "accepted": len(res.get("accepted") or [])}
+    if outcome != "gain":
+        return outcome, info
+    case_f = wt / "tests/equivalence" / case / "case.json"
+    case_f.write_text(solver_case_text(json.loads((work / "candidate_case.json").read_text()), case_f.read_text()))
+    rrc = _run_group([SELFSCAN_PY, "tests/tools/ladder_refresh.py", case, "--work", str(work / "refresh")], wt, env,
+                     rd / "refresh.log", timeout_s)
+    files = sorted({line[3:].split(" -> ")[-1].strip()
+                    for line in run(["git", "-C", str(wt), "status", "--porcelain"]).stdout.splitlines() if line[3:]})
+    hand = hand_written(files)
+    if FILE_CAP and len(hand) > FILE_CAP:
+        return "over file cap", {**info, "detail": f"{len(hand)} hand-written files: {', '.join(hand[:8])}"}
+    target = f"tests/equivalence/{case}/case.json"
+    if held := [who for who, fs in inflight_files(rid).items() if target in fs]:
+        return "held", {**info, "detail": f"{target} is in flight in {', '.join(held)}"}
+    branch = f"{SOLVER_BRANCH}{case}-{now().strftime('%Y%m%dT%H%MZ').lower()}"
+    title = (f"{case}: solver inputs, branches {before}/{total} -> {after}/{total}"
+             + (f" (Part of #{cfg['issue']})" if cfg.get("issue") else ""))
+    for cmd in (["git", "checkout", "-q", "-b", branch], ["git", "add", "--", *files],
+                ["git", "commit", "-q", "-m", title + "\n\nInputs from strengthen.py with the branch solver as its backend "
+                 "(promoter-bot's solver lane, no model); each proven alone on the GnuCOBOL oracle."],
+                ["git", "push", "-q", "-u", "origin", branch]):
+        r = run(cmd, cwd=wt, timeout=300)
+        if r.returncode:
+            return "error", {**info, "detail": f"{cmd[1]}: {(r.stderr or r.stdout).strip()[:200]}"}
+    refresh = ("The ledger refresh passed (`tests/tools/ladder_refresh.py`):" if rrc == 0 else
+               f"**The ledger refresh FAILED (rc {rrc}): this PR needs a hand before review.** Its log ends:")
+    report = ""
+    with contextlib.suppress(OSError):
+        report = (work / "strengthen.md").read_text(errors="replace")
+    body = (f"Opened by promoter-bot's solver lane: `strengthen.py run {case} --rounds {int(cfg['rounds'])} "
+            "--no-mutation` with `tests/tools/branch_solver.py backend` as the input source, so no model wrote these "
+            "inputs. Each new input was proven alone on the GnuCOBOL oracle and the strengthened case was proven "
+            "whole; the expected results come from the COBOL. Review the inputs, then mark ready.\n\n"
+            f"{report}\n## Ledger refresh\n\n{refresh}\n\n```\n{solver_tail(rd / 'refresh.log')}\n```\n"
+            + (f"\nPart of #{cfg['issue']}\n" if cfg.get("issue") else ""))
+    (rd / "pr-body.md").write_text(body)
+    r = run(["gh", "pr", "create", "--repo", REPO, "--draft", "--base", "main", "--head", branch, "--title", title,
+             "--body-file", str(rd / "pr-body.md")], cwd=wt, timeout=120)
+    m = re.search(r"/pull/(\d+)", r.stdout)
+    if not m:
+        return "error", {**info, "detail": f"gh pr create: {(r.stderr or r.stdout).strip()[:200]}", "branch": branch}
+    return "pr", {**info, "pr": int(m.group(1)), "branch": branch, "refresh_rc": rrc}
+
+
+def cmd_solver_run(a) -> int:
+    """`churn _solver RUN_ID` (detached): one solver attempt, then the record, the worktree removed and the log line."""
+    rd = RUNS / a.run_id
+    meta = json.loads((rd / "meta.json").read_text())
+    cfg = solver_cfg(load_state())
+    try:
+        outcome, info = solver_attempt(meta, rd, cfg)
+    except Exception as e:  # noqa: BLE001 -- the attempt must still be booked
+        outcome, info = "error", {"detail": f"{type(e).__name__}: {e}"[:300]}
+    with contextlib.suppress(Exception):
+        run(["git", "-C", str(V6), "worktree", "remove", "--force", meta["worktree"]], timeout=120)
+    if outcome in ("no gain", "pr"):  # the report, candidate and logs are in the run dir; port gaps and errors keep it
+        shutil.rmtree(solver_work(a.run_id), ignore_errors=True)
+    (rd / "result.json").write_text(json.dumps({"outcome": outcome, **info}, indent=1))
+    with edit_state() as st:
+        solver_record(st, meta["case"], meta["key"], outcome, a.run_id, **{k: info.get(k) for k in
+                      ("before", "after", "total", "pr", "detail")})
+    cov = f"{info.get('before')}/{info.get('total')} -> {info.get('after')}/{info.get('total')}"
+    log(f"solver: {a.run_id} {meta['case']} {outcome} ({cov})" + (f": draft PR #{info['pr']}" if info.get("pr") else "")
+        + (f": {info['detail']}" if info.get("detail") else ""), quiet=outcome == "no gain")
+    if outcome in ("pr", "port differs"):
+        notify(f"solver-{a.run_id}", f"churn: solver {outcome} on {meta['case']}",
+               (f"draft PR #{info['pr']} ({cov})" if info.get("pr") else
+                f"branches {cov}, but the port differs on a new input: a port gap. Report: {rd / 'strengthen.md'}"),
+               cooldown_h=0, tags="mag")
+    return 0
+
+
+def cmd_solver(a) -> int:
+    """`churn solver` (status), `on`, `off`, `pick` (the next case and why, no launch), `forget CASE` (try it again),
+    `set KNOB V`."""
+    if a.action in ("on", "off", "forget", "set"):
+        with edit_state() as st:
+            s = st.setdefault("solver", {})
+            if a.action in ("on", "off"):
+                s["enabled"] = a.action == "on"
+                s.pop("hold", None)
+                s.pop("z3_missing", None)
+            elif a.action == "forget":
+                if not a.key:
+                    raise SystemExit("solver forget CASE")
+                (s.get("attempts") or {}).pop(a.key, None)
+            else:
+                if a.key not in SOLVER_KNOBS or a.value is None:
+                    raise SystemExit(f"solver set: one of {sorted(SOLVER_KNOBS)} and a value")
+                s[a.key] = SOLVER_KNOBS[a.key](a.value)
+        log(f"[owner] solver {a.action}" + (f" {a.key}" if a.key else "") + (f" {a.value}" if a.value else ""))
+    state = load_state()
+    cfg, s = solver_cfg(state), state.get("solver") or {}
+    print(f"solver lane: {'on' if cfg['enabled'] else 'off'}; max {cfg['max_per_day']}/24 h, cooldown "
+          f"{cfg['cooldown_min']} min, timeout {cfg['timeout_min']} min, rounds {cfg['rounds']}, issue #{cfg['issue']}")
+    print(f"solver on main: {solver_missing() or 'yes'}; running: {(s.get('running') or {}).get('run_id') or 'none'}; "
+          f"last hold: {s.get('hold') or '-'}")
+    if a.action == "pick" or a.action == "status":
+        gaps = solver_gaps()
+        pick = solver_pick(state) if gaps else None
+        print(f"cases with open net gaps: {len(gaps)}; next: "
+              + (f"{pick['case']} ({len(pick['gaps'])} gaps: {', '.join(pick['gaps'][:6])})" if pick else "none untried"))
+    for h in (s.get("history") or [])[-10:]:
+        print(f"  {h.get('t')} {h.get('case')}: {h.get('outcome')}"
+              + (f" {h.get('before')}->{h.get('after')}/{h.get('total')}" if h.get("before") is not None else "")
+              + (f" PR #{h['pr']}" if h.get("pr") else "") + (f" ({h['detail'][:120]})" if h.get("detail") else ""))
+    return 0
 
 
 # ---------------------------------------------------------------- experiments
@@ -8234,10 +8643,12 @@ def cmd_tick(a) -> int:
                 log(f"credit ticks held: {ct[1]}", quiet=True)
             did = []
             agy_items = any(q.get("backend") == "agy" for q in state.get("queue", []))
-            if agy_items or credit_ready(state, True)[0]:
+            solver_on = solver_cfg(state)["enabled"]  # token-free: a plan pause is the solver lane's best time
+            if agy_items or solver_on or credit_ready(state, True)[0]:
                 refresh_tools()
                 b, snap = box(), (json.loads(SNAP.read_text()) if SNAP.exists() else {})
                 did = (lanes(b, snap, True, a.dry_run) if agy_items else []) + credit_lane(b, snap, True, a.dry_run)
+                did += solver_lane(b, snap, a.dry_run) if solver_on else []
             log(f"paused until {iso(paused)}" + (f"; lanes: {', '.join(did)}" if did else ""), quiet=not did)
             if a.dry_run:
                 print(json.dumps({"paused_until": iso(paused), "lanes": did}, indent=1))
@@ -8378,6 +8789,7 @@ def cmd_tick(a) -> int:
         if direct := direct_launches(b, snap, a.dry_run):  # on credit: cmd_worker puts these on the credit lane
             did += [f"direct launch {d}" for d in direct]
         did += credit_lane(b, snap, on_credit, a.dry_run)  # when=always, or credit about to expire, or the pause
+        did += solver_lane(b, snap, a.dry_run)  # no model: runs on credit ticks too; off unless `churn solver on`
         if not on_credit:  # a credit pause keeps launches to the review/merge loop: RSI and experiments wait
             did += retro_lane(b, snap, a.dry_run)  # the RSI lane: always on, whatever the focus
             did += conflict_lane(b, snap, a.dry_run)
@@ -9228,6 +9640,11 @@ def cmd_status(a) -> int:
         print(f"credit lane: ${credit_balance(state)['balance']:.2f} left; {'launches next tick' if ok else why}")
         print(credit_ticks_line(state))
     print(f"RSI lane: retro: {retro_due(state)[1]}; conflicts: {conflict_due(state)[1]}")
+    so = state.get("solver") or {}
+    print(f"solver lane: {'on' if solver_cfg(state)['enabled'] else 'off'}"
+          + (f"; running {so['running'].get('case')}" if solver_live(state) else
+             f"; {so['hold']}" if so.get("hold") and solver_cfg(state)["enabled"] else "")
+          + f"; {len(solver_history(state, 24))} runs in 24 h (`churn solver`)")
     if gq := state.get("gh_quota"):
         print(f"GitHub API: {gq.get('remaining')}/{gq.get('limit')} left, resets "
               f"{iso(dt.datetime.fromtimestamp(gq.get('reset', 0), dt.timezone.utc))}, burn "
@@ -10032,6 +10449,13 @@ def main() -> int:
     rs.add_argument("job", nargs="?")
     rs.add_argument("key", nargs="?")
     rs.add_argument("value", nargs="?")
+    sv = sub.add_parser("solver", help="the token-free solver lane (strengthen.py + branch_solver.py -> draft PRs): "
+                                       "status (default) / on / off / pick / forget CASE / set KNOB V")
+    sv.add_argument("action", nargs="?", default="status", choices=["status", "on", "off", "pick", "forget", "set"])
+    sv.add_argument("key", nargs="?")
+    sv.add_argument("value", nargs="?")
+    svr = sub.add_parser("_solver")
+    svr.add_argument("run_id")
     rt = sub.add_parser("retro", help="weekly retro: status (default) / now / on / off / set KEY V / size FILE KB")
     rt.add_argument("action", nargs="?", default="status", choices=["status", "now", "on", "off", "set", "size"])
     rt.add_argument("key", nargs="?")
@@ -10151,6 +10575,10 @@ def main() -> int:
         return cmd_retro(a)
     if a.cmd == "rsi":
         return cmd_rsi(a)
+    if a.cmd == "solver":
+        return cmd_solver(a)
+    if a.cmd == "_solver":
+        return cmd_solver_run(a)
     if a.cmd == "poll":
         return cmd_poll(a)
     if a.cmd == "sync":
