@@ -8294,10 +8294,12 @@ def goal_measure(reports: list[dict], issues: list[dict]) -> dict:
     """Programs per level, and every program that does not translate whole (L0) with the open issues that name it.
     `untracked` = L0 programs no open issue mentions: nobody is working on them. `below` = {estate: [[program, level]]}
     for the programs at L1-L3, which the ladder refill slices by estate (ladder_group). `source_defects` = L0 programs
-    the report names as source IBM rejects (owner 2026-10-31: settled): they keep their level but are nobody's work."""
+    the report names as source IBM rejects (owner 2026-10-31: settled): they keep their level but are nobody's work.
+    `refused_by_design` = L0 programs the report names as outside what the port proves (owner 2026-11-03, #5106,
+    gitgalaxy ladder_exclusions.py): settled the same way, listed apart."""
     levels: collections.Counter = collections.Counter()
     texts = [(i["number"], f"{i.get('title', '')}\n{i.get('body') or ''}".lower()) for i in issues]
-    untranslated, defects, below = [], [], collections.defaultdict(list)
+    untranslated, defects, by_design, below = [], [], [], collections.defaultdict(list)
     for rep in reports:
         for p in rep.get("programs") or []:
             lv = str(p.get("level") or "?").rstrip("*")
@@ -8308,9 +8310,10 @@ def goal_measure(reports: list[dict], issues: list[dict]) -> dict:
             if lv != "L0":
                 continue
             excl = p.get("ladder_exclusion") or {}
-            if excl.get("kind") == "source_defect":
-                defects.append({"estate": Path(rep["file"]).parent.name, "program": p.get("program"),
-                                "reason": str(excl.get("reason") or "")[:120], "issue": excl.get("issue")})
+            if excl.get("kind") in ("source_defect", "refused_by_design"):
+                (defects if excl["kind"] == "source_defect" else by_design).append({
+                    "estate": Path(rep["file"]).parent.name, "program": p.get("program"),
+                    "reason": str(excl.get("reason") or "")[:120], "issue": excl.get("issue")})
                 continue
             t = p.get("translation") or {}
             stem = Path(str(p.get("program", ""))).stem.lower()
@@ -8320,16 +8323,18 @@ def goal_measure(reports: list[dict], issues: list[dict]) -> dict:
                                  "classes": [str(c)[:120] for c in (t.get("gap_classes") or [])[:4]], "issues": hits})
     return {"t": iso(now()), "programs": sum(levels.values()), "levels": dict(sorted(levels.items())),
             "untranslated": untranslated, "untracked": [u["program"] for u in untranslated if not u["issues"]],
-            "source_defects": defects, "below": {e: sorted(ps) for e, ps in sorted(below.items())}}
+            "source_defects": defects, "refused_by_design": by_design, "below": {e: sorted(ps) for e, ps in sorted(below.items())}}
 
 
 def goal_summary(m: dict) -> str:
     lv = " ".join(f"{k} {v}" for k, v in (m.get("levels") or {}).items())
     holes = sum(int(u.get("holes") or 0) for u in m.get("untranslated", []))
     defects = len(m.get("source_defects") or [])
+    by_design = len(m.get("refused_by_design") or [])
     return (f"{m.get('programs', 0)} programs: {lv}; {len(m.get('untranslated', []))} not translated whole "
             f"({holes} holes), {len(m.get('untracked', []))} with no open issue"
-            + (f"; {defects} named source defects" if defects else ""))
+            + (f"; {defects} named source defects" if defects else "")
+            + (f"; {by_design} refused by design" if by_design else ""))
 
 
 def goal_tick(state: dict, force: bool = False) -> list[str]:
@@ -8480,6 +8485,8 @@ def cmd_goal(a) -> int:
               + (", ".join(f"#{n}" for n in u["issues"]) or "NO ISSUE"))
     for d in m.get("source_defects") or []:
         print(f"  source defect {d['estate']} {d['program']} ({d.get('issue')}): {d.get('reason')}")
+    for d in m.get("refused_by_design") or []:
+        print(f"  refused by design {d['estate']} {d['program']} ({d.get('issue')}): {d.get('reason')}")
     return 0
 
 
