@@ -5672,3 +5672,55 @@ def test_the_rescue_run_books_its_cost_and_reports_to_the_owner(churn, monkeypat
     assert st["rescue"]["finished"] and st["usage"]["log"][-1]["model"] == "orchestrator-rescue-opus"
     assert sent == [("churn: rescue report", "CAUSE: hollow focus\nRUNNING NOW: #4108")]
     assert churn.last_worker_activity(st) is None  # the rescue is not a worker
+
+
+def test_a_dry_ladder_family_is_not_requeued_until_something_moves(churn, monkeypatch):
+    """2026-11-03: each new measure requeued commarea-mismatch; 4 runs in a row said "no data-only lift" (no PR)."""
+    f = _focus(churn, monkeypatch, ladder={"anchor": 6072, "skip": []})
+    below = {"cics-crucible/commarea-mismatch": [["CAADSB", "L2"], ["CAGMZ", "L1"]], "zecs": [["ZECS001", "L1"]]}
+    st = {"queue": [], "running": [], "prs": [], "focus": f, "goal": {"measure": {"t": "2026-11-03T09:32Z", "below": below}}}
+    fam = churn.ladder_mark_dry(st, "[ladder:cics-crucible/commarea-mismatch] ladder slice of #6072", "6072-a")
+    assert fam == "cics-crucible/commarea-mismatch"
+    assert churn.ladder_mark_dry(st, "Fix _same_commarea comparing PIC X fields", "6072-b") is None  # not a ladder task
+    st["goal"]["measure"]["t"] = churn.iso(churn.now() + churn.dt.timedelta(minutes=1))  # a newer measure, same levels
+    assert [x["task"].split("]")[0] for x in churn.ladder_items(st, {})] == ["[ladder:zecs"]
+    st["queue"] = []
+    st["goal"]["measure"] = {"t": churn.iso(churn.now() + churn.dt.timedelta(minutes=2)),
+                             "below": {**below, "cics-crucible/commarea-mismatch": [["CAGMZ", "L1"]]}}  # CAADSB lifted
+    assert "[ladder:cics-crucible/commarea-mismatch" in [x["task"].split("]")[0] for x in churn.ladder_items(st, {})]
+    churn.ladder_mark_dry(st, "[ladder:zecs] slice", "6072-c")
+    st["focus"]["ladder_dry"]["zecs"]["t"] = churn.iso(churn.now() - churn.dt.timedelta(hours=churn.LADDER_DRY_H + 1))
+    assert churn.ladder_dry(st, "zecs", [["ZECS001", "L1"]]) is None  # expired: try again
+
+
+def test_a_prerequisite_merge_clears_the_dry_marks(churn, monkeypatch):
+    f = _focus(churn, monkeypatch, ladder={"anchor": 6072},
+               prereqs=[{"issue": 7589, "for": 6072, "reason": "harness gaps", "t": churn.iso(churn.now())}])
+    st = {"focus": f, "prs": [{"number": 7594, "issue": 7589}, {"number": 7600, "issue": 4242}],
+          "goal": {"measure": {"t": "2026-11-03T09:32Z", "below": {"zecs": [["ZECS001", "L1"]]}}}}
+    churn.ladder_mark_dry(st, "[ladder:zecs] slice", "6072-a")
+    churn.settle_closed(st, {"7600": pr(state="merged", merged=True, branch="churn/4242-x")})
+    assert st["focus"].get("ladder_dry")  # not a prerequisite of the anchor: kept
+    notes = churn.settle_closed(st, {"7594": pr(state="merged", merged=True, branch="churn/7589-x")})
+    assert "ladder_dry" not in st["focus"] and st["goal"]["measure_due"]
+    assert any("dry marks cleared" in n for n in notes)
+
+
+def test_reap_marks_a_prless_commitless_ladder_run_dry(churn, monkeypatch):
+    f = _focus(churn, monkeypatch, ladder={"anchor": 6072})
+    below = {"zecs": [["ZECS001", "L1"]]}
+    for rid, found_pr, changed in (("6072-a", None, False), ("6072-b", 7599, True), ("6072-c", None, True)):
+        rd = churn.RUNS / rid
+        rd.mkdir(parents=True)
+        (rd / "meta.json").write_text(json.dumps({"worktree": str(rd), "branch": f"churn/{rid}", "issue": 6072,
+                                                  "model": "sonnet", "task": "[ladder:zecs] ladder slice of #6072"}))
+        (rd / "exit").write_text("0\n")
+        (rd / "out.json").write_text(json.dumps({"result": "no PR", "session_id": "s"}))
+        monkeypatch.setattr(churn, "worktree_pr", lambda wt, issue=None, p=found_pr, r=rid: (f"churn/{r}", p))
+        monkeypatch.setattr(churn, "own_commits", lambda wt, head, c=changed: c)
+        monkeypatch.setattr(churn, "own_hand_commits", lambda wt, head: False)
+        st = {"prs": [], "focus": {**f}, "goal": {"measure": {"t": "2026-11-03T09:32Z", "below": below}},
+              "running": [{"run_id": rid, "pid": 0, "issue": 6072, "model": "sonnet"}]}
+        churn.reap(st)
+        dry = (st["focus"].get("ladder_dry") or {}).get("zecs")
+        assert bool(dry) == (rid == "6072-a"), rid  # a PR or a commit is progress: no mark

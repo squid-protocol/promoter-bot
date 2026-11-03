@@ -3521,6 +3521,10 @@ def reap(state: dict) -> list[dict]:
                     meta["hand_changed"] = hand
         meta.update(session_id=out.get("session_id"), status=status, cost_usd=round(cost, 2), finished=iso(now()), pr=pr,
                     session_cost_usd=round(session_cost, 4))
+        if status == "done" and not pr and not meta.get("code_changed") and not meta.get("repo") and not meta.get("pr"):
+            if fam := ladder_mark_dry(state, meta.get("task") or r.get("task"), rid):
+                log(f"ladder: {fam} marked dry by {rid} (no PR, no commit): no requeue until its levels move, "
+                    f"a prerequisite PR merges, or {LADDER_DRY_H:g} h")
         if pr and not meta.get("repo") and all(pr_num(p) != pr for p in state.get("prs", [])):
             # 2026-10-16 audit: only the model's `pr watch` made a PR visible; a review that skipped it left the PR with no
             # fix items, review needs or followups
@@ -3825,6 +3829,12 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
         if v.get("merged") and owner:
             with contextlib.suppress(Exception):  # #30: a merged slice retires queued items it already did
                 notes += drop_merged_covered(state, int(owner), n)
+            anchor = ladder_anchor(state)
+            if anchor and (focus_cfg(state).get("ladder_dry")) and int(owner) in {
+                    int(x.get("issue", 0)) for x in focus_prereqs(state) if int(x.get("for", 0)) == int(anchor)}:
+                state["focus"].pop("ladder_dry", None)  # a named gap may have closed: every family may slice again
+                state.setdefault("goal", {})["measure_due"] = True
+                notes.append(f"ladder dry marks cleared: prerequisite #{owner} of #{anchor} merged #{n}")
         if v.get("merged") and owner and checks and not v.get("closes") and (
                 note := "; ".join(x for c in checks if (x := settle_check(state, int(owner), n, *c)))):
             notes.append(note)  # the box records it: no followup for the tick
@@ -7799,6 +7809,32 @@ def goal_need(state: dict) -> str:
 # the goal measure) and no ladder item queued, running or in an open PR; an estate is queued again only after a newer
 # measure. It is the focus's own generator: the one refill left while a focus is set.
 LADDER_TAG = "[ladder:{}]"
+# 2026-11-03: the refill requeued every family below L4 on each new measure, and a measure lands after most merges (6
+# refills by 16Z). commarea-mismatch ran 4 times and condition-handling twice, each time "no data-only lift, needs harness
+# code": 7 of 46 runs produced no PR. A ladder run that ends with no PR and no commit marks its family DRY with the
+# family's programs and levels then. The refill skips a dry family until those change, a PR of a focus prerequisite of
+# the anchor merges (where the named harness gaps go, e.g. #7589), or LADDER_DRY_H passes.
+LADDER_DRY_H = float(_CFG.get("ladder_dry_h", 24))
+
+
+def ladder_mark_dry(state: dict, task: object, run_id: str) -> str | None:
+    """Mark the ladder family a finished, PR-less, commit-less run worked on as dry (focus.ladder_dry). Returns it."""
+    below = (goal_cfg(state).get("measure") or {}).get("below") or {}
+    known = {*below, *(focus_cfg(state).get("ladder_queued") or {})}
+    if not ladder_anchor(state) or not (fam := ladder_estate(task, known)):
+        return None
+    sig = sorted([str(p), str(lv)] for p, lv in below.get(fam) or [])
+    state.setdefault("focus", {}).setdefault("ladder_dry", {})[fam] = {"t": iso(now()), "run": run_id, "sig": sig}
+    return fam
+
+
+def ladder_dry(state: dict, family: str, progs: list) -> dict | None:
+    """The family's dry mark while it still holds: same programs and levels, younger than LADDER_DRY_H."""
+    d = (focus_cfg(state).get("ladder_dry") or {}).get(family)
+    t = parse_iso((d or {}).get("t"))
+    if not d or not t or now() - t >= dt.timedelta(hours=LADDER_DRY_H):
+        return None
+    return d if sorted([str(p), str(lv)] for p, lv in progs) == d.get("sig") else None
 
 
 def ladder_anchor(state: dict) -> int | None:
@@ -7827,6 +7863,8 @@ def ladder_items(state: dict, snap: dict | None) -> list[dict]:
         if estate.split("/")[0].lower() in skip:
             continue  # a whole estate dropped from the ladder (owner 2026-10-27: cics-crucible)
         tag = LADDER_TAG.format(estate)
+        if ladder_dry(state, estate, progs):
+            continue  # its last run found nothing to land and nothing moved since: no requeue (2026-11-03)
         if tag in ours or ((t := parse_iso(last.get(estate))) and (not measured or measured <= t)):
             continue  # in hand, or this measure was already sliced: wait for a newer one
         progs = [(p, lv) for p, lv in progs if p.lower() not in skip
