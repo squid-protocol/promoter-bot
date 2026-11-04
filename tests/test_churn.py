@@ -1812,14 +1812,17 @@ def test_a_new_worker_is_told_to_selfcheck_before_opening_its_pr(churn, tmp_path
 
 def test_a_held_plan_gates_its_requeued_item_without_a_new_plan_run(churn, tmp_path):
     st = {"held_plans": {"5005-a": {"issue": 5005, "t": churn.iso(churn.now()),
-                                    "files": ["det/cics.py", "docs/x.md", "tests/tools/equivalence_cics.py"]}},
+                                    "files": ["det/cics.py", "docs/self_scan/x.md", "docs/ci.md",
+                                              "tests/tools/equivalence_cics.py"]}},
           "queue": [item(5005, task="requeued: implement plan of run 5005-a")], "running": [], "prs": []}
     assert churn.held_plan(st, item(5005, task="a later slice of #5005")) == (None, None)  # another slice: not its plan
-    churn._INFLIGHT = {"PR #5204": {"det/cics.py", "docs/x.md"}, "worker 5005-a": {"tests/tools/equivalence_cics.py"}}
-    assert churn.plan_overlap(st, st["queue"][0]) == ["PR #5204: det/cics.py"]  # docs ignored, own run ignored
+    churn._INFLIGHT = {"PR #5204": {"det/cics.py", "docs/self_scan/x.md"}, "worker 5005-a": {"tests/tools/equivalence_cics.py"}}
+    assert churn.plan_overlap(st, st["queue"][0]) == ["PR #5204: det/cics.py"]  # generated docs ignored, own run ignored
     assert churn.pick_item(st, {}, "calm") == (None, None)
     assert churn.idle_causes(st, {}, "calm") == "idle: plan-overlap 1"
-    churn._INFLIGHT = {"PR #5204": {"docs/x.md"}}
+    churn._INFLIGHT = {"PR #5204": {"docs/ci.md"}}  # 2026-11-04: a hand-written doc is a real overlap
+    assert churn.plan_overlap(st, st["queue"][0]) == ["PR #5204: docs/ci.md"]
+    churn._INFLIGHT = {"PR #5204": {"docs/self_scan/x.md"}}
     assert churn.pick_item(st, {}, "calm")[1]["issue"] == 5005
     assert churn.plan_overlap(st, item(5005, pr=7, task="5005-a")) == []
     assert churn.plan_overlap(st, item(5005, lane="backfill", task="5005-a")) == []
@@ -4973,6 +4976,77 @@ def test_an_item_an_open_pr_overlaps_waits_for_its_merge_and_a_covered_one_is_th
     assert len(notes) == 1 and "covered by merged PR #7000" in notes[0]
     assert [x["task"][-40:] for x in q] == [x["task"][-40:] for x in (partly, ladder, nopath, other)]
     assert churn.load_state()["queue"][0]["covered_note"] == 7000  # the key survives the queue normaliser
+
+
+def test_a_next_slice_waits_behind_its_issues_unapproved_open_pr_until_approval(churn, monkeypatch):
+    """2026-11-04: ~9 of 35 conflict fix runs were two slices of one issue in flight at once. A new-work item of an issue
+    whose open, unapproved PR changes hand-written files waits on it (after_prs, not after_merge): approval releases it."""
+    files = {7033: {"gitgalaxy/tools/cobol_to_java/det/gen.py", "tests/golden_master_audit/x.json"},
+             7040: {"tests/equivalence/cases/zecs-zecs001/case.json"}, 7050: {"tests/tools/oracle.py"}}
+    monkeypatch.setattr(churn, "gh_json", lambda path: [{"filename": f} for f in files[int(path.split("/")[-2])]])
+    snap = {"7033": pr(head="h7033"), "7040": pr(head="h7040"), "7050": pr(head="h7050")}
+    nxt = {**item(4268, task="slice 4: RECORD VARYING USING/GIVING files"), "auto": "followup-next"}
+    data_only = item(6072)  # its open PR changes case data only: nothing hand-written to collide on
+    fix = item(4268, pr=7033, task="Fix PR #7033 (b): conflicts with main", auto="pr-fix")
+    agy = item(4268, backend="agy")
+    held_issue = item(6266)  # its open PR is on hold: never wait behind it
+    other = item(5003)
+    prs = [{"pr": 7033, "issue": 4268}, {"pr": 7040, "issue": 6072}, {"pr": 7050, "issue": 6266, "verdict": "hold"}]
+    put(churn, prs=prs, queue=[nxt, data_only, fix, agy, held_issue, other])
+    with churn.edit_state() as st:
+        notes = churn.hold_sibling_slices(st, snap)
+    q = churn.load_state()["queue"]
+    assert len(notes) == 1 and "#4268" in notes[0] and "PR #7033" in notes[0] and "det/gen.py" in notes[0]
+    assert q[0]["after_prs"] == [7033] and q[0]["sibling_hold"] == 7033 and not q[0].get("after_merge")
+    assert all("after_prs" not in x for x in q[1:] if not x.get("pr")) and q[2]["pr"] == 7033
+    assert churn.blocked_by(q[0], snap, churn.load_state()) == [7033]
+    with churn.edit_state() as st:
+        assert churn.hold_sibling_slices(st, snap) == []  # once per PR
+        st["prs"][0].update(verdict="merge", reviewed_head="h7033")
+    assert churn.blocked_by(q[0], snap, churn.load_state()) == []  # approved at its head: the slice may start
+
+
+def test_an_approved_sibling_pr_holds_nothing_and_the_feature_can_be_turned_off(churn, monkeypatch):
+    monkeypatch.setattr(churn, "gh_json", lambda path: [{"filename": "gitgalaxy/core/detector.py"}])
+    snap = {"7100": pr(head="h1")}
+    put(churn, prs=[{"pr": 7100, "issue": 5638, "verdict": "merge", "reviewed_head": "h1"}], queue=[item(5638)])
+    with churn.edit_state() as st:
+        assert churn.hold_sibling_slices(st, snap) == []
+        st["prs"][0].pop("verdict")
+    monkeypatch.setattr(churn, "SIBLING_HOLD", False)
+    with churn.edit_state() as st:
+        assert churn.hold_sibling_slices(st, snap) == []
+    assert "after_prs" not in churn.load_state()["queue"][0]
+
+
+def test_a_conflict_only_in_regenerated_files_gets_the_regenerate_recipe(churn):
+    st = {"prs": [{"pr": 7360, "issue": 7207}], "queue": [], "running": []}
+    snap = {"7360": pr(ms="dirty", branch="churn/7207-x")}
+    gold = ["tests/golden_master_audit/12_scan_output_snapshots/gpu_json.json",
+            "tests/golden_master_zero_dep_audit/12_scan_output_snapshots/gpu_json.json",
+            "tests/golden_doom_rosetta/dartdoom.json.gz"]
+    assert churn.queue_pr_fixes(st, snap, conflicts=lambda n: gold) == ["#7360 (regenerate only)"]
+    q = st["queue"][0]
+    assert q["regen_only"] and q["model"] == "sonnet" and "ONLY in regenerated files" in q["task"]
+    assert "crucible_check.py --update --yes" in q["task"] and "doom_rosetta_check.py" in q["task"]
+    assert "never rebase" in q["task"] and "Do not edit any hand-written file" in q["task"]
+
+
+def test_a_conflict_touching_a_hand_written_file_or_a_red_keeps_the_open_brief(churn):
+    for files, ms, labels in ((["tests/golden_master_audit/a.json", "gitgalaxy/core/detector.py"], "dirty", []),
+                              (["tests/golden_master_audit/a.json"], "dirty", ["shepherd:needs-fix"]),
+                              ([], "dirty", []), (None, "dirty", [])):
+        st = {"prs": [{"pr": 7400, "issue": 7207}], "queue": [], "running": []}
+        snap = {"7400": pr(ms=ms, labels=labels, branch="churn/7207-y")}
+        assert churn.queue_pr_fixes(st, snap, triage=lambda n: ["real"], conflicts=lambda n, f=files: f) == ["#7400"]
+        assert not st["queue"][0].get("regen_only") and "read any red check" in st["queue"][0]["task"]
+
+
+def test_hand_written_docs_now_count_as_plan_overlap(churn):
+    assert not churn.OVERLAP_IGNORE.search("docs/ci.md")
+    assert not churn.OVERLAP_IGNORE.search(".claude/agents/gitgalaxy-pr-worker.md")
+    assert churn.OVERLAP_IGNORE.search("docs/self_scan/tri_comparison_ledger.json")
+    assert churn.OVERLAP_IGNORE.search("tests/ruff_audit_baseline.json")
 
 
 def test_task_paths_reads_paths_not_versions_or_abbreviations(churn):
