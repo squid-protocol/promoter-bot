@@ -233,7 +233,7 @@ LANES = ("normal", "ci", "backfill")
 CRUCIBLE_REPOS = {"estate-crucible", "cics-crucible"}
 QUEUE_KEYS = {"issue", "model", "task", "needs_owner", "backend", "pr", "after_prs", "allow_workflows", "agy_step", "lane", "repo", "after_merge",
               "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "wait_worker", "scope", "promoted", "rescue",
-              "regraft", "also_prs", "owner_hold", "covered_note"}
+              "regraft", "also_prs", "owner_hold", "covered_note", "sibling_hold", "regen_only"}
 # Scope labels (scope:core|sweep|frontier|infra) are kept on items for the scorecard; they no longer order or hold work.
 # Tiers, promotion and scope ranks were retired 2026-10-25: the owner's focus decides what launches.
 SCOPES = ("core", "sweep", "frontier", "infra")
@@ -4266,6 +4266,48 @@ def fold_covered(state: dict, snap: dict) -> list[str]:
     return out
 
 
+# 2026-11-04 (gitgalaxy conflict study, nyx Oct 19-Nov 3): of 35 conflict fix runs, ~9 were two slices of ONE issue: slice
+# k+1 launched 2-30 min after slice k opened its PR, both edited the same file, and whichever merged second needed a fix
+# run (#4268 slice 3 -> 4, #5003, #6876, #4108, #6266 x2). fold_covered could not see them: a generated next slice is
+# exempt there and most name no file, and plan_overlap only runs for an item with a held plan (none of the 8 had one).
+# So a new-work item of an issue that has an open, unapproved PR changing hand-written files waits behind it (after_prs,
+# NOT after_merge): blocked_by releases it once that PR is approved at its head and mergeable, as for any after_prs, so
+# the next slice starts from code that is final. A PR on hold is not waited on (it may sit for days).
+SIBLING_HOLD = _CFG.get("features", {}).get("sibling_hold", True)
+
+
+def _sibling_gateable(x: dict) -> bool:
+    return (bool(x.get("issue")) and not x.get("pr") and not x.get("repo") and x.get("backend") != "agy"
+            and x.get("lane", "normal") == "normal" and x.get("auto") not in ("main-red", "shared-red", "pr-fix")
+            and not x.get("main_red_pr") and not x.get("needs_owner")
+            and not str(x.get("task", "")).startswith(("Fix PR", "Main is red:", SHARED_RED_TITLE)))
+
+
+def hold_sibling_slices(state: dict, snap: dict) -> list[str]:
+    """A queued new-work item waits behind an open, unapproved sibling PR of its issue that changes hand-written files."""
+    if not SIBLING_HOLD:
+        return []
+    open_prs: dict[int, list[tuple[int, str | None]]] = {}
+    for p in state.get("prs", []):
+        n, v = pr_num(p), snap.get(str(pr_num(p)), {})
+        if isinstance(p, dict) and p.get("issue") and v.get("state") == "open" and not on_hold(state, str(n)):
+            open_prs.setdefault(int(p["issue"]), []).append((n, v.get("head")))
+    out = []
+    for x in state.get("queue", []):
+        if not _sibling_gateable(x) or int(x["issue"]) not in open_prs:
+            continue
+        for n, head in open_prs[int(x["issue"])]:
+            if n in (x.get("after_prs") or []) or not blocked_by({"after_prs": [n]}, snap, state):
+                continue  # already waits on it, or it is approved at its head: nothing left to collide with
+            if (files := pr_changed_files(n, head)) is None or not (hand := hand_written(sorted(files))):
+                continue
+            x["after_prs"] = sorted({*(x.get("after_prs") or []), n})
+            x["sibling_hold"] = n
+            out.append(f"#{x['issue']}: next slice waits for sibling PR #{n} to be approved (it changes "
+                       f"{', '.join(hand[:3])}{', ...' if len(hand) > 3 else ''})")
+    return out
+
+
 def drop_merged_covered(state: dict, issue: int, pr: int) -> list[str]:
     """#30 merge sweep: queued new-work items of `issue` whose named files the merged PR fully changed are dropped."""
     cands = [x for x in state.get("queue", []) if _foldable(x) and x.get("auto") not in GENERATED_AUTO
@@ -6338,7 +6380,10 @@ def ci_snapshot_summary(hours: float = 24, path: Path | None = None) -> str:
 
 
 HELD_PLAN_MAX_H = 48
-OVERLAP_IGNORE = re.compile(r"(^docs/|\.md$|baseline|ledger|_report\b|CHANGELOG)")  # shared ledgers: the tick calls these harmless
+# Shared ledgers and generated pages: the tick calls these harmless. 2026-11-04: hand-written docs and .md no longer are:
+# docs/ci.md, tests/tools/doom_speedrun/README.md and .claude/agents/gitgalaxy-pr-worker.md each cost a conflict fix run
+# (nyx Oct 19-Nov 3).
+OVERLAP_IGNORE = re.compile(r"(^docs/self_scan/|baseline|ledger|_report\b|CHANGELOG)")
 _INFLIGHT: dict[str, set[str]] | None = None  # inflight_files() once per tick (git + one gh call per watched PR)
 
 
@@ -7608,6 +7653,47 @@ def regraft_verdict(rid: str) -> tuple[str, str] | None:
     return None
 
 
+# 2026-11-04 (gitgalaxy conflict study, nyx Oct 19-Nov 3): 13 of 35 conflict fix runs collided only on files a tool
+# writes (the two golden-master fixtures, the DOOM-rosetta goldens). Each run still got the open-ended "merge main,
+# resolve, read any red" brief and explored. When every conflicting file has a known regenerate recipe the fix item says
+# exactly what to run instead, and touches no hand-written file. (language_addition_costs.jsonl, the other repeat
+# offender, merges with merge=union in gitgalaxy's .gitattributes, so it no longer conflicts.)
+REGEN_RECIPES = (
+    (re.compile(r"^tests/golden_master(_zero_dep)?_audit/"),
+     "golden masters: `git checkout origin/main -- tests/golden_master_audit tests/golden_master_zero_dep_audit`, then "
+     "re-bless with `tests/tools/box/golden-lock.sh python tests/tools/crucible_check.py --update --yes` (both legs, "
+     "CI-matched venvs; never update_golden_master.py)"),
+    (re.compile(r"^tests/golden_doom_rosetta/"),
+     "DOOM-rosetta goldens: `git checkout origin/main -- tests/golden_doom_rosetta`, then `python "
+     "tests/tools/doom_rosetta_check.py --only <ports> --update --yes --work <scratch dir outside the repo>` for the "
+     "ports whose files conflicted"),
+)
+
+
+def regen_recipe(files: list[str] | None) -> list[str] | None:
+    """The regenerate steps when EVERY conflicting file has a REGEN_RECIPES entry (one step per kind), else None."""
+    if not files:
+        return None
+    steps = []
+    for f in files:
+        hit = next((how for rx, how in REGEN_RECIPES if rx.search(f)), None)
+        if hit is None:
+            return None
+        if hit not in steps:
+            steps.append(hit)
+    return steps
+
+
+def regen_task(n: str, branch: str | None, files: list[str], steps: list[str]) -> str:
+    return (f"Fix PR #{n} ({branch}): conflicts with main ONLY in regenerated files ({len(files)}: "
+            f"{', '.join(files[:4])}{', ...' if len(files) > 4 else ''}). Mechanical: work on the PR's own branch, "
+            f"`git merge origin/main` (never rebase); for each kind take main's side and regenerate: "
+            + "; ".join(f"({i}) {s}" for i, s in enumerate(steps, 1))
+            + ". Then `git status` must show no conflict left, commit the merge, run the gates and push. Do not edit "
+              "any hand-written file; if a regenerate step fails because the PR's own code needs a change, stop and "
+              "say so in the report.")
+
+
 def regraft_task(prs: list[int], issue: int, behind: int, files: list[str] | None, why: list[str]) -> str:
     """The regraft brief: re-apply the PRs' net hand-written change on a fresh branch off current main."""
     names = ", ".join(f"#{p}" for p in prs)
@@ -7852,7 +7938,12 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
                   f"changes: to defer it use `churn queue wait`, never `churn queue rm`.)" if sent_back and note else "")
         if "shepherd:needs-fix" in why and CI_RED.get(int(n)):
             review += f" Red at this head (ci_digest): {CI_RED[int(n)]}."
-        task = (rescue_task(n, v.get("branch"), issue, loops, why) + review if rescue else
+        regen = None
+        if why == ["conflicts with main"] and not rescue:  # a red or a send-back needs a worker's judgement: no recipe
+            cfiles = (conflicts or conflict_files)(int(n))
+            if steps := regen_recipe(cfiles):
+                regen = regen_task(n, v.get("branch"), cfiles or [], steps)
+        task = (rescue_task(n, v.get("branch"), issue, loops, why) + review if rescue else regen or
                 f"Fix PR #{n} ({v.get('branch')}): {' + '.join(why)}. Work on the PR's own branch: merge origin/main "
                 f"(never rebase), resolve (regenerate generated docs, never hand-merge them), read any red check and fix "
                 f"what is real, gates, push; report the PR's CI." + review)
@@ -7861,8 +7952,9 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
                                                  **({"filler_pr": True} if filler_branch(v.get("branch")) else {}),
                                                  **({"main_red_pr": True} if main_red_branch(v.get("branch")) else {}),
                                                  **({"rescue": True} if rescue else {}),
+                                                 **({"regen_only": True} if regen else {}),
                                                  **({"head": v["head"]} if v.get("head") else {})})
-        added.append(f"#{n}")
+        added.append(f"#{n}" + (" (regenerate only)" if regen else ""))
     for q in list(state.get("queue", [])):  # a later PR (this pass or an earlier one) showed this red is shared
         r = ((state.get("shared_red") or {}).get("prs") or {}).get(str(q.get("pr")))
         if (q.get("auto") != "pr-fix" or q.get("rescue") or q.get("regraft") or not r or not q.get("head")
@@ -9007,6 +9099,9 @@ def cmd_tick(a) -> int:
                         log("review kept across the gate's update-branch: " + ", ".join(carried))
                 with contextlib.suppress(Exception):  # #30
                     for note in fold_covered(st, snap):
+                        log(note)
+                with contextlib.suppress(Exception):  # sibling slices of one issue (2026-11-04)
+                    for note in hold_sibling_slices(st, snap):
                         log(note)
                 pruned = prune_pr_fixes(st, snap)
                 fixes = queue_pr_fixes(st, snap)
