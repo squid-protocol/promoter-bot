@@ -50,6 +50,8 @@ def churn(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "start_precheck", lambda rid: None)
     monkeypatch.setitem(mod.CLAIMS_DEFAULT, "enabled", False)  # claim tests turn it on with a fake GitHub
     monkeypatch.setattr(mod, "open_issues", lambda: [])
+    mod.real_focus_preflight = mod.focus_preflight
+    monkeypatch.setattr(mod, "focus_preflight", lambda state, issues, gh=None: [])  # never read GitHub on `focus set`
     monkeypatch.setitem(mod.WT_GC_DEFAULT, "enabled", False)  # gc tests call gc_worktrees directly; it reads GitHub
     mod.real_unreachable = mod.unreachable
     monkeypatch.setattr(mod, "unreachable", lambda hosts=mod.NET_HOSTS: [])  # online, without asking the network
@@ -517,10 +519,10 @@ class TestCiLoadBalancer:
         st = {"ci_profile": {"target_util": 0.3}}
         churn.fast_cut(st, calm)  # folds the live waits; nothing over the limit, no cut
         note = churn.fast_climb(st, 0.9)
-        assert "fast climb" in note and st["ci_profile"]["target_util"] == 0.35
+        assert "fast climb" in note and st["ci_profile"]["target_util"] == 0.375  # mirrors the cut: / 0.8
         assert churn.fast_climb(st, 0.9) is None  # once per climb_every_min
         st["ci_profile"]["fast_climb_at"] = churn.iso(churn.now() - churn.dt.timedelta(minutes=21))
-        assert churn.fast_climb(st, 0.9) and st["ci_profile"]["target_util"] == 0.4
+        assert churn.fast_climb(st, 0.9) and st["ci_profile"]["target_util"] == 0.469
         st["ci_profile"]["fast_climb_at"] = None
         assert churn.fast_climb(st, 4.0) is None  # queued runs wait 4 min: not calm (60% of 5 = 3)
         assert churn.fast_climb(st, None) is None  # queue unread: hold
@@ -535,6 +537,33 @@ class TestCiLoadBalancer:
         st5 = {"ci_profile": {"target_util": 0.3}, "ci_admission_cfg": {"util_step": 0.2}}
         churn.fast_cut(st5, calm)
         assert churn.fast_climb(st5, 0.5) and st5["ci_profile"]["target_util"] == 0.5  # `churn config ci.util_step 0.2`
+
+    def test_a_cut_at_the_floor_is_no_cut_and_does_not_block_the_climb(self, churn):
+        """2026-11-03: "0.30 -> 0.30 (fast cut)" every 20 min stamped fast_cut_at and held target_util at the floor."""
+        st = {"ci_profile": {"target_util": 0.3}}
+        assert churn.fast_cut(st, [], queued_wait=40.0) is None  # nothing to cut
+        assert "fast_cut_at" not in st["ci_profile"] and st["ci_profile"]["target_util"] == 0.3
+        st["ci_profile"]["live_waits"] = [[k, churn.iso(churn.now()), 1.0] for k in range(6)]
+        assert churn.fast_climb(st, 0.5) and st["ci_profile"]["target_util"] == 0.375  # calm again: climbs at once
+
+    def test_the_climb_mirrors_the_cut_back_to_the_start(self, churn):
+        """x0.8 cuts against +0.05 climbs needed 10 calm windows from 0.3 to 0.8; / 0.8 needs 5."""
+        st = {"ci_profile": {"target_util": 0.3}}
+        steps = 0
+        while st["ci_profile"]["target_util"] < 0.8:
+            st["ci_profile"]["fast_climb_at"] = None
+            assert churn.fast_climb(st, 0.0)  # an empty queue and no live PR runs: a quiet CI is calm
+            steps += 1
+        assert steps == 5 and st["ci_profile"]["target_util"] <= 1.0
+        st = {"ci_profile": {"target_util": 0.98}}
+        assert churn.fast_climb(st, 0.0) and st["ci_profile"]["target_util"] == 1.0  # capped at util_max
+
+    def test_a_quiet_ci_climbs_only_while_its_queue_is_calm(self, churn):
+        few = {"ci_profile": {"target_util": 0.3, "live_waits": [[1, churn.iso(churn.now()), 9.0]]}}
+        assert churn.fast_climb(few, 0.5) is not None  # one live wait is no p50: the queue decides
+        assert "(quiet)" in churn.fast_climb({"ci_profile": {"target_util": 0.3}}, 0.0)
+        assert churn.fast_climb({"ci_profile": {"target_util": 0.3}}, 4.0) is None  # queue waits 4 min: not calm
+        assert churn.fast_climb({"ci_profile": {"target_util": 0.3}}, 0.0, queued_job_age=6.0) is None
 
     def test_lane_order_follows_the_mode(self, churn):
         st = {"running": [], "queue": [item(1), item(2, lane="backfill"), item(3, lane="ci"), item(4, pr=44)]}
@@ -4952,6 +4981,38 @@ def test_queue_add_and_followups_park_off_focus_work_instead_of_queueing_it(chur
     assert st["queue"] == [] and st["focus"]["parked"][0]["issue"] == 3799 and "parked" in capsys.readouterr().out
     note = churn.requeue_next_slice(st, {"pr": 6634, "kind": "merged", "issue": 3799}, "validate more shapes")
     assert note.startswith("off focus") and st["queue"] == [] and len(st["focus"]["parked"]) == 1  # one row per issue
+
+
+def test_focus_set_warns_about_issues_that_cannot_launch_useful_work(churn, monkeypatch, capsys):
+    """2026-11-03: 3 of 4 items of a new focus were census-only (non-burned programs) and stopped with no PR."""
+    issues = {
+        1: {"state": "open", "title": "det: EXEC SQL ROLLBACK in a CICS program (census: 1 non-burned program)",
+            "body": "- [ ] model it", "labels": []},
+        2: {"state": "closed", "title": "done already", "body": "", "labels": []},
+        3: {"state": "open", "title": "an epic with every box ticked", "body": "- [x] all of it", "labels": []},
+        4: {"state": "open", "title": "split the hot file", "body": "- [ ] slice 2 of 4", "labels": []},
+        5: {"state": "open", "title": "someone else's", "body": "- [ ] x", "labels": [], "assignees": [{"login": "a"}]},
+        6: {"state": "open", "title": "a fully ticked issue with a queued slice", "body": "", "labels": []},
+    }
+    def gh(path):
+        n = int(path.rsplit("/", 1)[1])
+        if n == 7:
+            raise RuntimeError("HTTP 404")
+        return {"number": n, **issues[n]}
+    monkeypatch.setattr(churn, "host_skips", lambda i: None)
+    warn = churn.real_focus_preflight({"queue": [item(6)]}, [1, 2, 3, 4, 5, 6, 7], gh=gh)
+    assert [w.split(":")[0] for w in warn] == ["#1", "#2", "#3", "#5", "#7"]  # #4 has a line, #6 a queued item
+    assert "census-only" in warn[0] and "closed" in warn[1] and "nothing to launch" in warn[2]
+    assert "assigned to a" in warn[3] and "could not read" in warn[4]
+    monkeypatch.setattr(churn, "focus_preflight", lambda st, ns, gh=None: [f"#{n}: closed" for n in ns if n == 2])
+    ns = lambda action, *args: argparse.Namespace(action=action, args=list(args), skip=None)
+    churn.cmd_focus(ns("set", "breadth", "2", "4"))
+    out = capsys.readouterr().out
+    assert "WARNING: 1 of 2" in out and "#2: closed" in out and churn.load_state()["focus"]["issues"] == [2, 4]
+    churn.cmd_focus(ns("rm", "2"))
+    assert "WARNING" not in capsys.readouterr().out  # removing an issue reads nothing
+    churn.cmd_focus(ns("add", "4"))
+    assert "preflight: all 1" in capsys.readouterr().out
 
 
 def test_only_the_owner_edits_the_focus(churn, monkeypatch, capsys):
