@@ -6087,30 +6087,41 @@ def fast_cut(state: dict, live: list[list], queued_wait: float | None = None,
     v, what = max(over)
     u = float(prof.get("target_util", cfg["util_init"]))
     new = max(float(cfg["util_min"]), u * float(cfg["util_cut"]))
+    if round(new, 3) >= round(u, 3):
+        # 2026-11-03: at the util_min floor a cut changes nothing, but it still stamped fast_cut_at, and fast_climb
+        # waits climb_every_min after a cut, so a "0.30 -> 0.30 (fast cut)" every 20 min blocked every climb for
+        # hours (target_util sat at 0.30 from 17:11Z to 22:30Z). A no-op cut is not a cut: no stamp, no log line.
+        return None
     prof["target_util"], prof["fast_cut_at"] = round(new, 3), iso(now())
     return f"ci admission: {what} {v} min over {limit:g}: target_util {u:.2f} -> {new:.2f} (fast cut)"
 
 
 def fast_climb(state: dict, queued_wait: float | None, queued_job_age: float | None = None) -> str | None:
     """The fast cut's other half (2026-10-23): cuts came every tick but the climb only hourly, on completed-run waits,
-    so the 2026-10-23 storm left target_util at the 0.3 floor for half a day while live waits were 2 min. Raise it by
-    util_step at most every climb_every_min while the live PR job wait p50 (as folded by fast_cut) and the queued runs'
-    median wait are both under 60% of target_wait_min; never within climb_every_min of a cut."""
+    so the 2026-10-23 storm left target_util at the 0.3 floor for half a day while live waits were 2 min. Raise it at
+    most every climb_every_min while the live PR job wait p50 (as folded by fast_cut) and the queued runs' median wait
+    are both under 60% of target_wait_min; never within climb_every_min of a cut.
+    2026-11-03 (nyx): cuts are x util_cut but the climb was + util_step, so 0.3 -> 0.8 took 10 calm climbs (>= 3.3 h)
+    and CI busy for 10.4 h held launches with five focus items ready. The climb now mirrors the cut (/ util_cut, at
+    least + util_step): 0.3 -> 0.8 in 5. And a quiet CI (fewer than min_waits live PR job waits, because few PR runs
+    are live) counts as calm when the queue itself is: before, no live PR runs meant no climb at all."""
     cfg = ci_admission_cfg(state)
     prof = state.setdefault("ci_profile", {"workflows": {}, "waits": []})
     u = float(prof.get("target_util", cfg["util_init"]))
     waits = sorted(x[2] for x in prof.get("live_waits", []))
     calm = 0.6 * float(cfg["target_wait_min"])
+    live_p50 = waits[len(waits) // 2] if len(waits) >= int(cfg["min_waits"]) else None
     if (u >= float(cfg["util_max"]) or queued_wait is None or float(queued_wait) >= calm
             or (queued_job_age is not None and float(queued_job_age) >= calm)
-            or len(waits) < int(cfg["min_waits"]) or waits[len(waits) // 2] >= calm):
+            or (live_p50 is not None and live_p50 >= calm)):
         return None
     every = dt.timedelta(minutes=float(cfg["climb_every_min"]))
     if any((t := parse_iso(prof.get(k))) and now() - t < every for k in ("fast_cut_at", "fast_climb_at")):
         return None
-    new = min(float(cfg["util_max"]), u + float(cfg["util_step"]))
+    new = min(float(cfg["util_max"]), max(u + float(cfg["util_step"]), u / float(cfg["util_cut"])))
     prof["target_util"], prof["fast_climb_at"] = round(new, 3), iso(now())
-    return (f"ci admission: live PR job wait p50 {waits[len(waits) // 2]} min, queued {queued_wait} min, both under "
+    live = f"live PR job wait p50 {live_p50} min" if live_p50 is not None else f"{len(waits)} live PR job waits (quiet)"
+    return (f"ci admission: {live}, queued {queued_wait} min, both under "
             f"{calm:g}: target_util {u:.2f} -> {new:.2f} (fast climb)")
 
 
@@ -6738,6 +6749,39 @@ def focus_prereq(args: list[str], reason: str | None) -> int:
     return 0
 
 
+# 2026-11-03 (nyx): the owner set focus cics-breadth over 10 issues; 3 of the 4 items queued for it (#7523 / #7525 /
+# #7527) were census-only work on non-burned programs that the translator refuses by design (mainframe evidence policy
+# 2 and 8), so each worker stopped within a minute with no PR, and the focus starved. `focus set` / `focus add` now
+# read each issue first and say which ones cannot give a worker a PR-sized step. It warns; it never refuses: the focus
+# stays the owner's decision.
+CENSUS_ONLY_RE = re.compile(r"\bnon-burned\b", re.I)
+
+
+def focus_preflight(state: dict, issues: list[int], gh=None) -> list[str]:
+    """One warning per focus issue that cannot launch useful work now: closed or unreadable, another host's or a
+    person's, not this host's work, census-only (its title names only non-burned programs), or with nothing to launch
+    (no queued item and no unchecked checklist line). Empty list: every issue has a next step."""
+    queued = {int(x["issue"]) for x in state.get("queue", []) if x.get("issue") is not None and not x.get("needs_owner")}
+    out = []
+    for n in issues:
+        try:
+            i = (gh or gh_json)(f"repos/{REPO}/issues/{n}")
+        except (RuntimeError, ValueError) as e:
+            out.append(f"#{n}: could not read it ({str(e)[:80]})")
+            continue
+        why = ("closed" if i.get("state") != "open" else
+               foreign_claim(i) or host_skips(i) or
+               ("census-only: its title names only non-burned programs, which the policy keeps out of case and port "
+                "work, so a worker will most likely stop with no PR" if CENSUS_ONLY_RE.search(str(i.get("title", "")))
+                else None) or
+               (None if n in queued or next_check(i, state) else
+                ("nothing to launch: no queued item and no unchecked checklist line, so the gate's focus refill has nothing "
+                 "to queue from (add `- [ ]` lines to the issue or queue a slice)")))
+        if why:
+            out.append(f"#{n}: {why}")
+    return out
+
+
 def cmd_focus(a) -> int:
     """`churn focus` (status), `set NAME N..`, `add N..`, `rm N..`, `ladder ANCHOR [--skip P..]`, `off`,
     `filler --hours H --reason R [--max N]` / `filler off` (the tick may open filler only while starving),
@@ -6802,6 +6846,7 @@ def cmd_focus(a) -> int:
             notify("focus-filler", "filler on", f"{focus_cfg(load_state()).get('name')}: {msg}", cooldown_h=1)
         return 0
     owner_only("churn focus " + a.action)
+    check: list[int] = []
     with edit_state() as st:
         f = st.setdefault("focus", {})
         if a.action == "set":
@@ -6809,11 +6854,13 @@ def cmd_focus(a) -> int:
                 raise SystemExit("focus set NAME N..")
             f.update(name=args[0], issues=sorted({_int(x) for x in args[1:]}), set=iso(now()), idle_passes=0)
             msg = f"focus set: {args[0]} = " + ", ".join(f"#{n}" for n in f["issues"])
+            check = list(f["issues"])
         elif a.action in ("add", "rm"):
             nums = {_int(x) for x in args}
             cur = set(f.get("issues") or [])
             f["issues"] = sorted(cur | nums if a.action == "add" else cur - nums)
             msg = f"focus {a.action}: " + ", ".join(f"#{n}" for n in sorted(nums)) + f" -> {len(f['issues'])} issues"
+            check = sorted(nums) if a.action == "add" else []
         elif a.action == "ladder":
             if len(args) < 1:
                 raise SystemExit("focus ladder ANCHOR|off [--skip PROGRAM..]")
@@ -6832,6 +6879,16 @@ def cmd_focus(a) -> int:
             raise SystemExit(f"focus {a.action}?")
     log(f"{msg} (owner)")
     print(msg)
+    if check:
+        warn = focus_preflight(load_state(), check)  # GitHub reads outside the state lock
+        if warn:
+            log(f"focus preflight: {len(warn)} of {len(check)} cannot launch useful work now: " + "; ".join(warn)[:600])
+            print(f"\nWARNING: {len(warn)} of {len(check)} focus issue(s) cannot give a worker a PR-sized step now:")
+            for w in warn:
+                print(f"  {w}")
+            print("The focus is set as asked. `churn focus rm N..` drops one; queue a slice for one with nothing to launch.")
+        else:
+            print(f"preflight: all {len(check)} focus issue(s) have a next step")
     return 0
 
 
