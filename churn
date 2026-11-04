@@ -768,6 +768,61 @@ REGENERATED_RE = re.compile(r"golden_master|refraction_snapshot|scan_output|/evi
 FILE_CAP_EXCEPTION = re.compile(r"(?im)^[*_ ]*File-cap exception[*_ ]*:\s*\S")
 
 
+# gitgalaxy#7625 (owner 2026-11-03, epic #7624): with the doc-refs audit (#7623) a PR that renames a path, drops a flag
+# or adds a module fails CI until it fixes the doc that names it. A worker near the cap could only break the cap (a
+# send-back here) or leave CI red. So a small markdown edit that only fixes a doc-refs finding the PR caused counts like a
+# regenerated file, when the PR body lists it under `Doc-refs fixes:` and EVERY listed file is .md with at most
+# DOC_REFS_MAX_LINES changed lines; one .py (or an oversized edit) in the list and nothing is exempt. Markdown is safe to
+# exempt: the 2026-10-26 send-back causes were collateral breaks, stale derived files, red main and conflicts.
+DOC_REFS_MAX_LINES = int(_CFG.get("doc_refs_max_lines", 10))
+_DOC_REFS_HEAD = re.compile(r"(?im)^[#*_ ]*Doc-refs fixes[*_ ]*:(.*)$")
+_LISTED_PATH = re.compile(r"[`'\"]?([\w./@+-]+\.[\w]+)[`'\"]?")
+
+
+def doc_refs_listed(body: str) -> list[str]:
+    """The files a PR body lists under `Doc-refs fixes:`: on the same line (comma-separated) and/or as the bullet lines
+    right after it. Empty when the section is absent."""
+    lines = (body or "").splitlines()
+    for k, line in enumerate(lines):
+        if not (m := _DOC_REFS_HEAD.match(line)):
+            continue
+        found = _LISTED_PATH.findall(m.group(1))
+        for nxt in lines[k + 1:]:
+            if not re.match(r"\s*[-*+]\s+\S", nxt):
+                break
+            if hit := _LISTED_PATH.search(nxt):
+                found.append(hit.group(1))
+        return list(dict.fromkeys(found))
+    return []
+
+
+def doc_refs_exempt(listed: list[str], numstat: dict[str, int]) -> tuple[set[str], str | None]:
+    """(files the 5-file rule skips, why none are skipped). `numstat` maps each changed file to its added + deleted
+    lines. All or nothing: every listed file must be a changed .md file within DOC_REFS_MAX_LINES."""
+    if not listed:
+        return set(), None
+    bad = [f for f in listed if not f.lower().endswith(".md")]
+    if bad:
+        return set(), f"`Doc-refs fixes:` lists non-markdown {', '.join(bad[:4])}, so none of it is exempt"
+    if missing := [f for f in listed if f not in numstat]:
+        return set(), f"`Doc-refs fixes:` lists {', '.join(missing[:4])}, which this PR does not change"
+    if big := [f"{f} ({numstat[f]} lines)" for f in listed if numstat[f] > DOC_REFS_MAX_LINES]:
+        return set(), (f"`Doc-refs fixes:` edits over {DOC_REFS_MAX_LINES} changed lines ({', '.join(big[:4])}) are not "
+                       "a doc-refs fix, so none of it is exempt")
+    return set(listed), None
+
+
+def diff_numstat(wt: str) -> dict[str, int]:
+    """{file: added + deleted lines} for origin/main...HEAD (a binary file counts as 0 lines)."""
+    out = {}
+    for line in run(["git", "-C", wt, "diff", "--numstat", "--no-renames", "origin/main...HEAD"],
+                    timeout=300).stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            out[parts[2]] = sum(int(x) for x in parts[:2] if x.isdigit())
+    return out
+
+
 def hand_written(files: list[str]) -> list[str]:
     """The files a PR's 5-file rule counts: everything but the regenerated ones."""
     return [f for f in files if not REGENERATED_RE.search(f)]
@@ -853,11 +908,14 @@ def precheck_problems(meta: dict, body: str, gates=None) -> list[str]:
         out.append(NO_CLASS_TABLE)
     if FILE_CAP and not FILE_CAP_EXCEPTION.search(body):
         changed = run(["git", "-C", wt, "diff", "--name-only", "origin/main...HEAD"], timeout=300).stdout.split()
-        if len(hand := hand_written(changed)) > FILE_CAP:
+        listed = doc_refs_listed(body)
+        exempt, why_not = doc_refs_exempt(listed, diff_numstat(wt)) if listed else (set(), None)
+        if len(hand := [f for f in hand_written(changed) if f not in exempt]) > FILE_CAP:
             out.append(f"touches {len(hand)} hand-written files, over the {FILE_CAP}-file rule ({', '.join(hand[:10])}"
                        f"{', ...' if len(hand) > 10 else ''}): keep the first self-contained slice of {FILE_CAP} or fewer "
                        "and list the rest under Remaining slices, or, for an atomic rename or a mechanical one-line "
-                       "change, add a line `File-cap exception: <why>` to the PR body")
+                       "change, add a line `File-cap exception: <why>` to the PR body"
+                       + (f" ({why_not})" if why_not else ""))
     if names := internal_names():
         diff = run(["git", "-C", wt, "diff", "-U0", "--no-color", "--no-ext-diff", "origin/main...HEAD"], timeout=300).stdout
         probs, detail = internal_name_problems(diff, body, names)

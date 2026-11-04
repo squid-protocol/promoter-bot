@@ -1307,6 +1307,45 @@ def test_precheck_holds_the_file_cap_unless_the_body_states_an_exception(churn, 
     assert churn.precheck_problems({"worktree": str(wt)}, GOOD_BODY, gates=ok) == []
 
 
+def test_doc_refs_fixes_are_listed_inline_or_as_bullets(churn):
+    """gitgalaxy#7625: the PR body names the doc-refs fixes under `Doc-refs fixes:`."""
+    assert churn.doc_refs_listed("x\n\nDoc-refs fixes: `README.md`, docs/ci.md\n") == ["README.md", "docs/ci.md"]
+    body = "**Doc-refs fixes:**\n- `docs/agents/a.md` (renamed path)\n* CLAUDE.md\n\nRemaining slices: x.py"
+    assert churn.doc_refs_listed(body) == ["docs/agents/a.md", "CLAUDE.md"]  # the list ends at the first non-bullet
+    assert churn.doc_refs_listed("## Doc-refs fixes:\n- a.md\n- a.md") == ["a.md"]
+    assert churn.doc_refs_listed("no such section; Doc-refs fixes mentioned mid-line: a.md") == []
+
+
+def test_doc_refs_exemption_is_markdown_only_small_and_all_or_nothing(churn):
+    num = {"README.md": 3, "docs/ci.md": 10, "docs/big.md": 11, "a.py": 2}
+    assert churn.doc_refs_exempt(["README.md", "docs/ci.md"], num) == ({"README.md", "docs/ci.md"}, None)
+    got, why = churn.doc_refs_exempt(["README.md", "a.py"], num)  # one .py: nothing is exempt
+    assert got == set() and "non-markdown a.py" in why
+    got, why = churn.doc_refs_exempt(["README.md", "docs/big.md"], num)
+    assert got == set() and "docs/big.md (11 lines)" in why
+    got, why = churn.doc_refs_exempt(["docs/other.md"], num)
+    assert got == set() and "does not change" in why
+    assert churn.doc_refs_exempt([], num) == (set(), None)
+
+
+def test_precheck_skips_listed_doc_refs_fixes_in_the_file_cap(churn, tmp_path):
+    ok = lambda: subprocess.CompletedProcess([], 0, "6/6 gates pass", "")  # noqa: E731
+    wt = _repo_with_conflict(tmp_path, conflict=False)
+    for name in ("a.py", "b.py", "c.py", "d.py", "tests/test_a.py", "docs/a.md"):
+        (wt / name).parent.mkdir(parents=True, exist_ok=True)
+        (wt / name).write_text("x\n")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-q", "-m", "five plus a one-line doc fix")
+    assert churn.precheck_problems({"worktree": str(wt)}, GOOD_BODY + "\n\nDoc-refs fixes: `docs/a.md`", gates=ok) == []
+    probs = churn.precheck_problems({"worktree": str(wt)}, GOOD_BODY + "\n\nDoc-refs fixes: `docs/a.md`, `a.py`",
+                                    gates=ok)
+    assert len(probs) == 1 and "touches 6 hand-written files" in probs[0] and "non-markdown a.py" in probs[0]
+    (wt / "docs/a.md").write_text("".join(f"line {k}\n" for k in range(12)))
+    _git(wt, "commit", "-qam", "the doc edit grows past a doc-refs fix")
+    probs = churn.precheck_problems({"worktree": str(wt)}, GOOD_BODY + "\n\nDoc-refs fixes: `docs/a.md`", gates=ok)
+    assert len(probs) == 1 and "docs/a.md (12 lines)" in probs[0]
+
+
 def test_precheck_fails_an_internal_only_name_without_echoing_it(churn, tmp_path, monkeypatch, capsys):
     # promoter-bot-private#2. Made-up names only: the real list lives in the private repo and never in this one.
     lst = tmp_path / "names.txt"
