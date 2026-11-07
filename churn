@@ -2009,6 +2009,9 @@ def cmd_worker(a) -> int:
             "allow_workflows": "standing" if allow_wf == "standing" else bool(allow_wf), "precheck_of": getattr(a, "precheck_of", None),
             "head_start": run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip() or None,
             **({"filler": True} if filler else {})}
+    with contextlib.suppress(Exception):  # promoter-bot #108: judged at launch, so a focus issue that later closes
+        meta["focus_at_launch"] = bool(in_focus(load_state(), {"issue": issue, "task": task,  # (and leaves the
+                                                                 "lane": getattr(a, "lane", None)}))  # focus) stays focus
     if credit:
         meta.update(lane="credit", queue_item=getattr(a, "queue_item", None))
     if getattr(a, "budget_usd", None):  # the credit lane's balance, the retro's cap
@@ -2932,6 +2935,132 @@ def solver_record(st: dict, case: str, key: str, outcome: str, rid: str, **extra
     s["history"] = (s.get("history") or [])[-49:] + [{"case": case, **entry}]
     if (s.get("running") or {}).get("run_id") == rid:
         s["running"] = None
+
+
+# promoter-bot #108: workers file no issues, so a census gap row whose owner closed sat unowned (#4270 -> #7959 by hand).
+GAP_PAGE = "docs/language_status/gap_prevalence.md"
+GAP_CHECK_EVERY_H = 6
+GAP_OPEN_STATUSES = ("not modelled", "unknown")
+
+
+def gap_rows(text: str) -> list[dict]:
+    """[{gap, status, owner}] from the first table of gap_prevalence.md (all estates)."""
+    rows, cols = [], None
+    for ln in text.splitlines():
+        if not ln.startswith("|"):
+            if cols is not None and rows:
+                break
+            continue
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if cols is None:
+            if cells and cells[0] == "gap" and "status" in cells and "owner" in cells:
+                cols = {name: k for k, name in enumerate(cells)}
+            continue
+        if set(ln.replace("|", "").strip()) <= set("-: "):
+            continue
+        if len(cells) <= max(cols["status"], cols["owner"]):
+            continue
+        rows.append({"gap": cells[0].strip("`"), "status": cells[cols["status"]], "owner": cells[cols["owner"]],
+                     "scope": cells[cols["scope"]] if "scope" in cols else ""})
+    return rows
+
+
+def gap_owner_check(force: bool = False, page: Path | None = None, is_open=None) -> list[str]:
+    """Every GAP_CHECK_EVERY_H: rows still open (not modelled / unknown) whose owner cell names no open issue go to
+    state['gap_orphans'] for the gate. Reads the churn-tools checkout (origin/main), plus one memoised gh read per owner."""
+    state = load_state()
+    last = parse_iso((state.get("gap_owner") or {}).get("checked"))
+    if last and not force and now() - last < dt.timedelta(hours=GAP_CHECK_EVERY_H):
+        return []
+    try:
+        text = (page or TOOLS / GAP_PAGE).read_text(errors="replace")
+    except OSError:
+        return []
+    found = {}
+    for r in gap_rows(text):
+        # census rows only: a burned row whose owner closed was settled (source defect, refused by design) and the
+        # page's status lags; the census has no other owner path (2026-11-06: 7 burned rows, 1 census row)
+        if r["status"].lower() not in GAP_OPEN_STATUSES or "C" not in r["scope"]:
+            continue
+        refs = [int(x) for x in re.findall(r"#(\d+)", r["owner"])]
+        states = {n: (is_open or owner_open)(n) for n in refs}
+        if refs and any(v is not False for v in states.values()):
+            continue
+        why = (f"owner {', '.join(f'#{n}' for n in refs)} closed" if refs else "no owner")
+        found[f"gap:{check_key(r['gap'])}"] = {"gap": r["gap"], "why": why}
+    with edit_state() as st:
+        before = set((st.get("gap_orphans") or {}))
+        st["gap_orphans"] = found
+        st["gap_owner"] = {"checked": iso(now()), "rows": len(found)}
+    return [f"gap owner: `{v['gap'][:70]}` has {v['why']} ({k})" for k, v in found.items() if k not in before]
+
+
+# promoter-bot #108: census counts after each census-linked merge, token-free, by starting the owner's
+# census-nightly.service (census_nightly.py: box-gated, once per main SHA per day, counts only to `generated`).
+CENSUS_LANE_DEFAULT = {"enabled": True, "issues": [7709], "unit": "census-nightly.service",
+                       "max_per_day": 4, "cooldown_min": 120}
+
+
+def census_cfg(state: dict) -> dict:
+    host = {k: v for k, v in (_CFG.get("census_lane") or {}).items() if k in CENSUS_LANE_DEFAULT}
+    mine = {k: v for k, v in (state.get("census_lane") or {}).items() if k in CENSUS_LANE_DEFAULT}
+    return {**CENSUS_LANE_DEFAULT, **host, **mine}
+
+
+def census_issues(state: dict) -> set[int]:
+    """The census issues and their live prerequisite links."""
+    base = {int(n) for n in census_cfg(state)["issues"]}
+    return base | {int(p["issue"]) for p in focus_cfg(state).get("prereqs") or [] if int(p.get("for", 0)) in base}
+
+
+def census_mark_due(state: dict, issue: int, pr: int) -> str | None:
+    if not census_cfg(state)["enabled"] or int(issue) not in census_issues(state):
+        return None
+    state.setdefault("census_lane", {})["due"] = {"t": iso(now()), "pr": pr, "issue": int(issue)}
+    return f"census run due (merge #{pr} of #{issue})"
+
+
+def census_lane(b: dict, dry_run: bool = False, runner=None) -> list[str]:
+    """Start the census unit once a census-linked merge made a run due. Never reads GitHub or a model."""
+    state = load_state()
+    cfg, s = census_cfg(state), state.get("census_lane") or {}
+    if not cfg["enabled"] or not s.get("due"):
+        return []
+    rn = runner or run
+    hold = None
+    if state.get("workers_paused"):
+        hold = f"workers paused: {state['workers_paused']}"
+    elif b.get("verdict") != "GREEN":
+        hold = f"box {b.get('verdict')}"
+    elif rn(["systemctl", "--user", "cat", cfg["unit"]], timeout=30).returncode:
+        hold = f"{cfg['unit']} not installed"
+    elif rn(["systemctl", "--user", "is-active", cfg["unit"]], timeout=30).stdout.strip() in ("active", "activating"):
+        hold = f"{cfg['unit']} already running"
+    else:
+        hist = [h for h in s.get("history") or [] if (t := parse_iso(h.get("t"))) and now() - t < dt.timedelta(hours=24)]
+        last = max((parse_iso(h["t"]) for h in hist), default=None)
+        if len(hist) >= int(cfg["max_per_day"]):
+            hold = f"{len(hist)} runs in 24 h (max_per_day {cfg['max_per_day']})"
+        elif last and now() - last < dt.timedelta(minutes=float(cfg["cooldown_min"])):
+            hold = f"cooldown until {iso(last + dt.timedelta(minutes=float(cfg['cooldown_min'])))}"
+    if hold:
+        if s.get("hold") != hold and not dry_run:
+            with edit_state() as st:
+                st.setdefault("census_lane", {})["hold"] = hold
+            log(f"census lane held: {hold}", quiet=True)
+        return []
+    desc = f"census run ({cfg['unit']}) after merge #{s['due'].get('pr')} of #{s['due'].get('issue')}"
+    if dry_run:
+        return [desc]
+    r = rn(["systemctl", "--user", "start", "--no-block", cfg["unit"]], timeout=60)
+    with edit_state() as st:
+        c = st.setdefault("census_lane", {})
+        if r.returncode:
+            c["hold"] = f"start failed: {(r.stderr or '').strip()[:120]}"
+            return []
+        c["history"] = (c.get("history") or [])[-19:] + [{"t": iso(now()), **c.pop("due", {})}]
+        c.pop("hold", None)
+    return [desc]
 
 
 def solver_lane(b: dict, snap: dict, dry_run: bool = False, spawn=None) -> list[str]:
@@ -4336,6 +4465,9 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
         owner = issue or (int(m.group(1)) if m else None)  # #20: an entry without its issue (mark_flake, ints) settles
         checks = v.get("checks") or ([[*v["check"], ""]] if v.get("check") else [])
         if v.get("merged") and owner:
+            with contextlib.suppress(Exception):  # promoter-bot #108: census counts after a census-linked merge
+                if due := census_mark_due(state, int(owner), n):
+                    notes.append(due)
             with contextlib.suppress(Exception):  # #30: a merged slice retires queued items it already did
                 notes += drop_merged_covered(state, int(owner), n)
             with contextlib.suppress(Exception):  # a merged fix of a shared red: update the PRs that waited on it
@@ -4347,7 +4479,9 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
                 state.setdefault("goal", {})["measure_due"] = True
                 notes.append(f"ladder dry marks cleared: prerequisite #{owner} of #{anchor} merged #{n}")
         if v.get("merged") and owner and checks and not v.get("closes") and (
-                note := "; ".join(x for c in checks if (x := settle_check(state, int(owner), n, *c)))):
+                note := "; ".join(x for c in checks if (x := settle_check(
+                    state, int(owner), n, *c, also_done=frozenset(
+                        str(k[1]) for k in checks if str(k[0]).lower() == "done" and k[1] != c[1]))))):
             notes.append(note)  # the box records it: no followup for the tick
         elif v.get("merged") and v.get("closes"):
             notes.append(f"merged #{n} (closes its issue itself)")
@@ -4361,7 +4495,8 @@ def settle_closed(state: dict, snap: dict) -> list[str]:
     return notes
 
 
-def settle_check(state: dict, issue: int, pr: int, status: str, key: str, left_text: str = "") -> str | None:
+def settle_check(state: dict, issue: int, pr: int, status: str, key: str, left_text: str = "",
+                 also_done: set[str] | frozenset = frozenset()) -> str | None:
     """A merged PR that reported `Checklist: done|partial [c:key]`: tick the line (done) or say on the issue what the
     slice delivered (partial; #20: epics showed 0 of 8 while their slices merged), and for a core issue queue its
     next unclaimed line (or the same one, partial) right away. None = not settled here: the old followup, e.g. every line
@@ -4387,18 +4522,23 @@ def settle_check(state: dict, issue: int, pr: int, status: str, key: str, left_t
                + (f"; left: {left_text}" if left_text else "") + " (promoter-bot)")
         if not run(["gh", "api", "-X", "POST", f"repos/{REPO}/issues/{issue}/comments", "-f", f"body={msg}"]).returncode:
             note += ", commented"
-    left = [c for c in checklist(body) if not c["done"]]
+    # promoter-bot #108: #7958 reported 4 lines done; settling the first queued the second, which the same PR ticks
+    # next. The PR's other `done` keys are settled here too, so they are neither "left" nor the next line.
+    left = [c for c in checklist(body) if not c["done"] and c["key"] not in also_done]
     if not left:
         return None
     note += f", {len(left)} left"
     i["body"] = body
+    stale: list[dict] = []
     if (not state.get("workers_paused") and in_focus(state, {"issue": issue})
             and issue != ladder_anchor(state)  # the ladder refill slices it by estate
             and not foreign_claim(i) and not host_skips(i)
             and not any(x.get("issue") == issue for s in ("queue", "running") for x in state.get(s, []))
-            and (c := next_check(i, state))):
+            and (c := next_check(i, state, exclude=set(also_done) | ({key} if status == "done" else set()), stale=stale))):
         state.setdefault("queue", []).append(refill_item(i, check=c))
         note += f"; queued next line [c:{c['key']}]"
+    if stale:
+        note += "".join(f"; {x}" for x in note_stale_lines(state, issue, stale))
     return note
 
 
@@ -6562,8 +6702,11 @@ def prune_prereqs(state: dict) -> list[str]:
             keep.append(p)
     if out:
         with edit_state() as st:
-            st.setdefault("focus", {})["prereqs"] = [p for p in st["focus"].get("prereqs") or []
-                                                     if any(p.get("issue") == k.get("issue") for k in keep)]
+            f = st.setdefault("focus", {})
+            gone = [p for p in f.get("prereqs") or [] if not any(p.get("issue") == k.get("issue") for k in keep)]
+            f["prereqs"] = [p for p in f.get("prereqs") or [] if any(p.get("issue") == k.get("issue") for k in keep)]
+            # kept so focus_share still counts their earlier launches as focus (promoter-bot #108)
+            f["prereqs_dropped"] = ((f.get("prereqs_dropped") or []) + [{**p, "dropped": iso(now())} for p in gone])[-40:]
     return out
 
 
@@ -6628,6 +6771,15 @@ def park_off_focus(state: dict, issue: int, task: str, source: str) -> str:
     return f"off focus ({f.get('name') or 'focus'}): #{issue} not queued, parked"
 
 
+def _dropped_or_prereq(f: dict, issue) -> bool:
+    """A run from before focus_at_launch: its issue left the focus as closed, or was a prerequisite link."""
+    with contextlib.suppress(TypeError, ValueError):
+        n = int(issue)
+        return (any(int(d.get("issue", 0)) == n for d in f.get("dropped_closed") or [])
+                or any(int(p.get("issue", 0)) == n for p in (f.get("prereqs") or []) + (f.get("prereqs_dropped") or [])))
+    return False
+
+
 def focus_share(state: dict, hours: float = 24) -> dict:
     """Launch mix over the last `hours` since the focus was set: {focus, filler, leak, total}. New worker runs only (not
     checks, prechecks or resumes). `leak` = off-focus and not filler: something launched around the focus."""
@@ -6642,7 +6794,11 @@ def focus_share(state: dict, hours: float = 24) -> dict:
         out["total"] += 1
         # experiment runs record no lane, only an exp/ branch (2026-10-27: 13 E1 runs paged as "drift")
         lane = m.get("lane") or ("experiment" if str(m.get("branch") or "").startswith("exp/") else None)
-        kind = ("focus" if in_focus(state, {"issue": m.get("issue"), "task": m.get("task"), "lane": lane})
+        # promoter-bot #108: judged against the focus of launch time. 2026-11-06: all 54 "leaked" launches were census
+        # issues that were focus when they launched and were dropped as they closed (#7525 #7847 #7844 #7846 #7901).
+        was = m.get("focus_at_launch")
+        focus_now = in_focus(state, {"issue": m.get("issue"), "task": m.get("task"), "lane": lane})
+        kind = ("focus" if was or (was is None and (focus_now or _dropped_or_prereq(f, m.get("issue"))))
                 else "filler" if m.get("filler") else "leak")
         out[kind] += 1
     return out
@@ -6726,7 +6882,7 @@ def focus_refill(state: dict) -> list[str]:
     checked = focus_cfg(state).get("refill_checked") or {}
     due = [n for n in focus_issues(state) if n not in busy and n != ladder_anchor(state)
            and not ((t := parse_iso(checked.get(str(n)))) and now() - t < dt.timedelta(hours=FOCUS_REFILL_EVERY_H))]
-    out, items, seen, closed = [], [], {}, []
+    out, items, seen, closed, stale_by = [], [], {}, [], {}
     for n in due[:FOCUS_REFILL_READS]:
         seen[str(n)] = iso(now())
         try:
@@ -6738,10 +6894,13 @@ def focus_refill(state: dict) -> list[str]:
             continue
         if i.get("state") != "open" or foreign_claim(i) or host_skips(i):
             continue
-        if c := next_check(i, state):
+        stale_by[n] = []
+        if c := next_check(i, state, stale=stale_by[n]):
             items.append(refill_item(i, check=c))
             out.append(f"focus refill: queued #{n} [c:{c['key']}] {c['text'][:80]}")
     with edit_state() as st:
+        for n, found in stale_by.items():  # promoter-bot #108: lines whose owner closed are a tick need, not work
+            out += note_stale_lines(st, n, found)
         f = st.setdefault("focus", {})
         f["refill_checked"] = {**(f.get("refill_checked") or {}), **seen}
         have = {x.get("issue") for x in st.get("queue", [])}
@@ -7125,6 +7284,17 @@ def gate(state: dict, b: dict, force: list[str], needs: dict[str, str] | None = 
         reasons += list(needs.values())
     # 2026-10-22: the gate never looked at owner answers, so seven 10-21 rulings sat unapplied for a day while the
     # ticks it did wake (refill, launch) stayed on their own reason. Step 0b applies them.
+    acks = state.get("acks") or {}
+    if stale := [v for k, v in (state.get("checklist_stale") or {}).items() if k not in acks]:
+        reasons.append("checklist lines whose owner issue is closed, so refill skips them (promoter-bot #108): " + ", ".join(
+            f"#{v['issue']} [c:{v['key']}] owner #{v['owner']}" for v in stale[:6])
+            + ". If the owner's close finished the line: `churn checklist tick ISSUE KEY --note '#OWNER closed'`; "
+              "if work is left: file or name an open owner, then `churn ack chk:ISSUE:KEY --note why`")
+    if orphans := [(k, v) for k, v in (state.get("gap_orphans") or {}).items() if k not in acks]:
+        reasons.append("census gap rows with no open owner (gap_prevalence.md, promoter-bot #108): " + ", ".join(
+            f"`{v['gap'][:70]}` ({v['why']})" for _, v in orphans[:4])
+            + ". File one owner issue per row (scrubbed gap key and counts only; #7709 tools-only rules), then "
+              "`churn ack gap:KEY --note '#N'` (" + ", ".join(k for k, _ in orphans[:4]) + ")")
     if answers := unapplied_owner_answers():
         reasons.append("owner answers to apply (step 0b, owner-answers.jsonl): " + ", ".join(
             f"{e.get('id', '?')} ({str(e.get('question') or e.get('item') or '')[:60]})" for e in answers))
@@ -8427,12 +8597,40 @@ def checklist(body: str | None) -> list[dict]:
             for m in CHECK_RE.finditer(body or "")]
 
 
-def tick_line(body: str, key: str, pr: int) -> str | None:
-    """body with the unchecked line `key` ticked and its PR appended; None if no unchecked line has that key."""
+def tick_line(body: str, key: str, pr: int | None, note: str = "") -> str | None:
+    """body with the unchecked line `key` ticked and its PR (or a note) appended; None if no unchecked line has it."""
+    tail = f" (#{pr})" if pr else (f" ({note})" if note else "")
     for m in CHECK_RE.finditer(body):
         if m.group(2) == " " and check_key(m.group(3)) == key:
-            return body[:m.start()] + f"{m.group(1)}[x] {m.group(3)} (#{pr})" + body[m.end():]
+            return body[:m.start()] + f"{m.group(1)}[x] {m.group(3)}{tail}" + body[m.end():]
     return None
+
+
+# promoter-bot #108 (2026-11-06): #7709 kept 4 unticked lines whose owner issues had closed (#7525 #7526 #7846 #7847), and a
+# followup `--next` queued a slice for closed #7847. A line names its owner as "owned by #N", "consolidated in #N" or a
+# leading "(#N"; when that owner is closed the line is not queued, and the tick is asked to tick or ack it instead.
+LINE_OWNER_RES = (re.compile(r"owned by #(\d+)", re.I), re.compile(r"consolidated in #(\d+)", re.I),
+                  re.compile(r"\(#(\d+)\b"))
+_OWNER_OPEN: dict[int, tuple[float, bool | None]] = {}
+OWNER_OPEN_TTL_S = 1800
+
+
+def line_owner(text: str, issue: int | None = None) -> int | None:
+    """The issue a checklist line names as its owner, or None (the issue itself never counts)."""
+    for rx in LINE_OWNER_RES:
+        if (m := rx.search(text or "")) and int(m.group(1)) != issue:
+            return int(m.group(1))
+    return None
+
+
+def owner_open(n: int) -> bool | None:
+    """issue_open with a 30 min memo: refill and settle read the same owners within one gate pass."""
+    hit = _OWNER_OPEN.get(n)
+    if hit and time.time() - hit[0] < OWNER_OPEN_TTL_S:
+        return hit[1]
+    v = issue_open(n)
+    _OWNER_OPEN[n] = (time.time(), v)
+    return v
 
 
 def claimed_checks(state: dict, issue: int) -> set[str]:
@@ -8441,9 +8639,34 @@ def claimed_checks(state: dict, issue: int) -> set[str]:
             for k in CHECK_KEY_RE.findall(str(x.get("task", "")))}
 
 
-def next_check(i: dict, state: dict) -> dict | None:
-    taken = claimed_checks(state, i["number"])
-    return next((c for c in checklist(i.get("body")) if not c["done"] and c["key"] not in taken), None)
+def next_check(i: dict, state: dict, exclude: set[str] | frozenset = frozenset(),
+               stale: list[dict] | None = None) -> dict | None:
+    """The first unticked line nobody holds. `exclude`: keys settled elsewhere (the same merged PR's other `done`
+    lines). A line whose named owner issue is closed is skipped and, when `stale` is given, appended to it."""
+    taken = claimed_checks(state, i["number"]) | set(exclude)
+    for c in checklist(i.get("body")):
+        if c["done"] or c["key"] in taken:
+            continue
+        if (o := line_owner(c["text"], i["number"])) and owner_open(o) is False:
+            if stale is not None:
+                stale.append({"issue": i["number"], "key": c["key"], "owner": o, "text": c["text"][:160]})
+            continue
+        return c
+    return None
+
+
+def note_stale_lines(st: dict, issue: int, found: list[dict]) -> list[str]:
+    """Replace issue's entries in st['checklist_stale'] with `found`; log lines for the new ones."""
+    cur = st.setdefault("checklist_stale", {})
+    keep = {k: v for k, v in cur.items() if int(v.get("issue", 0)) != issue}
+    new = []
+    for f in found:
+        tok = f"chk:{issue}:{f['key']}"
+        if tok not in cur:
+            new.append(f"checklist #{issue} [c:{f['key']}]: owner #{f['owner']} is closed; not queued (tick or ack it)")
+        keep[tok] = {**f, "t": cur.get(tok, {}).get("t") or iso(now())}
+    st["checklist_stale"] = keep
+    return new
 
 
 def check_task(i: dict, c: dict) -> str:
@@ -9209,6 +9432,11 @@ def cmd_tick(a) -> int:
             did += [f"direct launch {d}" for d in direct]
         did += credit_lane(b, snap, on_credit, a.dry_run)  # when=always, or credit about to expire, or the pause
         did += solver_lane(b, snap, a.dry_run)  # no model: runs on credit ticks too; off unless `churn solver on`
+        did += census_lane(b, a.dry_run)  # no model: the census unit after a census-linked merge (#108)
+        if not a.dry_run:
+            with contextlib.suppress(Exception):
+                for note in gap_owner_check():
+                    log(note)
         if not on_credit:  # a credit pause keeps launches to the review/merge loop: RSI and experiments wait
             did += retro_lane(b, snap, a.dry_run)  # the RSI lane: always on, whatever the focus
             did += conflict_lane(b, snap, a.dry_run)
@@ -9959,8 +10187,42 @@ def cmd_scorecard(a) -> int:
     return 0
 
 
+def cmd_ack(a) -> int:
+    """Acknowledge a tick need so the gate stops raising it (promoter-bot #108): `chk:ISSUE:KEY` or `gap:KEY`."""
+    if a.list or not a.token:
+        for k, v in sorted((load_state().get("acks") or {}).items()):
+            print(f"{k}  {v.get('t')}  {v.get('note', '')}")
+        return 0
+    if not re.fullmatch(r"(chk:\d+:[0-9a-f]{8}|gap:[0-9a-f]{8})", a.token):
+        raise SystemExit("ack chk:ISSUE:KEY | gap:KEY (as the gate's need prints them)")
+    with edit_state() as st:
+        st.setdefault("acks", {})[a.token] = {"t": iso(now()), "note": a.note[:200]}
+        acks = st["acks"]
+        if len(acks) > 200:
+            st["acks"] = dict(sorted(acks.items(), key=lambda kv: kv[1].get("t", ""))[-200:])
+    log(f"ack {a.token}" + (f": {a.note[:120]}" if a.note else ""))
+    print(f"acked {a.token}")
+    return 0
+
+
 def cmd_checklist(a) -> int:
-    """Checklist parts per open issue of a scope (default core): ticked / total, and the next unclaimed line."""
+    """Checklist parts per open issue of a scope (default core): ticked / total, and the next unclaimed line.
+    `checklist tick ISSUE KEY --note TEXT`: tick one line without a PR (its owner issue closed: promoter-bot #108)."""
+    if getattr(a, "action", "list") == "tick":
+        if not a.issue or not a.key or not a.note:
+            raise SystemExit("checklist tick ISSUE KEY --note 'why' (e.g. '#7847 closed')")
+        i = gh_json(f"repos/{REPO}/issues/{a.issue}")
+        new = tick_line(i.get("body") or "", a.key, None, a.note[:120])
+        if new is None:
+            raise SystemExit(f"#{a.issue} has no unticked line [c:{a.key}]")
+        r = run(["gh", "api", "-X", "PATCH", f"repos/{REPO}/issues/{a.issue}", "--input", "-"], input=json.dumps({"body": new}))
+        if r.returncode:
+            raise SystemExit(f"gh api PATCH #{a.issue}: {r.stderr.strip()[:200]}")
+        with edit_state() as st:
+            (st.get("checklist_stale") or {}).pop(f"chk:{a.issue}:{a.key}", None)
+        log(f"checklist #{a.issue} [c:{a.key}] ticked without a PR: {a.note[:120]}")
+        print(f"ticked #{a.issue} [c:{a.key}]")
+        return 0
     state = load_state()
     every = [i for i in gh_pages(f"repos/{REPO}/issues?labels=scope:{a.scope}&state=open&per_page=100")
              if "pull_request" not in i]
@@ -10064,6 +10326,16 @@ def cmd_status(a) -> int:
           + (f"; running {so['running'].get('case')}" if solver_live(state) else
              f"; {so['hold']}" if so.get("hold") and solver_cfg(state)["enabled"] else "")
           + f"; {len(solver_history(state, 24))} runs in 24 h (`churn solver`)")
+    cl, ccfg = state.get("census_lane") or {}, census_cfg(state)
+    last_c = (cl.get("history") or [{}])[-1]
+    print(f"census lane: {'on' if ccfg['enabled'] else 'off'} ({ccfg['unit']}, issues "
+          f"{', '.join(f'#{n}' for n in sorted(census_issues(state)))})"
+          + (f"; due after #{cl['due'].get('pr')}" if cl.get("due") else "")
+          + (f"; held: {cl['hold']}" if cl.get("hold") else "")
+          + (f"; last run {last_c.get('t')} after #{last_c.get('pr')}" if last_c.get("t") else "; no run yet"))
+    if n_need := len([k for k in (state.get("checklist_stale") or {}) if k not in (state.get("acks") or {})]) + len(
+            [k for k in (state.get("gap_orphans") or {}) if k not in (state.get("acks") or {})]):
+        print(f"tick needs from #108: {n_need} (stale checklist lines / ownerless gap rows; `churn ack --list`)")
     if gq := state.get("gh_quota"):
         print(f"GitHub API: {gq.get('remaining')}/{gq.get('limit')} left, resets "
               f"{iso(dt.datetime.fromtimestamp(gq.get('reset', 0), dt.timezone.utc))}, burn "
@@ -10840,6 +11112,15 @@ def main() -> int:
     ck = sub.add_parser("checklist", help="checklist parts per open issue (ticked/total) and the scope's parts left")
     ck.add_argument("--scope", default="core", choices=list(SCOPES))
     ck.add_argument("--next", action="store_true", help="also show each issue's next unclaimed line")
+    ck.add_argument("action", nargs="?", default="list", choices=["list", "tick"])
+    ck.add_argument("issue", nargs="?", type=int)
+    ck.add_argument("key", nargs="?")
+    ck.add_argument("--note", default="", help="tick: why the line is done without a PR")
+    ak = sub.add_parser("ack", help="silence one tick need: chk:ISSUE:KEY (checklist line, owner closed) or gap:KEY "
+                                    "(census gap row without an open owner)")
+    ak.add_argument("token", nargs="?")
+    ak.add_argument("--note", default="")
+    ak.add_argument("--list", action="store_true")
     sc = sub.add_parser("scorecard", help="the day's numbers: merged, spend, $/PR, issues net, hours main was red")
     sc.add_argument("--day", help="YYYY-MM-DD (UTC; default today so far)")
     sc.add_argument("--json", action="store_true")
@@ -11030,6 +11311,8 @@ def main() -> int:
         return cmd_scorecard(a)
     if a.cmd == "checklist":
         return cmd_checklist(a)
+    if a.cmd == "ack":
+        return cmd_ack(a)
     return 2
 
 

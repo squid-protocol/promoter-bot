@@ -6148,3 +6148,119 @@ def test_a_program_refused_by_design_is_settled_and_listed_apart(churn):
     assert [u["program"] for u in m["untranslated"]] == ["src/OTHER.cbl"] and m["untracked"] == ["src/OTHER.cbl"]
     assert m["source_defects"] == [] and "1 not translated whole (2 holes)" in churn.goal_summary(m)
     assert churn.goal_summary(m).endswith("; 1 refused by design")
+
+
+# ---------------------------------------------------------------- promoter-bot #108 (census #7709 lessons)
+def test_one_pr_ticking_several_lines_never_queues_a_line_it_also_ticks(churn, monkeypatch):
+    body = "- [ ] web line\n- [ ] copy line\n- [ ] last line\n"
+    gh = _Gh(churn, monkeypatch, body)
+
+    def patched(cmd, **kw):  # each PATCH becomes the issue's body, as GitHub would
+        if kw.get("input"):
+            gh.issue["body"] = json.loads(kw["input"])["body"]
+            gh.sent.append(kw["input"])
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
+    monkeypatch.setattr(churn, "run", patched)
+    a, b = churn.check_key("web line"), churn.check_key("copy line")
+    st = {"prs": [{"number": 9, "issue": 4}], "queue": [], "running": []}
+    churn.settle_closed(st, {"9": {**pr(state="closed", merged=True), "checks": [["done", a, ""], ["done", b, ""]]}})
+    assert "- [x] web line (#9)" in gh.issue["body"] and "- [x] copy line (#9)" in gh.issue["body"]
+    keys = [k for q in st["queue"] for k in churn.CHECK_KEY_RE.findall(q["task"])]
+    assert len(st["queue"]) == 1 and set(keys) == {churn.check_key("last line")}  # 11-06 #7958 queued a line it ticked
+
+
+def test_a_line_whose_owner_closed_is_not_queued_but_raised_to_the_tick(churn, monkeypatch):
+    body = "- [ ] refusals (**owned by #7847**)\n- [ ] json, 2 programs (#7524, reopened)\n"
+    i = {"number": 4, "state": "open", "title": "t", "body": body, "labels": []}
+    monkeypatch.setattr(churn, "issue_open", lambda n: {7847: False, 7524: True}.get(n))
+    churn._OWNER_OPEN.clear()
+    stale = []
+    c = churn.next_check(i, {"queue": [], "running": []}, stale=stale)
+    assert c["text"].startswith("json") and stale[0]["owner"] == 7847
+    assert churn.line_owner("x (#7644; some may be source defects)") == 7644
+    assert churn.line_owner("code-page literals, consolidated in #7526. T3: (#7738)") == 7526
+    assert churn.line_owner("see (#4) itself", issue=4) is None
+    st = {}
+    assert "owner #7847 is closed" in churn.note_stale_lines(st, 4, stale)[0]
+    assert churn.note_stale_lines(st, 4, stale) == []  # logged once
+    tok = f"chk:4:{stale[0]['key']}"
+    reasons, _ = churn.gate({**st, "queue": [], "running": [], "prs": []}, {"verdict": "GREEN", "free_slots": 0}, [])
+    assert any("owner #7847" in r for r in reasons)
+    reasons, _ = churn.gate({**st, "acks": {tok: {}}, "queue": [], "running": [], "prs": []},
+                            {"verdict": "GREEN", "free_slots": 0}, [])
+    assert not any("owner #7847" in r for r in reasons)
+
+
+def test_tick_line_takes_a_note_instead_of_a_pr(churn):
+    k = churn.check_key("first part")
+    assert "- [x] first part (#7847 closed)" in churn.tick_line(BODY, k, None, "#7847 closed")
+    assert "- [x] first part (#9)" in churn.tick_line(BODY, k, 9)
+
+
+GAP_MD = """# Gap prevalence
+
+## All estates (15 estates: burned B, census C)
+
+| gap | scope | estates | programs | e0 | e1 | e2 | e3 | e4 | none | status | owner |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `<name>: undeclared item` | C | 2 | 4 | 0 | 0 | 3 | 0 | 0 | 1 | named source defect | #7647 (source defect) |
+| `EXEC CICS: operand is not a data area` | C | 1 | 1 | 0 | 0 | 0 | 0 | 1 | 0 | not modelled | #4270 (cics-command-slice) |
+| `missing copybook: z/OS Connect product` | C | 1 | 2 | 0 | 0 | 1 | 0 | 1 | 0 | unknown | #7709 (product copybook frontier) |
+| `SET TO ENTRY: pointers` | B | 1 | 1 | 0 | 0 | 0 | 0 | 1 | 0 | not modelled | none |
+
+Coverage if closed ...
+
+| gap | estates | programs | status | owner |
+|---|---|---|---|---|
+| `later table` | 1 | 1 | not modelled | none |
+"""
+
+
+def test_gap_rows_without_an_open_owner_become_a_tick_need(churn, tmp_path):
+    page = tmp_path / "gap.md"
+    page.write_text(GAP_MD)
+    rows = churn.gap_rows(GAP_MD)
+    assert [r["status"] for r in rows] == ["named source defect", "not modelled", "unknown", "not modelled"]
+    notes = churn.gap_owner_check(force=True, page=page, is_open=lambda n: {4270: False, 7709: True}.get(n))
+    st = churn.load_state()
+    gaps = sorted(v["gap"] for v in st["gap_orphans"].values())
+    assert gaps == ["EXEC CICS: operand is not a data area"] and len(notes) == 1  # the burned (B) row is left out
+    assert churn.gap_owner_check(page=page, is_open=lambda n: False) == []  # within GAP_CHECK_EVERY_H: no reread
+    reasons, _ = churn.gate({**st, "queue": [], "running": [], "prs": []}, {"verdict": "GREEN", "free_slots": 0}, [])
+    assert any("owner #4270 closed" in r and "churn ack gap:" in r for r in reasons)
+
+
+def test_census_lane_runs_the_unit_after_a_census_merge(churn, monkeypatch):
+    calls = []
+
+    def fake(cmd, **kw):
+        calls.append(cmd)
+        out = "inactive" if "is-active" in cmd else ""
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+    st = {"prs": [], "queue": [], "running": [], "focus": {"prereqs": [{"issue": 7959, "for": 7709}]}}
+    assert churn.census_mark_due(st, 1234, 5) is None  # not a census issue
+    assert "census run due" in churn.census_mark_due(st, 7959, 7960)  # a prerequisite of #7709 counts
+    churn.save_state(st) if hasattr(churn, "save_state") else churn.STATE.write_text(json.dumps(st))
+    assert churn.census_lane({"verdict": "YELLOW"}, runner=fake) == []
+    assert "box YELLOW" in churn.load_state()["census_lane"]["hold"]
+    did = churn.census_lane({"verdict": "GREEN"}, runner=fake)
+    assert did and ["systemctl", "--user", "start", "--no-block", "census-nightly.service"] in calls
+    s = churn.load_state()["census_lane"]
+    assert "due" not in s and s["history"][-1]["pr"] == 7960
+    assert churn.census_lane({"verdict": "GREEN"}, runner=fake) == []  # nothing due any more
+
+
+def test_launches_count_as_focus_by_the_focus_they_launched_under(churn, monkeypatch):
+    monkeypatch.setattr(churn, "in_focus", lambda state, x: x.get("issue") == 1)
+    t = churn.iso(churn.now())
+    for rid, meta in {"7847-a": {"issue": 7847, "focus_at_launch": True},          # launched as focus, closed since
+                      "7525-a": {"issue": 7525},                                   # older run: dropped as closed
+                      "7845-a": {"issue": 7845},                                   # older run: a dropped prerequisite
+                      "9999-a": {"issue": 9999, "focus_at_launch": False}}.items():  # a real leak
+        d = churn.RUNS / rid
+        d.mkdir(parents=True)
+        (d / "meta.json").write_text(json.dumps({"run_id": rid, "started": t, **meta}))
+    st = {"focus": {"issues": [1], "dropped_closed": [{"issue": 7525}],
+                    "prereqs_dropped": [{"issue": 7845, "for": 7709}]}}
+    mix = churn.focus_share(st)
+    assert (mix["focus"], mix["leak"], mix["total"]) == (3, 1, 4)
