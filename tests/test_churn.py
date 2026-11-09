@@ -895,6 +895,22 @@ def test_queue_add_before_an_issue(churn, capsys):
     assert [q["issue"] for q in churn.load_state()["queue"]] == [1, 7, 5117, 5118]
 
 
+def test_a_workers_self_requeue_behind_a_pr_waits_for_the_merge(churn, monkeypatch):
+    """#8121 (2026-11-09): blocked runs requeued themselves --after-pr 8157; the approval released them every tick."""
+    put(churn, queue=[])
+    ns = lambda issue: argparse.Namespace(action="add", issue=issue, task="blocked", model="sonnet", needs_owner=False,
+                                          backend=None, front=False, pr=None, after_pr=[8157], allow_workflows=False,
+                                          agy_step=None, lane=None, before_issue=None, index=None, note=None)
+    monkeypatch.setenv("CHURN_RUN_ID", "8121-20261109T0653Z")
+    churn.cmd_queue(ns(8121))  # its own issue: wait for the merge
+    churn.cmd_queue(ns(8122))  # another issue it queues: a plain after_pr, released on approval as before
+    monkeypatch.delenv("CHURN_RUN_ID")
+    churn.cmd_queue(ns(8121))  # the owner or a tick: unchanged
+    q = churn.load_state()["queue"]
+    assert [bool(x.get("after_merge")) for x in q] == [True, False, False]
+    assert all(x["after_prs"] == [8157] for x in q)
+
+
 def test_priority_work_evicts_a_box_hogging_backfill(churn):
     stopped = []
     (churn.RUNS / "4628-x").mkdir(parents=True)
