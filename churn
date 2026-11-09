@@ -10418,6 +10418,14 @@ def cmd_queue(a) -> int:
                 item["after_prs"] = a.after_pr
             if getattr(a, "after_merge", False):
                 item["after_merge"] = True
+            # 2026-11-09: a worker that requeues ITS OWN issue behind a PR found the issue blocked on that PR's code, which
+            # it can only build on once the PR is on main. A plain after_pr is released on approval (blocked_by), so #8121
+            # relaunched every tick for 9 h behind approved-but-unmerged #8157, each run ending "requeued after-pr 8157".
+            run_id = os.environ.get("CHURN_RUN_ID", "")
+            if a.after_pr and not a.pr and run_id.split("-", 1)[0] == str(a.issue) and not item.get("after_merge"):
+                item["after_merge"] = True
+                log(f"queue add #{a.issue}: self-requeue from run {run_id} behind "
+                    f"{', '.join(f'#{n}' for n in a.after_pr)} waits for the merge, not the approval")
             if a.allow_workflows:
                 item["allow_workflows"] = True
             if a.agy_step:
