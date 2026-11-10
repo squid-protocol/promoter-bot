@@ -5392,6 +5392,43 @@ BOT_PRS = H / "churn-bot-prs.json"  # what tend_bot_prs did per bot PR: {n: {hea
 BOT_PR_MAX_AGE_H = 24
 
 
+# 2026-11-10 (gitgalaxy#8215): the shepherd's `*/20` reconcile cron is its net for a check that finishes last and is no
+# workflow_run trigger, and for the 15-minute rerun gap. GitHub started it 8 times in 48 h (every 4 to 9 h). #8213 sat
+# green with auto-merge armed and `ci-gate` pending for an hour; a `shepherd:retrying` PR waits for a pass that never
+# comes. While a watched open PR carries a label the shepherd acts on and no reconcile run was created in the last
+# RECONCILE_EVERY_MIN, the gate dispatches the workflow (its workflow_dispatch trigger). One read per
+# RECONCILE_EVERY_MIN at most, one host (role `bot_prs`), config `reconcile_workflow: ""` turns it off.
+RECONCILE_WF = _CFG.get("reconcile_workflow", "shepherd-reconcile.yml")
+RECONCILE_EVERY_MIN = 20
+RECONCILE_LABELS = ("shepherd:merge", "shepherd:retrying")
+
+
+def reconcile_nudge(state: dict, snap: dict | None, gh=None, sh=None) -> list[str]:
+    """Dispatch the shepherd's reconcile when labelled PRs wait and no pass ran lately. Returns log lines."""
+    if not RECONCILE_WF or QUOTA_MODE != "ok":
+        return []
+    waiting_prs = sorted((int(n) for n, v in (snap or {}).items() if v.get("state") == "open"
+                          and set(v.get("labels") or ()) & set(RECONCILE_LABELS)))
+    mem = state.get("reconcile_nudge") or {}
+    every = dt.timedelta(minutes=RECONCILE_EVERY_MIN)
+    if not waiting_prs or ((t := parse_iso(mem.get("checked"))) and now() - t < every):
+        return []
+    gh, sh = gh or gh_json, sh or run
+    runs = gh(f"repos/{REPO}/actions/workflows/{RECONCILE_WF}/runs?per_page=1").get("workflow_runs") or []
+    last = parse_iso(runs[0].get("created_at")) if runs else None
+    lines = []
+    with edit_state() as st:
+        m = st.setdefault("reconcile_nudge", {})
+        m["checked"] = iso(now())
+        if not (last and now() - last < every) and not (runs and runs[0].get("status") in ("queued", "in_progress")):
+            if sh(["gh", "workflow", "run", RECONCILE_WF, "-R", REPO, "--ref", "main"]).returncode == 0:
+                m["dispatched"] = iso(now())
+                ago = f"{(now() - last).total_seconds() / 60:.0f} min ago" if last else "never"
+                lines.append(f"reconcile: last shepherd pass {ago}, "
+                             f"{', '.join(f'#{n}' for n in waiting_prs[:6])} labelled: dispatched {RECONCILE_WF}")
+    return lines
+
+
 def tend_bot_prs(gh=None, sh=None) -> list[str]:
     """Bot PRs (a workflow's PR from a branch prefix in config `bot_prs`) have no worker and no shepherd label, so
     nothing looked after them: #5317 (evidence refresh) sat 13 h on 2026-10-17 after a 15.2 s timing flake failed
@@ -9387,6 +9424,9 @@ def cmd_tick(a) -> int:
                     log(line)
             with contextlib.suppress(Exception):
                 for line in (tend_bot_prs() if host_role("bot_prs") else []):
+                    log(line)
+            with contextlib.suppress(Exception):  # a nudge bug must never stop the gate
+                for line in (reconcile_nudge(state, snap) if host_role("bot_prs") else []):
                     log(line)
             SNAP.write_text(json.dumps(snap, indent=1))  # a cache for other commands; nothing diffs it any more
             with edit_state() as st:

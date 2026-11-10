@@ -6361,3 +6361,48 @@ def test_launches_count_as_focus_by_the_focus_they_launched_under(churn, monkeyp
                     "prereqs_dropped": [{"issue": 7845, "for": 7709}]}}
     mix = churn.focus_share(st)
     assert (mix["focus"], mix["leak"], mix["total"]) == (3, 1, 4)
+
+
+# ---------------------------------------------------------------- reconcile nudge (2026-11-10, gitgalaxy#8215)
+def _nudge(churn, monkeypatch, last_min, status="completed"):
+    reads, calls = [], []
+    made = (churn.now() - churn.dt.timedelta(minutes=last_min)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    runs = [] if last_min is None else [{"created_at": made, "status": status}]
+    gh = lambda path: reads.append(path) or {"workflow_runs": runs}  # noqa: E731
+    sh = lambda argv: calls.append(argv[:3]) or argparse.Namespace(returncode=0)  # noqa: E731
+    return reads, calls, gh, sh
+
+
+NUDGE_SNAP = {"7": {"state": "open", "labels": ["shepherd:merge"]}, "9": {"state": "open", "labels": []},
+              "11": {"state": "closed", "labels": ["shepherd:retrying"]}}
+
+
+def test_a_labelled_pr_with_no_shepherd_pass_for_20_minutes_gets_one_dispatched(churn, monkeypatch):
+    put(churn)
+    reads, calls, gh, sh = _nudge(churn, monkeypatch, 65)
+    out = churn.reconcile_nudge(churn.load_state(), NUDGE_SNAP, gh, sh)
+    assert calls == [["gh", "workflow", "run"]] and len(reads) == 1
+    assert "65 min ago" in out[0] and "#7 labelled" in out[0] and "#9" not in out[0] and "#11" not in out[0]
+    assert churn.reconcile_nudge(churn.load_state(), NUDGE_SNAP, gh, sh) == [] and len(reads) == 1  # one read per 20 min
+
+
+@pytest.mark.parametrize("last_min, status, snap", [
+    (5, "completed", NUDGE_SNAP),  # a pass ran 5 minutes ago
+    (40, "in_progress", NUDGE_SNAP),  # one is running (or queued) now
+    (65, "completed", {"9": {"state": "open", "labels": []}}),  # nothing the shepherd acts on
+])
+def test_the_nudge_leaves_a_recent_or_live_pass_and_unlabelled_prs_alone(churn, monkeypatch, last_min, status, snap):
+    put(churn)
+    reads, calls, gh, sh = _nudge(churn, monkeypatch, last_min, status)
+    assert churn.reconcile_nudge(churn.load_state(), snap, gh, sh) == [] and calls == []
+    assert len(reads) == (1 if snap is NUDGE_SNAP else 0)  # no labelled PR: no API read either
+
+
+def test_the_nudge_is_off_without_a_workflow_or_under_quota_pressure(churn, monkeypatch):
+    put(churn)
+    reads, calls, gh, sh = _nudge(churn, monkeypatch, 65)
+    monkeypatch.setattr(churn, "RECONCILE_WF", "")
+    assert churn.reconcile_nudge(churn.load_state(), NUDGE_SNAP, gh, sh) == []
+    monkeypatch.setattr(churn, "RECONCILE_WF", "shepherd-reconcile.yml")
+    monkeypatch.setattr(churn, "QUOTA_MODE", "hold")
+    assert churn.reconcile_nudge(churn.load_state(), NUDGE_SNAP, gh, sh) == [] and reads == [] and calls == []
