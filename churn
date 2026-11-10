@@ -6921,6 +6921,76 @@ def focus_refill(state: dict) -> list[str]:
     return out
 
 
+# 2026-11-10: a filler window that opens over an empty off-focus queue launches nothing. The tick was then asked to add
+# items and, on 9 of 9 asks in two days, added none ("no small, self-contained item"), so the need stalled and paged the
+# owner while both slots sat idle 3.5 h. The work was there: every off-focus follow-up and queue add of the last days
+# sits in focus.parked. With a window open and nothing in it launchable, the gate queues from that list itself, newest
+# first: an open scope:core or scope:sweep issue, not an epic, not another host's; its next unticked checklist line,
+# or with no checklist the parked follow-up slice. At most FILLER_REFILL_READS issue reads a pass, an issue at most once
+# per FILLER_REFILL_EVERY_H, never past FILLER_QUEUE_MAX queued filler items; a closed issue leaves the parked list.
+FILLER_REFILL_READS = 4
+FILLER_REFILL_EVERY_H = 2
+FILLER_PARKED_DAYS = 7
+FILLER_SCOPES = ("core", "sweep")
+
+
+def filler_refill(state: dict, snap: dict | None) -> list[str]:
+    """Queue filler items from focus.parked when an open filler window has nothing it can launch. Returns log lines."""
+    if not focus_on(state) or state.get("workers_paused") or QUOTA_MODE != "ok":
+        return []
+    if not filler_open(state) or filler_live(state, snap):
+        return []
+    room = FILLER_QUEUE_MAX - sum(1 for x in state.get("queue", []) if x.get("filler"))
+    if room <= 0:
+        return []
+    f = focus_cfg(state)
+    busy = {x.get("issue") for k in ("queue", "running", "reports_pending", "prs") for x in state.get(k, [])
+            if isinstance(x, dict)}
+    checked = f.get("filler_checked") or {}
+    cut = now() - dt.timedelta(days=FILLER_PARKED_DAYS)
+    due: dict[int, dict] = {}
+    for p in reversed(f.get("parked") or []):  # newest first; one entry per issue
+        n = int(p["issue"])
+        if n in due or n in busy or not ((t := parse_iso(p.get("t"))) and t > cut):
+            continue
+        if (c := parse_iso(checked.get(str(n)))) and now() - c < dt.timedelta(hours=FILLER_REFILL_EVERY_H):
+            continue
+        due[n] = p
+    out, items, seen, closed = [], [], {}, []
+    for n, p in list(due.items())[:FILLER_REFILL_READS]:
+        if len(items) >= room:
+            break
+        seen[str(n)] = iso(now())
+        try:
+            i = gh_json(f"repos/{REPO}/issues/{n}")
+        except (RuntimeError, ValueError):
+            continue
+        if i.get("state") == "closed":
+            closed.append(n)
+            continue
+        names = {str(lab.get("name", "")) for lab in i.get("labels") or []}
+        if i.get("state") != "open" or "pull_request" in i or "epic" in names or foreign_claim(i) or host_skips(i):
+            continue
+        if issue_scope(n, {"labels": i.get("labels") or []}) not in FILLER_SCOPES:
+            continue
+        if c := next_check(i, state):
+            items.append({**refill_item(i, check=c), "filler": True})
+            out.append(f"filler refill: queued #{n} [c:{c['key']}] {c['text'][:80]}")
+        elif not checklist(i.get("body")) and str(p.get("source", "")).startswith("followup"):
+            items.append({**refill_item(i, task=f"#{n} {i.get('title', '')[:120]} -- {p['task']}. Read the issue and "
+                                                 "that PR first; one PR-sized slice on burned estates only, and when "
+                                                 "nothing is left say so and open no PR."), "filler": True})
+            out.append(f"filler refill: queued #{n} ({p['source']}) {p['task'][:80]}")
+    with edit_state() as st:
+        fs = st.setdefault("focus", {})
+        fs["filler_checked"] = {**(fs.get("filler_checked") or {}), **seen}
+        if closed:
+            fs["parked"] = [p for p in fs.get("parked") or [] if int(p["issue"]) not in closed]
+        have = {x.get("issue") for x in st.get("queue", [])}
+        st.setdefault("queue", []).extend(x for x in items if x["issue"] not in have)
+    return out
+
+
 def focus_alerts(state: dict, snap: dict | None, launched: list[str]) -> list[str]:
     """Starvation bookkeeping, the unresolved-starvation page and the launch-mix pages. Returns log lines."""
     if not focus_on(state):
@@ -7536,6 +7606,11 @@ def shared_for(state: dict, n: str) -> dict:
     if any(c not in shared_checks and c not in ROLLUP_CHECKS for c in me["checks"]):
         return {}  # a real failure of the PR's own besides the shared one: its fixer still has work
     entry = next((e for e in book.get("issues", []) if set(e["sigs"]) & set(hits)), None)
+    # 2026-11-10: PR n is the fix of that shared red (its issue IS the shared-red issue), so it cannot wait on it. #8198
+    # (Fixes #8196) failed det once on a runner's Maven miss that left the same case NOT PROVEN, was marked
+    # "#8198 -> #8196", got no fixer, and the fix, its issue and the four PRs behind it waited on each other for 10 h.
+    if entry is not None and int(entry["issue"]) == int(me["issue"]):
+        return {}
     return {"sigs": hits, "entry": entry}
 
 
@@ -9461,6 +9536,10 @@ def cmd_tick(a) -> int:
             if starving(state):
                 with contextlib.suppress(Exception):  # a refill bug must never stop the gate
                     for line in focus_refill(state):
+                        log(line)
+                state = load_state()
+                with contextlib.suppress(Exception):  # 2026-11-10: an open window with nothing in it fills itself
+                    for line in filler_refill(state, snap):
                         log(line)
                 state = load_state()
         if not a.dry_run:

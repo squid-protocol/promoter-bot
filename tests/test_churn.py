@@ -5100,6 +5100,72 @@ def test_a_starved_focus_refills_the_next_checklist_line_of_idle_focus_issues(ch
     assert churn.focus_refill(churn.load_state()) == [] and churn.load_state()["queue"] == []  # another host's claim
 
 
+def _parked(churn, issue, source="followup #9000", task=None, days=0):
+    return {"issue": issue, "task": task or f"#{issue} next slice after #9000", "source": source,
+            "t": churn.iso(churn.now() - churn.dt.timedelta(days=days))}
+
+
+def _filler_issues(churn, monkeypatch, issues):
+    reads = []
+    monkeypatch.setattr(churn, "gh_json", lambda path: reads.append(path) or issues[int(path.rsplit("/", 1)[1])])
+    monkeypatch.setattr(churn, "host_skips", lambda i: None)
+    monkeypatch.setattr(churn, "foreign_claim", lambda i: None)
+    return reads
+
+
+def test_an_open_filler_window_with_nothing_queued_fills_itself_from_the_parked_work(churn, monkeypatch):
+    # 2026-11-10: 9 asks in two days for the tick to add filler items, none added, the owner paged, slots idle 3.5 h
+    lab = [{"name": "scope:sweep"}]
+    issues = {8010: {"number": 8010, "state": "open", "title": "rule overlaps", "labels": lab,
+                     "body": "- [x] first\n- [ ] second part\n"},
+              8097: {"number": 8097, "state": "open", "title": "no checklist", "labels": [{"name": "scope:core"}], "body": "x"},
+              8210: {"number": 8210, "state": "closed", "title": "main was red", "labels": lab, "body": ""},
+              8300: {"number": 8300, "state": "open", "title": "an epic", "labels": [*lab, {"name": "epic"}], "body": ""},
+              8301: {"number": 8301, "state": "open", "title": "frontier", "labels": [{"name": "scope:frontier"}], "body": ""},
+              8302: {"number": 8302, "state": "open", "title": "owner add, no checklist", "labels": lab, "body": "x"}}
+    reads = _filler_issues(churn, monkeypatch, issues)
+    monkeypatch.setattr(churn, "FILLER_REFILL_READS", 10)
+    window = {"until": churn.iso(churn.now() + churn.dt.timedelta(hours=2)), "launched": 0, "max": 4, "reason": "ci"}
+    parked = [_parked(churn, 7000, days=30), _parked(churn, 8302, source="queue add"), _parked(churn, 8301),
+              _parked(churn, 8300), _parked(churn, 8210), _parked(churn, 8097), _parked(churn, 8010)]
+    put(churn, focus={**_focus(churn, monkeypatch), "idle_passes": 3, "filler": window, "parked": parked},
+        queue=[item(6271, after_prs=[1], after_merge=True)])
+    out = churn.filler_refill(churn.load_state(), {})
+    st = churn.load_state()
+    filler = [x for x in st["queue"] if x.get("filler")]
+    assert [x["issue"] for x in filler] == [8010, 8097] and all(not churn.in_focus(st, x) for x in filler)
+    assert "[c:" in filler[0]["task"] and "second part" in filler[0]["task"]  # the next unticked checklist line
+    assert "next slice after #9000" in filler[1]["task"] and "open no PR" in filler[1]["task"]  # the parked follow-up
+    assert len(out) == 2 and all(x.startswith("filler refill: queued") for x in out)
+    assert 8210 not in [p["issue"] for p in st["focus"]["parked"]]  # a closed issue leaves the parked list
+    assert not any(p.endswith("/7000") for p in reads)  # parked a month ago: not read
+    assert churn.focus_pick(st, {}, "calm", False)[1]["issue"] == 8010  # and the window can launch it
+    reads.clear()
+    assert churn.filler_refill(churn.load_state(), {}) == [] and reads == []  # the window is live now: nothing to add
+
+
+@pytest.mark.parametrize("change", ["no window", "launchable filler queued", "paused", "queue full"])
+def test_the_filler_refill_only_runs_for_an_open_window_that_can_launch_nothing(churn, monkeypatch, change):
+    issues = {8010: {"number": 8010, "state": "open", "title": "t", "labels": [{"name": "scope:sweep"}],
+                     "body": "- [ ] part\n"}}
+    reads = _filler_issues(churn, monkeypatch, issues)
+    window = {"until": churn.iso(churn.now() + churn.dt.timedelta(hours=2)), "launched": 0, "max": 4, "reason": "ci"}
+    focus = {**_focus(churn, monkeypatch), "idle_passes": 3, "filler": window, "parked": [_parked(churn, 8010)]}
+    state = {"focus": focus, "queue": []}
+    if change == "no window":
+        focus.pop("filler")
+    elif change == "launchable filler queued":
+        state["queue"] = [item(3799, filler=True)]
+    elif change == "paused":
+        state["workers_paused"] = "owner"
+    else:  # FILLER_QUEUE_MAX filler items already queued, all waiting on a PR
+        state["queue"] = [item(3790 + k, filler=True, after_prs=[1], after_merge=True) for k in range(churn.FILLER_QUEUE_MAX)]
+    put(churn, **state)
+    snap = {"1": {"state": "open", "head": "h", "branch": "b", "labels": [], "mergeable_state": "blocked"}}
+    assert churn.filler_refill(churn.load_state(), snap) == [] and reads == []
+    assert [x["issue"] for x in churn.load_state()["queue"]] == [x["issue"] for x in state["queue"]]
+
+
 def test_queue_add_and_followups_park_off_focus_work_instead_of_queueing_it(churn, monkeypatch, capsys):
     put(churn, focus=_focus(churn, monkeypatch))
     a = argparse.Namespace(action="add", issue=3799, model="sonnet", task="next ledger slice", needs_owner=False,
@@ -6121,6 +6187,21 @@ def test_two_prs_of_one_issue_are_not_a_shared_red(churn):
     churn.queue_pr_fixes(st, snap, triage=shared_triage(churn, {7: (["det"], [UNLOCK]), 9: (["det"], [UNLOCK])}),
                          open_issue=lambda sigs, n: 1 / 0)
     assert "shared_red" not in st or not st["shared_red"].get("issues")
+
+
+def test_the_fix_pr_of_a_shared_red_keeps_its_fixer(churn):
+    # 2026-11-10: #8198 (Fixes #8196) went red on the same det case and was told to wait on #8196, its own issue
+    st = {"prs": [], "queue": [], "running": []}
+    table = {7: (["det"], [UNLOCK]), 9: (["det"], [UNLOCK]), 600: (["det"], [UNLOCK, "det::cruc-other"])}
+    churn.queue_pr_fixes(st, SNAP_SHARED, triage=shared_triage(churn, table), open_issue=lambda sigs, n: 500)
+    st["queue"] = []
+    st["prs"].append({"number": 600, "issue": 500})
+    snap = {**SNAP_SHARED, "600": {"state": "open", "head": "h600", "branch": "churn/500-fix",
+                                   "labels": ["shepherd:needs-fix"], "mergeable_state": "blocked"}}
+    added = churn.queue_pr_fixes(st, snap, triage=shared_triage(churn, table), open_issue=lambda sigs, n: 1 / 0)
+    assert not any(x.startswith("shared:#600") for x in added)
+    assert [q.get("pr") for q in st["queue"]] == [600]  # the fix PR is judged as any red PR; 7 and 9 still wait
+    assert st["shared_red"]["issues"][0]["prs"] == [7, 9]
 
 
 def test_a_merged_shared_red_fix_updates_the_waiting_prs_once(churn, monkeypatch):
