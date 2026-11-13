@@ -160,14 +160,20 @@ Open ONE draft PR titled "Weekly agent retro {day} (Part of #{issue})" that does
    For each, change the rule, skill or agent brief that should have prevented it, or say in the PR body why no
    instruction can.
 2. Lessons: promote the unticked lessons-inbox entries that are durable and not already covered. Tick each in {inbox}
-   with `-> <file>` (or `-> dropped: <why>`).
+   with `-> <file>` (or `-> dropped: <why>`). The data file's `lesson_grades` graded each one first (mechanical checks,
+   then a reader): promote a `keep`; tick a `drop` as `-> dropped: <its why>` unless you say in the PR body, in one
+   line, why the grader is wrong; judge an `ungraded` one yourself.
 3. Prune: merge duplicate or overlapping rules, delete rules that the code, tests or gates now enforce, and shorten.
    Size budgets (repo file: KB): {sizes}. Stay within each, and put origin/main's size and yours in the PR body.
    Removing text counts as much as adding it.
 4. Numbers: in the PR body, a small table of this week's vs. the previous week's daily scorecard figures ($ per merged
    churn PR, fix loops per merged PR, idle ticks or hours) from the data file, with one line on what moved and which
    earlier change it may come from.
-5. Experiments: if this week's data raises a question about how agents work here whose answer would change a brief, a
+5. Did earlier rule changes work: `rules_effect` lists, per instructions revision over four weeks (oldest first), the
+   PRs opened under it, how many needed a fix run, and those fix runs' causes. For each rule an earlier retro changed
+   to stop a failure, say in the PR body whether that cause fell under the revisions after it. Rewrite or remove one
+   that did not move its cause; a revision with under 15 PRs proves nothing either way, so say that instead.
+6. Experiments: if this week's data raises a question about how agents work here whose answer would change a brief, a
    rule or a policy (not a CI knob: those are tuned, not tested), append at most ONE line to {proposals}:
    `- [ ] <the question> | <what the answer would change>`. churn's experiment lane designs, registers and runs it;
    never run an experiment yourself.
@@ -2038,6 +2044,7 @@ def cmd_worker(a) -> int:
             "check_of": getattr(a, "check_of", None), "repo": getattr(a, "repo", None) or None,
             "allow_workflows": "standing" if allow_wf == "standing" else bool(allow_wf), "precheck_of": getattr(a, "precheck_of", None),
             "head_start": run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip() or None,
+            "rules_rev": rules_rev(str(wt)),
             **({"filler": True} if filler else {})}
     with contextlib.suppress(Exception):  # promoter-bot #108: judged at launch, so a focus issue that later closes
         meta["focus_at_launch"] = bool(in_focus(load_state(), {"issue": issue, "task": task,  # (and leaves the
@@ -2506,6 +2513,156 @@ def retro_due(state: dict) -> tuple[bool, str]:
 SCORECARD_HEAD = re.compile(r"^# Scorecard (\d{4}-\d\d-\d\d)")
 
 
+# 2026-11-13: a rule went into the instructions and nothing ever asked whether the failure it was written for fell
+# (five timing-test reds in one week were each fixed on their own). Every run now records the instructions revision
+# it read (the last commit that changed CLAUDE.md, AGENTS.md or .claude/ as of its starting head), and the retro gets,
+# per revision, the PRs opened under it and how many needed a fix run, by cause.
+RULES_PATHS = ("CLAUDE.md", "AGENTS.md", ".claude")
+_RULES_REV: dict[tuple[str, str], str | None] = {}
+
+
+def rules_rev(repo: str, at: str = "HEAD") -> str | None:
+    """The short hash of the last commit, as of `at`, that changed the agents' instructions; None when git cannot say."""
+    key = (repo, at)
+    if key not in _RULES_REV:
+        r = run(["git", "-C", repo, "log", "-1", "--format=%h %cs", at, "--", *RULES_PATHS], timeout=60)
+        _RULES_REV[key] = r.stdout.strip() or None if not r.returncode else None
+    return _RULES_REV[key]
+
+
+def rules_effect(since: dt.datetime, runs_dir: Path | None = None, rev_of=None) -> list[dict]:
+    """Per instructions revision, oldest first: PRs whose first run read it, how many of them needed a fix run
+    (send-back or PR fix; precheck retries are not fixes) and those fix runs' causes. A run from before revisions were
+    recorded is placed by its starting head (`rev_of`, default: git in the primary checkout)."""
+    rd = runs_dir or RUNS
+    rev_of = rev_of or (lambda sha: rules_rev(str(V6), sha))
+    by_pr: dict[int, list[tuple[Path, dict]]] = {}
+    for m in rd.glob("*/meta.json"):
+        with contextlib.suppress(OSError, ValueError):
+            meta = json.loads(m.read_text())
+            if (meta.get("pr") and not meta.get("repo") and meta.get("lane") not in RSI_LANES
+                    and (t := parse_iso(meta.get("started"))) and t >= since):
+                by_pr.setdefault(int(meta["pr"]), []).append((m.parent, meta))
+    revs: dict[str, dict] = {}
+    for runs in by_pr.values():
+        runs.sort(key=lambda x: x[1].get("started") or "")
+        first = runs[0][1]
+        rev = first.get("rules_rev") or (rev_of(first["head_start"]) if first.get("head_start") else None)
+        if not rev:
+            continue
+        e = revs.setdefault(rev, {"rev": rev, "first_run": first.get("started"), "prs": 0, "fixed": 0, "causes": {}})
+        e["first_run"] = min(e["first_run"], first.get("started"))
+        e["prs"] += 1
+        fixes = [(d, meta) for d, meta in runs[1:] if run_kind(meta, rd) in ("pr_fix", "send_back")]
+        e["fixed"] += bool(fixes)
+        for d, _ in fixes:
+            cause = "unlabelled"
+            with contextlib.suppress(OSError, ValueError, KeyError):
+                cause = json.loads((d / "cause.json").read_text())["cause"]
+            e["causes"][cause] = e["causes"].get(cause, 0) + 1
+    out = sorted(revs.values(), key=lambda e: e["first_run"] or "")
+    for e in out:
+        e["fix_rate"] = round(e["fixed"] / e["prs"], 3)
+    return out
+
+
+# 2026-11-13: lessons went from a PR body to the inbox to the instructions on the retro worker's say-so alone. Each
+# unticked lesson is now graded before the retro reads it: mechanical checks first (does it cite a PR, is it a repeat
+# of another entry, do the instructions already say it), then one cheap model call for the three things only a reader
+# can judge. The retro promotes `keep`, and must give its reason to overrule a `drop`.
+LESSON_PROMPT = """Grade each lesson an automated coding agent proposed for the standing instructions every future agent
+reads. A lesson earns its place only if it is all three:
+specific: names the tool, file, command or situation it applies to (not "be careful", "check your work")
+actionable: says what to do or not do
+durable: will still be true next month (not a one-off state of one PR, a number that will move, or a bug since fixed)
+Reply with ONLY a JSON object mapping id to {"grade": "keep" or "drop", "why": "<at most 12 words>"}.
+
+LESSONS:
+"""
+LESSON_MIN_WORDS = 8
+# share of a lesson's distinctive words found in ONE paragraph or list item of an instructions file. Against whole
+# files the check called 6 of 10 real lessons covered on 2026-11-13 (a 2,000-word file holds most common words; one
+# "covered" lesson's key term, commarea_hex, was not in its file at all), so the unit is the passage.
+LESSON_COVERED = 0.6
+_PASSAGE_SPLIT = re.compile(r"\n\s*\n|\n(?=\s*(?:[-*]|\d+\.)\s)|\n(?=#)")
+
+
+def _lesson_words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z_][a-z0-9_.-]{3,}", text.lower()) if w not in LESSON_STOP}
+
+
+LESSON_STOP = frozenset("that this with from when then they them their there which while what will would should could "
+                        "have been being into only also must never always before after until because does each every "
+                        "more than over under without within about".split())
+
+
+def lesson_checks(lessons: list[str], rules: dict[str, str]) -> list[dict]:
+    """The mechanical half of the grade, per unticked inbox line: cites a PR, long enough, not a repeat of an earlier
+    entry, not already said by an instructions file (`rules`: path -> text)."""
+    out, seen = [], []
+    passages = [(f, w) for f, t in rules.items() for part in _PASSAGE_SPLIT.split(t) if (w := _lesson_words(part))]
+    for i, line in enumerate(lessons):
+        text = re.sub(r"^- \[ \]\s*", "", line)
+        words = _lesson_words(re.sub(r"\(PR #\d+\)", "", text))
+        e = {"id": str(i), "lesson": text[:400], "cites_pr": bool(re.search(r"#\d+", text)), "problems": []}
+        if len(text.split()) < LESSON_MIN_WORDS:
+            e["problems"].append("too short to act on")
+        if not e["cites_pr"]:
+            e["problems"].append("cites no PR or issue: nothing to check it against")
+        if any(len(words & w) >= 0.8 * max(1, len(words)) for w in seen):
+            e["problems"].append("repeats an earlier inbox entry")
+        covered = [(len(words & pw) / max(1, len(words)), f) for f, pw in passages]
+        if covered and (best := max(covered))[0] >= LESSON_COVERED and len(words) >= 5:
+            e["covered_by"] = best[1]
+            e["problems"].append(f"{best[0]:.0%} of its words are already in one passage of {best[1]}")
+        seen.append(words)
+        out.append(e)
+    return out
+
+
+def grade_lessons(lessons: list[str], rules: dict[str, str], ask=None) -> list[dict]:
+    """Each unticked lesson with its grade: `drop` when a mechanical check fails, else the model's keep/drop; `ungraded`
+    when the model gave no answer for it (the retro then judges it alone, as before)."""
+    graded = lesson_checks(lessons, rules)
+    todo = [{"id": e["id"], "lesson": e["lesson"]} for e in graded if not e["problems"]]
+    got: dict = {}
+    if todo:
+        with contextlib.suppress(Exception):
+            got = (ask or ask_lesson_grades)(todo) or {}
+    for e in graded:
+        if e["problems"]:
+            e["grade"], e["why"] = "drop", "; ".join(e["problems"])
+        elif isinstance(g := got.get(e["id"]), dict) and g.get("grade") in ("keep", "drop"):
+            e["grade"], e["why"] = g["grade"], str(g.get("why") or "")[:120]
+        else:
+            e["grade"], e["why"] = "ungraded", "the grader gave no answer"
+        del e["problems"]
+    return graded
+
+
+def ask_lesson_grades(items: list[dict], model: str | None = None) -> dict:
+    out: dict = {}
+    for i in range(0, len(items), 40):
+        r = run([CLAUDE, "-p", "--model", model or _CFG.get("lesson_model", "haiku"), "--output-format", "json"],
+                input=LESSON_PROMPT + json.dumps(items[i:i + 40]), timeout=600)
+        with contextlib.suppress(ValueError, KeyError, TypeError, AttributeError):
+            out.update(json.loads(re.search(r"\{.*\}", json.loads(r.stdout)["result"], re.S).group(0)))
+    return out
+
+
+def instruction_files(repo: Path | None = None) -> dict[str, str]:
+    """The agents' instruction files of the primary checkout as committed on origin/main (its working tree lags)."""
+    repo = repo or V6
+    names = run(["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "origin/main", "--", *RULES_PATHS], timeout=60)
+    out = {}
+    for f in names.stdout.split():
+        if f.endswith(".md"):
+            got = run(["git", "-C", str(repo), "show", f"origin/main:{f}"], timeout=60)
+            if not got.returncode:
+                out[f] = got.stdout
+    return out
+
+
 def retro_data(state: dict, since: dt.datetime, runs_dir: Path | None = None, log_text: str | None = None,
                inbox: Path | None = None) -> dict:
     """The week's facts for the retro worker, from churn's own files (no model, no GitHub)."""
@@ -2577,7 +2734,12 @@ def retro_lane(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
     day = now().strftime("%Y-%m-%d")
     data = H / "retro" / f"retro-{day}.json"
     data.parent.mkdir(parents=True, exist_ok=True)
-    data.write_text(json.dumps(retro_data(state, now() - dt.timedelta(days=float(cfg["every_days"]))), indent=1))
+    facts = retro_data(state, now() - dt.timedelta(days=float(cfg["every_days"])))
+    with contextlib.suppress(Exception):  # the retro still runs on the week's facts if either extra fails
+        facts["rules_effect"] = rules_effect(now() - dt.timedelta(days=4 * float(cfg["every_days"])))
+    with contextlib.suppress(Exception):
+        facts["lesson_grades"] = grade_lessons(facts.get("unticked_lessons") or [], instruction_files())
+    data.write_text(json.dumps(facts, indent=1))
     brief = RETRO_BRIEF.format(day=day, issue=cfg["issue"], deep_tag=", deep audit" if deep else "", data=data,
                                inbox=H / "lessons-inbox.md", proposals=EXP_PROPOSALS,
                                sizes=", ".join(f"{k}: {v}" for k, v in cfg["size_budget_kb"].items()) or "none set",
@@ -6237,6 +6399,11 @@ def ci_profile_sample(state: dict, gh=None, ignore=(), want=()) -> list[str]:
     except RuntimeError:
         window = []
     notes += rejected
+    with contextlib.suppress(Exception):  # the per-kind prices are a refinement: never let them stop the sample
+        if folded := learn_push_kinds(window, prof, cfg, state):
+            kinds = prof.get("per_push_by_kind") or {}
+            notes.append(f"ci profile: {folded} push(es) priced by kind: " + ", ".join(
+                f"{k} {kinds[k]['rm']:g} (n={kinds[k]['n']})" for k in CI_KINDS if k in kinds))
     if (pp := per_push_cost(window, prof, cfg)) is not None:
         if per_push_ok(pp, state):
             old = prof.get("per_push_rm")
@@ -6246,6 +6413,99 @@ def ci_profile_sample(state: dict, gh=None, ignore=(), want=()) -> list[str]:
     if note := adjust_target_util(state):
         notes.append(note)
     return notes
+
+
+# 2026-11-13: one learned price for every launch was off by up to 2.6x in both directions over Nov 6-13 (learned
+# 118-188 runner-minutes; measured per merged bot PR 40-310): a docs PR and a crucible pin bump paid the same. Pushes
+# are now also priced by the kind of PR they belong to, and a launch is priced by the kind its task or its issue's
+# last PR points at. A kind with fewer than CI_KIND_MIN_N pushes seen keeps the one-price-for-all figure.
+CI_KINDS = ("docs", "data", "pin", "code")
+CI_KIND_MIN_N = 5
+CI_KIND_LOOKUPS = 6  # PR file lists fetched per sample for PRs churn does not watch (one API call each)
+_PIN_RE = re.compile(r"(?i)\bpin\b[^.]{0,40}\bbump|\bbump\b[^.]{0,40}\bpin\b|\bpin bump\b")
+_PIN_FILE_RE = re.compile(r"(^|/)pins?\.")
+_DOCS_TASK_RE = re.compile(r"(?i)\bdoc[- ]?(drift|refs?)\b|\bdocs?:|\breadme\b")
+_DATA_TASK_RE = re.compile(r"(?i)\bdata[- ]only\b|\[ladder:|\bbody[- ]only\b")
+
+
+def pr_kind(files: list[str], title: str = "") -> str:
+    """docs: only Markdown or docs/; pin: a pin bump; data: no hand-written file (ledgers, cases, goldens); else code."""
+    if _PIN_RE.search(title or "") or any(_PIN_FILE_RE.search(f) for f in files):
+        return "pin"
+    if files and all(f.endswith(".md") or f.startswith("docs/") for f in files):
+        return "docs"
+    if files and not hand_written(files):
+        return "data"
+    return "code"
+
+
+def task_kind(task: object, issue: object, prof: dict) -> str | None:
+    """The kind a launch will most likely push: what its task says, else its issue's last PR; None when unknown."""
+    text = str(task or "")
+    if _PIN_RE.search(text):
+        return "pin"
+    if _DOCS_TASK_RE.search(text):
+        return "docs"
+    if _DATA_TASK_RE.search(text):
+        return "data"
+    return (prof.get("issue_kind") or {}).get(str(issue))
+
+
+def learn_push_kinds(runs: list[dict], prof: dict, cfg: dict, state: dict, files=None) -> int:
+    """Fold each finished push in `runs` (all pull_request runs of a closed window) into per_push_by_kind and remember
+    its issue's kind. `files(n)`: PR n's changed paths, default the per-head cache, else up to CI_KIND_LOOKUPS API
+    reads. Returns the pushes folded."""
+    pushes: dict[str, list[dict]] = {}
+    for r in runs:
+        if (r.get("event") == "pull_request" and r.get("status") in (None, "completed")
+                and r.get("conclusion") not in ("cancelled", "skipped") and r.get("head_sha")):
+            pushes.setdefault(r["head_sha"], []).append(r)
+    cache: dict = {}
+    if files is None:
+        with contextlib.suppress(OSError, ValueError):
+            cache = json.loads(PR_FILES_CACHE.read_text())
+    lookups, a, n = [CI_KIND_LOOKUPS], float(cfg["alpha"]), 0
+
+    def changed(num: int) -> list[str] | None:
+        if files is not None:
+            return files(num)
+        if (hit := cache.get(str(num))) and hit.get("files") is not None:
+            return list(hit["files"])
+        if lookups[0] <= 0:
+            return None
+        lookups[0] -= 1
+        return pr_files(num)
+
+    by_kind = prof.setdefault("per_push_by_kind", {})
+    issue_kind = prof.setdefault("issue_kind", {})
+    for rs in pushes.values():
+        num = next((p.get("number") for r in rs for p in r.get("pull_requests") or [] if p.get("number")), None)
+        paths = changed(int(num)) if num else None
+        if not paths:
+            continue
+        kind = pr_kind(paths, str(rs[0].get("display_title") or ""))
+        cost = sum(float(workflow_cost(prof, os.path.basename(str(r.get("path", ""))), cfg)["runner_min"]) for r in rs)
+        if not per_push_ok(cost, state):
+            continue
+        e = by_kind.setdefault(kind, {"n": 0})
+        e["rm"] = round(cost if not e["n"] else (1 - a) * float(e.get("rm", cost)) + a * cost, 1)
+        e["n"] += 1
+        n += 1
+        if m := re.match(r"churn/(\d+)-", str(rs[0].get("head_branch") or "")):
+            issue_kind.pop(m[1], None)
+            issue_kind[m[1]] = kind  # newest last
+    for k in list(issue_kind)[:-300]:
+        del issue_kind[k]
+    return n
+
+
+def launch_cost(kind: str | None, prof: dict, state: dict, fallback: float) -> float:
+    """Runner-minutes one launch of this kind is expected to push: its learned per-push price x pushes_per_pr once
+    CI_KIND_MIN_N pushes of the kind were seen, else `fallback` (the one price for all)."""
+    e = (prof.get("per_push_by_kind") or {}).get(kind or "")
+    if e and int(e.get("n", 0)) >= CI_KIND_MIN_N and per_push_ok(e.get("rm"), state):
+        return float(e["rm"]) * float(ci_admission_cfg(state)["pushes_per_pr"])
+    return fallback
 
 
 def per_push_cost(runs: list[dict], prof: dict, cfg: dict) -> float | None:
@@ -6455,11 +6715,18 @@ def ci_admission(state: dict, backlog: dict, q: dict | None = None) -> dict:
     if not per_launch > 0:  # never let a price refuse launches: only room and the queue wait may
         per_launch = default_push
     live = [r for r in claude_slot_holders(state) if not r.get("repo")]
-    committed = len(live) * per_launch
+    committed = sum(launch_cost(task_kind(r.get("task"), r.get("issue"), prof), prof, state, per_launch) for r in live)
     in_hand = float(backlog.get("queued_rm") or 0) + float(backlog.get("active_rm") or 0)
     room = u * int(backlog.get("pool") or pcfg["pool"]) * float(cfg["horizon_min"]) - in_hand - committed
+    # the next launch is priced by its own kind (a docs slice fits where a pin bump does not)
+    nxt = next((x for x in state.get("queue", []) if not x.get("needs_owner") and x.get("backend") != "agy"
+                and not x.get("repo")), None)
+    next_kind = task_kind(nxt.get("task"), nxt.get("issue"), prof) if nxt else None
+    next_cost = launch_cost(next_kind, prof, state, per_launch)
     out = {"target_util": round(u, 3), "per_launch_rm": round(per_launch), "committed_rm": round(committed),
-           "room_rm": round(room), "admit": max(0, int(room // per_launch))}
+           "room_rm": round(room), "admit": max(0, int(room // next_cost))}
+    if next_cost != per_launch:
+        out.update(next_kind=next_kind, next_launch_rm=round(next_cost))
     if prof.get("per_push_rm") is not None and not per_push_ok(prof["per_push_rm"], state):
         out["cost_fallback"] = f"stored per_push_rm {prof['per_push_rm']!r} is not a real cost"
     qw, hold = (q or {}).get("median_wait_min"), float(cfg["hold_queue_wait_min"])
