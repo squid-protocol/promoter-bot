@@ -1,0 +1,10 @@
+[Unit]
+Description=promoter-bot gate every 10 minutes
+
+[Timer]
+OnCalendar=*:00/10
+Persistent=false
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
