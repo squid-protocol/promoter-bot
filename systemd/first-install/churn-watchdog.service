@@ -1,0 +1,8 @@
+[Unit]
+Description=promoter-bot watchdog: pages the owner when the gate stopped, its timer died or gh lost its login
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/.local/bin/churn watchdog
+TimeoutStartSec=120

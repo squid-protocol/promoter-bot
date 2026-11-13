@@ -2281,6 +2281,38 @@ def plan_env(**extra) -> dict:
     return {**{k: v for k, v in os.environ.items() if k not in API_KEY_VARS}, **WORKER_ENV, **extra}
 
 
+# 2026-11-13 (an outside security review of the public repos): every worker, the reviewing tick and the merge step
+# ran as the owner, with the owner's one GitHub login, so nothing but prompt text stopped a worker from labelling its
+# own PR or pushing to any repository the owner can. With `worker_token_file` set, WORKER sessions (never ticks) get
+# that file's token instead: `gh` reads it from GH_TOKEN, and git is pointed at https with gh as its credential
+# helper, so a push uses the same token and not the owner's ssh key. Use a bot account, or a fine-grained token
+# limited to the one repository with contents, pull requests and issues read/write and nothing else. Configured but
+# unusable (missing, empty, or readable by other users) fails the run: a worker never falls back to the owner's login.
+WORKER_TOKEN_FILE = _CFG.get("worker_token_file")
+
+
+def worker_identity_env(path: str | None = None) -> dict:
+    """The environment that makes a worker's gh and git act as the bot identity; {} when none is configured."""
+    path = WORKER_TOKEN_FILE if path is None else path
+    if not path:
+        return {}
+    f = Path(path).expanduser()
+    try:
+        mode = f.stat().st_mode
+        token = f.read_text().strip()
+    except OSError as e:
+        raise RuntimeError(f"worker identity: cannot read {f} ({e.strerror or e})") from None
+    if mode & 0o077:
+        raise RuntimeError(f"worker identity: {f} is readable by other users (chmod 600 it)")
+    if not token or any(c.isspace() for c in token):
+        raise RuntimeError(f"worker identity: {f} holds no single token")
+    return {"GH_TOKEN": token, "GITHUB_TOKEN": token, "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": "3",
+            "GIT_CONFIG_KEY_0": "credential.https://github.com.helper", "GIT_CONFIG_VALUE_0": "",  # drop the host's helpers
+            "GIT_CONFIG_KEY_1": "credential.https://github.com.helper", "GIT_CONFIG_VALUE_1": "!gh auth git-credential",
+            "GIT_CONFIG_KEY_2": "url.https://github.com/.insteadOf", "GIT_CONFIG_VALUE_2": "git@github.com:"}
+
+
 def _claude(cmd: list[str], cwd: str, env: dict, out_path: Path, err_path: Path) -> tuple[int, dict]:
     with open(out_path, "w") as out, open(err_path, "w") as err:
         rc = subprocess.call(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
@@ -2307,6 +2339,15 @@ def cmd_run(a) -> int:
             nudge_tick()
             return 0
         env["ANTHROPIC_API_KEY"] = key
+    try:
+        env.update(worker_identity_env())
+    except RuntimeError as e:  # never run a worker on the owner's login when a bot identity was asked for
+        (rd / "out.json").write_text(json.dumps({"is_error": True, "result": str(e)}))
+        (rd / "err.txt").write_text("")
+        (rd / "exit").write_text(f"1\n{iso(now())}\n")
+        DIRTY.touch()
+        nudge_tick()
+        return 0
     prompt = (rd / "prompt.md").read_text()
     resume = meta.get("resume_session")
     rc = 0
