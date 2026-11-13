@@ -4,5 +4,5 @@ Description=promoter-bot watchdog: pages the owner when the gate stopped, its ti
 [Service]
 Type=oneshot
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/python3 %h/.local/bin/churn watchdog
+ExecStart=/usr/bin/python3 %h/.local/bin/promoter-bot watchdog
 TimeoutStartSec=120

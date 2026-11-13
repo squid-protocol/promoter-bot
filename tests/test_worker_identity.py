@@ -52,3 +52,29 @@ def test_an_unusable_token_file_fails_the_run_instead_of_using_the_owners_login(
     make(f)
     with pytest.raises(RuntimeError, match=why):
         churn.worker_identity_env(str(f))
+
+
+def test_the_old_command_name_is_a_link_to_the_program_and_both_home_variables_work(tmp_path, monkeypatch):
+    """2026-11-13: the program file is `promoter-bot`; `churn` is a link to it, because every installed host's command,
+    units and workers call that name and a rename that removed it would stop the gate at its next self-update."""
+    import importlib.machinery
+    import importlib.util
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    assert (root / "churn").is_symlink() and (root / "churn").resolve() == root / "promoter-bot"
+    assert os.access(root / "promoter-bot", os.X_OK)
+    monkeypatch.setenv("PROMOTER_BOT_CONFIG", str(tmp_path / "none.json"))
+    for var in ("PROMOTER_BOT_HOME", "CHURN_HOME"):
+        monkeypatch.delenv("PROMOTER_BOT_HOME", raising=False)
+        monkeypatch.delenv("CHURN_HOME", raising=False)
+        monkeypatch.setenv(var, str(tmp_path / var))
+        loader = importlib.machinery.SourceFileLoader(f"pb_{var}", str(root / "churn"))  # through the old name
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(f"pb_{var}", loader))
+        loader.exec_module(mod)
+        assert mod.H == tmp_path / var and Path(mod.SELF).name == "promoter-bot"
+    monkeypatch.setenv("CHURN_HOME", str(tmp_path / "old"))  # both set: the new name wins
+    monkeypatch.setenv("PROMOTER_BOT_HOME", str(tmp_path / "new"))
+    loader = importlib.machinery.SourceFileLoader("pb_both", str(root / "promoter-bot"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("pb_both", loader))
+    loader.exec_module(mod)
+    assert mod.H == tmp_path / "new"
