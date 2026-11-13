@@ -695,6 +695,22 @@ def precheck_holds(e: dict) -> bool:
     return e.get("precheck") == "pending" and bool(t) and now() - t < dt.timedelta(minutes=PRECHECK_FUSE_MIN)
 
 
+# 2026-11-13 (owner, after reading agentrun): a run that reaches its spend cap is paused for a decision instead of
+# going straight to the tick, which sends it back or starts a fresh run by itself. For BUDGET_PAUSE_H its report is
+# held and listed in `churn inbox`: `churn budget continue RUN [--usd N]` resumes the same session with more room,
+# `churn budget release RUN` hands it to the tick now. Unanswered, the tick takes it as before, so a cap never
+# stalls the factory (0 of 1,644 runs hit one between Oct 30 and Nov 13). `budget_pause_h: 0` in config turns it off.
+BUDGET_PAUSE_H = float(_CFG.get("budget_pause_h", 2))
+
+
+def budget_holds(e: dict) -> bool:
+    """A budget-capped run's report is still waiting for the owner's continue / release."""
+    if e.get("status") != "budget" or not BUDGET_PAUSE_H or e.get("budget_released"):
+        return False
+    t = parse_iso(e.get("budget_at") or (_run_meta(e.get("run_id", "")) or {}).get("finished"))
+    return bool(t) and now() - t < dt.timedelta(hours=BUDGET_PAUSE_H)
+
+
 def start_precheck(rid: str) -> None:
     """Spawn the model-free pre-review check of a finished run (`churn _precheck`)."""
     spawn_detached(f"churn-precheck-{rid}", [sys.executable, SELF, "_precheck", rid], TICK_CWD, RUNS / rid / "precheck.log")
@@ -1755,9 +1771,52 @@ SESSION_SETTINGS = json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hoo
     {"type": "command", "command": f"python3 {GH_LOG_HOOK}", "timeout": 5}]}]}})
 
 
-def claude_cmd(prompt: str, model: str, budget: float, resume: str | None = None, allowed: list[str] | None = None) -> list[str]:
+# 2026-11-13 (owner, after reading agentrun): workers ran on the host with only the permission allowlist between them
+# and the network. `sandbox.enabled` in config.json turns on Claude Code's own Bash sandbox (bubblewrap) for WORKER
+# sessions: outbound connections only to the listed hosts, writes only in the worktree, the per-user temp directory
+# and the listed paths, and no retry outside the sandbox. Ticks and the rescue stay as they are (they drive churn
+# itself). Opt-in per host, because a host's toolchain decides the lists: check with `churn sandbox probe` first.
+# docker cannot run inside the sandbox; `excluded_commands` (default: docker) run outside it, with no limits, so a
+# worker that may use docker is not contained by this. Probed 2026-11-13 on melek with Claude Code 2.1.325.
+SANDBOX_CFG = _CFG.get("sandbox") or {}
+SANDBOX_DOMAINS = ("github.com", "api.github.com", "codeload.github.com", "*.githubusercontent.com", "pypi.org",
+                   "files.pythonhosted.org", "repo.maven.apache.org", "repo1.maven.org", "registry.npmjs.org")
+SANDBOX_BLOCK_RE = re.compile(r"sandbox blocked network-outbound to ([\w.*-]+)(?::\d+)?")
+
+
+def sandbox_settings(cfg: dict | None = None) -> dict | None:
+    """The `sandbox` settings block for a worker session, or None when this host has not turned it on."""
+    cfg = SANDBOX_CFG if cfg is None else cfg
+    if not cfg.get("enabled"):
+        return None
+    domains = list(dict.fromkeys([*SANDBOX_DOMAINS, *(cfg.get("allowed_domains") or [])]))
+    # a worktree's commits are written under the primary checkout's .git; churn's own commands write the handoffs
+    writes = list(dict.fromkeys([str(V6 / ".git"), str(H), *(str(x) for x in cfg.get("allow_write") or [])]))
+    out = {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+           "network": {"allowedDomains": domains, "strictAllowlist": True},
+           "filesystem": {"allowWrite": writes}}
+    if excluded := cfg.get("excluded_commands", ["docker *"]):
+        out["excludedCommands"] = list(excluded)
+    if deny := cfg.get("deny_read"):
+        out["filesystem"]["denyRead"] = [str(x) for x in deny]
+    return out
+
+
+def session_settings(sandbox: bool = False) -> str:
+    box = sandbox_settings() if sandbox else None
+    return json.dumps({**json.loads(SESSION_SETTINGS), "sandbox": box}) if box else SESSION_SETTINGS
+
+
+def sandbox_blocked(text: str) -> list[str]:
+    """Hosts the sandbox refused, as named in a session's result text (Claude Code puts the host in the command's
+    output; the JSON result has no field for it)."""
+    return sorted(set(SANDBOX_BLOCK_RE.findall(text or "")))
+
+
+def claude_cmd(prompt: str, model: str, budget: float, resume: str | None = None, allowed: list[str] | None = None,
+               sandbox: bool = False) -> list[str]:
     cmd = [CLAUDE, "-p", prompt, "--model", model, "--permission-mode", "auto", "--output-format", "json",
-           "--max-budget-usd", str(budget), "--settings", SESSION_SETTINGS, "--strict-mcp-config"]
+           "--max-budget-usd", str(budget), "--settings", session_settings(sandbox), "--strict-mcp-config"]
     if resume:
         cmd += ["--resume", resume]
     if allowed:
@@ -2239,7 +2298,7 @@ def cmd_run(a) -> int:
     try:
         if meta.get("plan"):
             meta["self_scan"] = self_scan(meta["worktree"], rd)
-            pcmd = claude_cmd(PLAN_HEADER + prompt, meta["model"], round(budget * PLAN_SHARE, 2))
+            pcmd = claude_cmd(PLAN_HEADER + prompt, meta["model"], round(budget * PLAN_SHARE, 2), sandbox=True)
             pcmd[pcmd.index("auto")] = "plan"
             rc, pout = _claude(pcmd, meta["worktree"], env, rd / "plan_out.json", rd / "plan_err.txt")
             pcost, _ = run_cost(pout)
@@ -2266,7 +2325,7 @@ def cmd_run(a) -> int:
                       "and keep your change in those files small. Now implement the plan in full, following the brief "
                       "(gates, WIP pushes, handoff note, draft PR, final report). If the plan turned out wrong, say what "
                       "changed in your report.")
-        rc, _ = _claude(claude_cmd(prompt, meta["model"], budget, resume=resume), meta["worktree"], env,
+        rc, _ = _claude(claude_cmd(prompt, meta["model"], budget, resume=resume, sandbox=True), meta["worktree"], env,
                         rd / "out.json", rd / "err.txt")
     finally:
         (rd / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -4147,6 +4206,10 @@ def reap(state: dict) -> list[dict]:
                     meta["hand_changed"] = hand
         meta.update(session_id=out.get("session_id"), status=status, cost_usd=round(cost, 2), finished=iso(now()), pr=pr,
                     session_cost_usd=round(session_cost, 4))
+        if blocked := sandbox_blocked(result):
+            meta["sandbox_blocked"] = blocked
+            log(f"sandbox: run {rid} was refused {', '.join(blocked)} (add to sandbox.allowed_domains in config.json if "
+                "the work needs it)")
         if status == "done" and not pr and not meta.get("code_changed") and not meta.get("repo") and not meta.get("pr"):
             if fam := ladder_mark_dry(state, meta.get("task") or r.get("task"), rid):
                 log(f"ladder: {fam} marked dry by {rid} (no PR, no commit): no requeue until its levels move, "
@@ -4656,6 +4719,132 @@ def owner_items(state: dict, snap: dict) -> list[str]:
     out += [f"experiment {e['id']} designed: owner OK needed ({e.get('question_file')})"
             for e in state.get("experiments", []) if e.get("stage") == "designed"]
     return out
+
+
+def inbox(state: dict, snap: dict) -> list[dict]:
+    """Everything that waits on a person, as records (2026-11-13: one place instead of `churn status` lines, phone
+    questions and the scorecard). Each has a kind, a ref, what it is, since when (where churn recorded it), whether an
+    answer is already on its way, and the command or step that settles it. Oldest first, undated last."""
+    answered = answered_refs()
+    since_stalled = state.get("stalled_at") or {}
+    out: list[dict] = []
+
+    def add(kind: str, ref: str, what: str, how: str, since: str | None = None, line: str = "") -> None:
+        out.append({"kind": kind, "ref": ref, "what": what[:300], "since": since, "how": how,
+                    "answered": bool(line) and owner_ref(line) in answered})
+
+    for n in owner_holds(state, snap):
+        p = next((p for p in state.get("prs", []) if isinstance(p, dict) and pr_num(p) == int(n)), {})
+        add("pr-hold", f"PR #{n}", str(p.get("note") or "on hold at its current head"),
+            f"decide, then `churn pr reviewed {n} --head <sha> --verdict merge|send-back` (or answer on the phone)",
+            p.get("held_at") or p.get("reviewed_at"), f"PR #{n} on hold: ")
+    for q in state.get("queue", []):
+        if q.get("needs_owner"):
+            ref = f"queue #{q['issue']}" + (f" (PR #{q['pr']})" if q.get("pr") else "")
+            add("ruling", ref, str(q.get("note") or q.get("task") or ""),
+                "answer on the issue or the phone; `churn queue` shows its index for `queue rm` / re-add without --needs-owner",
+                q.get("parked") if isinstance(q.get("parked"), str) else None, f"queue #{q['issue']}: ")
+    for k in state.get("stalled", []):
+        add("stalled", f"stalled: {k}", f"the tick tried {STALL_AFTER} times and could not move this",
+            f"fix the cause or wait: it is asked again {STALL_REARM_H:g} h after it stalled", since_stalled.get(k),
+            f"stalled: {k}")
+    for e in state.get("experiments", []):
+        if e.get("stage") == "designed":
+            add("experiment", f"experiment {e['id']}", f"designed, needs the owner's OK ({e.get('question_file')})",
+                f"`churn experiment approve {e['id']}` or `churn experiment drop {e['id']}`", e.get("designed_at"))
+    for e in state.get("reports_pending", []):
+        if budget_holds(e):
+            m = _run_meta(e.get("run_id", "")) or {}
+            add("budget", f"run {e['run_id']}", f"#{e.get('issue')} stopped at its spend cap (${m.get('cost_usd', '?')} spent); "
+                f"the tick takes it {BUDGET_PAUSE_H:g} h after it stopped",
+                f"`churn budget continue {e['run_id']} [--usd N]` or `churn budget release {e['run_id']}`", m.get("finished"))
+    for k in state.get("orphans", []):
+        add("liveness", str(k), "open work with no next step recorded", "queue a slice for it or close it")
+    return sorted(out, key=lambda x: (x["since"] is None, x["since"] or ""))
+
+
+def cmd_inbox(a) -> int:
+    state = load_state()
+    snap = json.loads(SNAP.read_text()) if SNAP.exists() else {}
+    items = inbox(state, snap)
+    if getattr(a, "json", False):
+        print(json.dumps({"host": HOST_ID, "at": iso(now()), "items": items}, indent=1))
+        return 0
+    if not items:
+        print("inbox: nothing waits on you")
+        return 0
+    print(f"inbox: {len(items)} item(s) wait on you (oldest first)")
+    for x in items:
+        age = ""
+        if t := parse_iso(x["since"]):
+            h = (now() - t).total_seconds() / 3600
+            age = f" [{h:.0f} h]" if h < 48 else f" [{h / 24:.0f} d]"
+        print(f"- {x['kind']}: {x['ref']}{age}{' (answered, being applied)' if x['answered'] else ''}\n    {x['what']}\n    -> {x['how']}")
+    return 0
+
+
+def cmd_budget(a) -> int:
+    """`churn budget` lists runs paused at their spend cap; `continue RUN [--usd N]` resumes the same session with a
+    fresh cap (N, else the model's usual one); `release RUN` hands the report to the tick now."""
+    with edit_state() as st:
+        held = [e for e in st.get("reports_pending", []) if budget_holds(e)]
+        if a.action == "list":
+            for e in held:
+                print(f"{e['run_id']} #{e.get('issue')}: paused at its cap until the tick takes it")
+            if not held:
+                print("no run is paused at its spend cap")
+            return 0
+        e = next((e for e in st.get("reports_pending", []) if e.get("run_id") == a.run_id), None)
+        if e is None or e.get("status") != "budget":
+            raise SystemExit(f"{a.run_id} is not a budget-capped run waiting for review")
+        if a.action == "release":
+            e["budget_released"] = True
+            log(f"budget: {a.run_id} released to the tick")
+            return 0
+        st["reports_pending"] = [x for x in st.get("reports_pending", []) if x.get("run_id") != a.run_id]
+    log(f"budget: {a.run_id} continued" + (f" with ${a.usd:g} more" if a.usd else ""))
+    ns = argparse.Namespace(resume_run=a.run_id, force=True, plan=False, budget_usd=a.usd,
+                            message="Your run stopped at its spend cap and the owner allowed it to continue. Pick up "
+                                    "exactly where you stopped: finish the step in hand, push, and write your report.")
+    return cmd_worker(ns)
+
+
+def cmd_sandbox(a) -> int:
+    """`churn sandbox` prints what a worker session would get; `probe` runs one cheap headless session that tries an
+    allowed host, a host that is not allowed, a write in its directory and a write outside it."""
+    box = sandbox_settings(SANDBOX_CFG if a.action == "status" else {**SANDBOX_CFG, "enabled": True})
+    if a.action == "status":
+        print("sandbox: " + ("on for worker sessions" if box else "off (set sandbox.enabled in config.json; "
+                                                                    "`churn sandbox probe` checks this host first)"))
+        if box:
+            print(json.dumps(box, indent=1))
+        return 0
+    work = Path(tempfile.mkdtemp(prefix="churn-sandbox-probe-"))
+    outside = Path.home() / f".churn-sandbox-probe-{os.getpid()}"
+    prompt = ("Run exactly these four shell commands, each as its own Bash call, and nothing else. Then reply with one "
+              "line per command: its number, OK or FAILED, and the first 100 characters of its output or error.\n"
+              "1) curl -sS -m 10 -o /dev/null -w '%{http_code}' https://api.github.com/zen\n"
+              "2) curl -sS -m 10 -o /dev/null -w '%{http_code}' https://example.com\n"
+              "3) echo hi > inside.txt && cat inside.txt\n"
+              f"4) echo hi > {outside}")
+    cmd = [CLAUDE, "-p", prompt, "--model", "haiku", "--permission-mode", "auto", "--output-format", "json",
+           "--max-budget-usd", "0.5", "--settings", json.dumps({"sandbox": box}), "--strict-mcp-config"]
+    r = run(cmd, cwd=str(work), timeout=300)
+    try:
+        text = str(json.loads(r.stdout).get("result") or "")
+    except ValueError:
+        text = (r.stdout + r.stderr)[-600:]
+    print(text)
+    escaped = outside.exists()
+    outside.unlink(missing_ok=True)
+    checks = {"allowed host reached": bool(re.search(r"1\)?\W+OK", text)),
+              "other host refused": "example.com" in sandbox_blocked(text),
+              "write in its own directory": (work / "inside.txt").exists(),
+              "write outside refused": not escaped}
+    shutil.rmtree(work, ignore_errors=True)
+    for name, ok in checks.items():
+        print(f"{'PASS' if ok else 'FAIL'}  {name}")
+    return 0 if all(checks.values()) else 1
 
 
 def count_attempts(state: dict, keys: list[str]) -> tuple[list[str], list[str]]:
@@ -7458,7 +7647,7 @@ def gate(state: dict, b: dict, force: list[str], needs: dict[str, str] | None = 
         reasons.append("owner answers to apply (step 0b, owner-answers.jsonl): " + ", ".join(
             f"{e.get('id', '?')} ({str(e.get('question') or e.get('item') or '')[:60]})" for e in answers))
     pending = [e for e in state.get("reports_pending", []) if not auto_checkable(e)  # agy `done`: the lane launches a checker
-               and not precheck_holds(e)]
+               and not precheck_holds(e) and not budget_holds(e)]
     if pending:
         reasons.append("review: " + ", ".join(
             f"{e['run_id']} ({e['status']}" + (f"; {e['review_why']}" if e.get("review_why") else "")
@@ -11463,6 +11652,14 @@ def main() -> int:
     ck.add_argument("issue", nargs="?", type=int)
     ck.add_argument("key", nargs="?")
     ck.add_argument("--note", default="", help="tick: why the line is done without a PR")
+    ib = sub.add_parser("inbox", help="everything that waits on a person, oldest first, with how to settle each")
+    ib.add_argument("--json", action="store_true", help="records, for a dashboard or the phone bridge")
+    bg = sub.add_parser("budget", help="runs paused at their spend cap: list (default) / continue RUN [--usd N] / release RUN")
+    bg.add_argument("action", nargs="?", default="list", choices=["list", "continue", "release"])
+    bg.add_argument("run_id", nargs="?")
+    bg.add_argument("--usd", type=float, help="continue: the resumed session's cap (default: the model's usual cap)")
+    sx = sub.add_parser("sandbox", help="the worker sandbox: status (default) / probe (one cheap session that checks it)")
+    sx.add_argument("action", nargs="?", default="status", choices=["status", "probe"])
     ak = sub.add_parser("ack", help="silence one tick need: chk:ISSUE:KEY (checklist line, owner closed) or gap:KEY "
                                     "(census gap row without an open owner)")
     ak.add_argument("token", nargs="?")
@@ -11662,6 +11859,14 @@ def main() -> int:
         return cmd_checklist(a)
     if a.cmd == "ack":
         return cmd_ack(a)
+    if a.cmd == "inbox":
+        return cmd_inbox(a)
+    if a.cmd == "budget":
+        if a.action != "list" and not a.run_id:
+            ap.error(f"budget {a.action} needs a run id")
+        return cmd_budget(a)
+    if a.cmd == "sandbox":
+        return cmd_sandbox(a)
     return 2
 
 
