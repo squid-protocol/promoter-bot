@@ -11563,6 +11563,8 @@ def main() -> int:
     sb.add_argument("message")
     sb.add_argument("--force", action="store_true", help="resume even if the run finished over 1 h ago")
     sub.add_parser("status")
+    sp = sub.add_parser("steps", help="what a run has finished and what is left (git + its step journal)")
+    sp.add_argument("run_id")
     qp = sub.add_parser("queue", help="list (default) / add / rm / top queue items")
     qp.add_argument("action", nargs="?", default="list", choices=["list", "add", "rm", "top", "route", "park", "lane",
                                                                                 "wait"])
@@ -11644,8 +11646,6 @@ def main() -> int:
     ck.add_argument("issue", nargs="?", type=int)
     ck.add_argument("key", nargs="?")
     ck.add_argument("--note", default="", help="tick: why the line is done without a PR")
-    sp = sub.add_parser("steps", help="what a run has finished and what is left (git + its step journal)")
-    sp.add_argument("run_id")
     ak = sub.add_parser("ack", help="silence one tick need: chk:ISSUE:KEY (checklist line, owner closed) or gap:KEY "
                                     "(census gap row without an open owner)")
     ak.add_argument("token", nargs="?")
@@ -11763,6 +11763,8 @@ def main() -> int:
         return cmd_worker(ns)
     if a.cmd == "status":
         return cmd_status(a)
+    if a.cmd == "steps":
+        return cmd_steps(a)
     if a.cmd == "goal":
         return cmd_goal(a)
     if a.cmd == "focus":
@@ -11845,8 +11847,6 @@ def main() -> int:
         return cmd_checklist(a)
     if a.cmd == "ack":
         return cmd_ack(a)
-    if a.cmd == "steps":
-        return cmd_steps(a)
     return 2
 
 
