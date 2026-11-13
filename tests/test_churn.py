@@ -1316,8 +1316,20 @@ def test_precheck_holds_the_file_cap_unless_the_body_states_an_exception(churn, 
     probs = churn.precheck_problems({"worktree": str(wt)}, GOOD_BODY, gates=ok)
     assert len(probs) == 1 and "touches 6 hand-written files, over the 5-file rule" in probs[0]
     assert "golden_master" not in probs[0] and "ledger" not in probs[0]
-    assert churn.precheck_problems({"worktree": str(wt)}, GOOD_BODY + "\n\n**File-cap exception:** atomic rename",
-                                   gates=ok) == []
+    # the worker's own exception line no longer counts (2026-11-13): 15 of 16 large PRs wrote it for themselves
+    stated = GOOD_BODY + "\n\n**File-cap exception:** atomic rename"
+    own = churn.precheck_problems({"worktree": str(wt), "task": "slice 3"}, stated, gates=ok)
+    assert len(own) == 1 and "counts only when the task granted one" in own[0]
+    # ... it counts when the launcher granted it in the task, and the body still has to state it
+    granted = {"worktree": str(wt), "task": "rename the module." + churn.FILE_CAP_GRANT_NOTE}
+    assert churn.precheck_problems(granted, stated, gates=ok) == []
+    assert len(churn.precheck_problems(granted, GOOD_BODY, gates=ok)) == 1
+    # ... and a fix run on the same branch keeps the first run's grant
+    runs = tmp_path / "runs"
+    (runs / "7-a").mkdir(parents=True)
+    (runs / "7-a" / "meta.json").write_text(json.dumps({"issue": 7, "branch": "churn/7-a", "task": granted["task"]}))
+    fix = {"worktree": str(wt), "task": "Fix PR #9: conflicts with main", "issue": 7, "branch": "churn/7-a"}
+    assert churn.file_cap_granted(fix, runs) and not churn.file_cap_granted({**fix, "branch": "churn/7-b"}, runs)
     (wt / "docs/a.md").unlink()
     _git(wt, "commit", "-qam", "five")
     assert churn.precheck_problems({"worktree": str(wt)}, GOOD_BODY, gates=ok) == []
@@ -5610,7 +5622,7 @@ def test_quality_counts_merged_prs_by_size_first_pass_and_the_days_fix_causes(ch
     asked = []
     out = churn.quality(churn.dt.date(2026, 10, 15), [{"number": n} for n in (1, 2, 3, 4)], runs_dir=runs,
                         files=files.get, classify=lambda items: asked.extend(items) or {"b2": "env"})
-    assert out["first_pass"] == {"merged": 4, "first_pass": 1}
+    assert out["first_pass"] == {"merged": 4, "first_pass": 2}  # PR 3's precheck retry is not a fix run: first pass
     q = out["quality"]
     assert q["by_size"]["1-2"] == {"merged": 2, "fixed": 0}  # the golden file does not count; a precheck retry is not a fix
     assert q["by_size"]["5"] == {"merged": 1, "fixed": 1} and q["by_size"]["6+"] == {"merged": 1, "fixed": 1}
@@ -6494,3 +6506,104 @@ def test_the_nudge_is_off_without_a_workflow_or_under_quota_pressure(churn, monk
     monkeypatch.setattr(churn, "RECONCILE_WF", "shepherd-reconcile.yml")
     monkeypatch.setattr(churn, "QUOTA_MODE", "hold")
     assert churn.reconcile_nudge(churn.load_state(), NUDGE_SNAP, gh, sh) == [] and reads == [] and calls == []
+
+
+# ---------------------------------------------------------------- the gate merges JSON-only conflicts by key (2026-11-13)
+
+def test_json_three_way_merge_takes_both_sides_keys_and_refuses_a_real_collision(churn):
+    m = churn.json_merge3
+    base = {"a": 1, "b": 2, "c": {"x": 1}}
+    assert m(base, {"a": 1, "b": 2, "c": {"x": 1}, "d": 4}, {"a": 1, "c": {"x": 1, "y": 2}}) == (
+        True, {"a": 1, "c": {"x": 1, "y": 2}, "d": 4})  # ours adds d; main drops b and adds c.y; keys stay sorted
+    assert m(base, {**base, "a": 5}, {**base, "a": 6}) == (False, None)  # one key, two values
+    assert m(base, {**base, "a": 5}, {**base, "a": 5}) == (True, {**base, "a": 5})
+    assert m(base, {"b": 2, "c": {"x": 1}}, {**base, "a": 9}) == (False, None)  # dropped here, changed on main
+    assert m({"l": ["a", "c"]}, {"l": ["a", "b", "c"]}, {"l": ["c", "d"]}) == (True, {"l": ["b", "c", "d"]})
+    assert m({"l": [1, 1]}, {"l": [1, 1, 2]}, {"l": [1, 1, 3]}) == (False, None)  # repeats: not a set of entries
+    assert m({"l": [{"k": 1}]}, {"l": [{"k": 1}, {"k": 2}]}, {"l": [{"k": 1}, {"k": 3}]}) == (False, None)
+    ok, got = m({"n": 1}, {"n": 1.0, "o": 1}, {"n": 1, "p": 2})  # 1 and 1.0 are different file text: ours changed n
+    assert ok and json.dumps(got) == '{"n": 1.0, "o": 1, "p": 2}'
+    assert m(churn._GONE, {"a": 1}, {"b": 2}) == (True, {"a": 1, "b": 2})  # the file is new on both sides
+
+
+def test_json_merge_text_keeps_mains_formatting_or_refuses(churn):
+    def dump(d, **kw):
+        return json.dumps(d, **kw) + "\n"
+    base = {"about": "caf\u00e9", "det": {"a": 1, "c": 3}}
+    ours = {"about": "caf\u00e9", "det": {"a": 1, "b": 2, "c": 3}}
+    theirs = {"about": "caf\u00e9", "det": {"a": 1, "c": 3, "d": 4}}
+    want = {"about": "caf\u00e9", "det": {"a": 1, "b": 2, "c": 3, "d": 4}}
+    for kw in ({"indent": 1}, {"indent": 2, "ensure_ascii": False}, {"indent": 4}, {}, {"separators": (",", ":")}):
+        assert churn.json_merge_text(dump(base, **kw), dump(ours, indent=7), dump(theirs, **kw)) == dump(want, **kw)
+    assert churn.json_merge_text(dump(base), dump(ours), json.dumps(theirs, indent=2)) == json.dumps(want, indent=2)
+    hand = '{"about": "x",\n  "det": {"a": 1}}\n'  # hand-laid-out: json.dumps cannot reproduce it, so no merge
+    assert churn.json_merge_text(hand, hand, hand) is None
+    assert churn.json_merge_text(dump(base), "not json", dump(theirs)) is None
+    assert churn.json_merge_text(dump(base), dump({**base, "about": "x"}), dump({**base, "about": "y"})) is None
+
+
+def _json_conflict_repos(tmp_path, churn, monkeypatch, ours, theirs, extra=None):
+    """origin (bare) with main and a PR branch that both changed d.json; V6 is a clone. Returns (v6, origin)."""
+    origin, v6 = tmp_path / "origin.git", tmp_path / "v6"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "clone", "-q", str(origin), str(v6)], check=True, capture_output=True)
+    for k, v in (("user.email", "t@example.com"), ("user.name", "t")):
+        _git(v6, "config", k, v)
+    _git(v6, "checkout", "-q", "-b", "main")
+    (v6 / "d.json").write_text(json.dumps({"a": 1, "m": 5}, indent=1) + "\n")
+    (v6 / "code.py").write_text("x = 1\n")
+    _git(v6, "add", "-A"), _git(v6, "commit", "-q", "-m", "base"), _git(v6, "push", "-q", "origin", "main")
+    _git(v6, "checkout", "-q", "-b", "churn/7-x")
+    (v6 / "d.json").write_text(json.dumps(ours, indent=1) + "\n")
+    for name, text in (extra or {}).items():
+        (v6 / name).write_text(text)
+    _git(v6, "add", "-A"), _git(v6, "commit", "-q", "-m", "pr"), _git(v6, "push", "-q", "origin", "churn/7-x")
+    _git(v6, "update-ref", "refs/churn/regraft/7", "HEAD")
+    _git(v6, "checkout", "-q", "main")
+    (v6 / "d.json").write_text(json.dumps(theirs, indent=1) + "\n")
+    if extra:
+        (v6 / "code.py").write_text("x = 3\n")
+    _git(v6, "add", "-A"), _git(v6, "commit", "-q", "-m", "main moves"), _git(v6, "push", "-q", "origin", "main")
+    wts = tmp_path / "wts"
+    wts.mkdir()
+    monkeypatch.setattr(churn, "V6", v6)
+    monkeypatch.setattr(churn, "WT", wts)
+    return v6, origin, wts
+
+
+def test_the_gate_merges_a_json_only_conflict_and_pushes_it(churn, tmp_path, monkeypatch):
+    v6, origin, wts = _json_conflict_repos(tmp_path, churn, monkeypatch, {"a": 1, "b": 2, "m": 5}, {"a": 1, "c": 3, "m": 5})
+    monkeypatch.setattr(churn, "conflict_files", lambda n: ["d.json"])
+    before = _git(origin, "rev-parse", "churn/7-x")
+    assert churn.json_merge_pr(7, "churn/7-x") is True
+    show = lambda ref, f: subprocess.run(["git", "-C", str(origin), "show", f"{ref}:{f}"], capture_output=True, text=True).stdout  # noqa: E731
+    assert show("churn/7-x", "d.json") == json.dumps({"a": 1, "b": 2, "c": 3, "m": 5}, indent=1) + "\n"
+    parents = _git(origin, "rev-list", "--parents", "-n", "1", "churn/7-x").split()
+    assert parents[1] == before and parents[2] == _git(origin, "rev-parse", "main")  # a merge commit
+    assert list(wts.iterdir()) == [] and "_jsonmerge" not in _git(v6, "worktree", "list")  # scratch tree removed
+
+
+def test_the_gate_leaves_a_colliding_or_mixed_conflict_to_a_worker(churn, tmp_path, monkeypatch):
+    v6, origin, wts = _json_conflict_repos(tmp_path, churn, monkeypatch, {"a": 1, "m": 6}, {"a": 1, "m": 7})
+    monkeypatch.setattr(churn, "conflict_files", lambda n: ["d.json"])
+    before = _git(origin, "rev-parse", "churn/7-x")
+    assert churn.json_merge_pr(7, "churn/7-x") is False  # both sides changed m
+    assert _git(origin, "rev-parse", "churn/7-x") == before and list(wts.iterdir()) == []
+    monkeypatch.setattr(churn, "conflict_files", lambda n: ["d.json", "code.py"])
+    assert churn.json_merge_pr(7, "churn/7-x") is False  # a hand-written file conflicts too: never touched
+    monkeypatch.setattr(churn, "conflict_files", lambda n: None)
+    assert churn.json_merge_pr(7, "churn/7-x") is False
+    monkeypatch.setattr(churn, "JSON_MERGE", False)
+    assert churn.json_merge_pr(7, "churn/7-x") is False
+
+
+def test_a_conflict_github_refused_is_offered_to_the_json_merge_before_a_worker(churn):
+    st = {"prs": [{"pr": 5180, "issue": 5100}], "queue": [], "running": []}
+    snap = {"5180": {"state": "open", "head": "h1", "mergeable_state": "dirty", "labels": [], "branch": "churn/5100-x"}}
+    asked = []
+    out = churn.queue_pr_fixes(st, snap, update=lambda n: False, json_merge=lambda n, b: asked.append((n, b)) or True)
+    assert out == ["jsonmerged:#5180"] and asked == [(5180, "churn/5100-x")] and st["queue"] == []
+    assert "updated_from" not in st["prs"][0]  # new content: the review is not carried to the merged head
+    st["prs"][0].pop("update_tried")
+    out = churn.queue_pr_fixes(st, snap, update=lambda n: False, json_merge=lambda n, b: False)
+    assert out == ["#5180"] and st["queue"][0]["pr"] == 5180  # not mechanical: a worker fixes it

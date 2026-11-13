@@ -766,6 +766,27 @@ REGENERATED_RE = re.compile(r"golden_master|refraction_snapshot|scan_output|/evi
 # (\.gz)? (2026-10-27): DOOM-rosetta re-blesses write tests/golden_doom_rosetta/<port>.json.gz; read as hand-written,
 # they sent pure re-bless PRs back over the 5-file rule (#6751 with 7, #6799 with 6: ~1.5 h of worker re-runs)
 FILE_CAP_EXCEPTION = re.compile(r"(?im)^[*_ ]*File-cap exception[*_ ]*:\s*\S")
+# 2026-11-13: the exception line was the worker's to write, and it wrote it. Of 16 PRs with 6+ hand-written files merged
+# Nov 10-11, 15 carried the line; 15 of the 20 that size needed a fix run (1-2 files: 8 of 51). The line now counts only
+# when whoever launched the work granted it: the words "file-cap exception" in the run's task, or in the task of an
+# earlier run on the same branch (a fix run keeps the first run's grant). `churn queue add --file-cap-exception` adds them.
+FILE_CAP_GRANT = re.compile(r"(?i)file-cap exception")
+FILE_CAP_GRANT_NOTE = " File-cap exception granted: this one PR may exceed the 5-file rule; say why in a `File-cap exception:` line in its body."
+
+
+def file_cap_granted(meta: dict, runs_dir: Path | None = None) -> bool:
+    """Did the launcher grant this run (or an earlier run on its branch) a file-cap exception?"""
+    if FILE_CAP_GRANT.search(str(meta.get("task") or "")):
+        return True
+    branch, issue = meta.get("branch"), meta.get("issue")
+    if not branch or not issue:
+        return False
+    for f in (runs_dir or RUNS).glob(f"{issue}-*/meta.json"):
+        with contextlib.suppress(OSError, ValueError):
+            m = json.loads(f.read_text())
+            if m.get("branch") == branch and FILE_CAP_GRANT.search(str(m.get("task") or "")):
+                return True
+    return False
 
 
 # gitgalaxy#7625 (owner 2026-11-03, epic #7624): with the doc-refs audit (#7623) a PR that renames a path, drops a flag
@@ -906,15 +927,16 @@ def precheck_problems(meta: dict, body: str, gates=None) -> list[str]:
                        "(night-shift Never rule) or say in the report that it needs the owner")
     if not body_has_class_section(body):
         out.append(NO_CLASS_TABLE)
-    if FILE_CAP and not FILE_CAP_EXCEPTION.search(body):
+    if FILE_CAP and not (FILE_CAP_EXCEPTION.search(body) and file_cap_granted(meta)):
         changed = run(["git", "-C", wt, "diff", "--name-only", "origin/main...HEAD"], timeout=300).stdout.split()
         listed = doc_refs_listed(body)
         exempt, why_not = doc_refs_exempt(listed, diff_numstat(wt)) if listed else (set(), None)
         if len(hand := [f for f in hand_written(changed) if f not in exempt]) > FILE_CAP:
             out.append(f"touches {len(hand)} hand-written files, over the {FILE_CAP}-file rule ({', '.join(hand[:10])}"
                        f"{', ...' if len(hand) > 10 else ''}): keep the first self-contained slice of {FILE_CAP} or fewer "
-                       "and list the rest under Remaining slices, or, for an atomic rename or a mechanical one-line "
-                       "change, add a line `File-cap exception: <why>` to the PR body"
+                       "and list the rest under Remaining slices. A `File-cap exception:` line in the PR body counts "
+                       "only when the task granted one; if this change cannot be cut, say so in the report and the "
+                       "orchestrator can requeue it with `churn queue add --file-cap-exception`"
                        + (f" ({why_not})" if why_not else ""))
     if names := internal_names():
         diff = run(["git", "-C", wt, "diff", "-U0", "--no-color", "--no-ext-diff", "origin/main...HEAD"], timeout=300).stdout
@@ -7948,6 +7970,133 @@ def conflict_files(n: int) -> list[str] | None:
     return files
 
 
+# 2026-11-13: conflict fix runs Nov 8-12 named one shared JSON file again and again (doc_refs_audit_baseline.json 12
+# times, det_sweep_durations.json 5): parallel PRs each add or drop their own keys of one map, git sees neighbouring
+# lines, and a worker is launched to merge them. When EVERY conflicting file is JSON and the two sides changed different
+# keys, the gate merges main into the PR branch itself: a three-way merge by key, written back in main's exact
+# formatting, pushed as an ordinary merge commit. Anything else (the same key changed both ways, a file main's formatting
+# cannot be reproduced for, a failed commit hook or push) leaves the PR untouched for a worker. CI judges the result.
+JSON_MERGE = bool(_CFG.get("json_merge", True))
+_GONE = object()
+_SCALAR = (str, int, float, bool, type(None))
+
+
+def json_merge3(base, ours, theirs):
+    """(True, merged) when the two sides' changes to `base` do not collide, else (False, None). _GONE = absent."""
+    def same(x, y) -> bool:  # as file text, so 1 and 1.0 differ
+        return x is y or (x is not _GONE and y is not _GONE
+                          and json.dumps(x, sort_keys=True) == json.dumps(y, sort_keys=True))
+    if same(ours, theirs):
+        return True, ours
+    if same(ours, base):
+        return True, theirs
+    if same(theirs, base):
+        return True, ours
+    if isinstance(ours, dict) and isinstance(theirs, dict):
+        b = base if isinstance(base, dict) else {}
+        out = {}
+        for k in [*theirs, *(k for k in ours if k not in theirs)]:
+            ok, v = json_merge3(b.get(k, _GONE), ours.get(k, _GONE), theirs.get(k, _GONE))
+            if not ok:
+                return False, None
+            if v is not _GONE:
+                out[k] = v
+        if list(ours) == sorted(ours) and list(theirs) == sorted(theirs):
+            out = {k: out[k] for k in sorted(out)}
+        return True, out
+    if isinstance(ours, list) and isinstance(theirs, list) and isinstance(base, list):
+        if not all(isinstance(x, _SCALAR) and not isinstance(x, bool) for side in (base, ours, theirs) for x in side):
+            return False, None
+        if any(len(set(side)) != len(side) for side in (base, ours, theirs)):
+            return False, None  # a list with repeats is not a set of entries: order and count may matter
+        dropped = (set(base) - set(ours)) | (set(base) - set(theirs))
+        out = [x for x in theirs if x not in dropped] + [x for x in ours if x not in set(base) and x not in set(theirs)]
+        with contextlib.suppress(TypeError):
+            if ours == sorted(ours) and theirs == sorted(theirs):
+                out = sorted(out)
+        return True, out
+    return False, None
+
+
+def json_style(text: str) -> dict | None:
+    """The json.dumps arguments that reproduce `text` byte for byte (its trailing newline apart), or None."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    body = text[:-1] if text.endswith("\n") else text
+    for indent in (1, 2, 4, "\t", None):
+        for ascii_ in (True, False):
+            for seps in ((None,) if indent is not None else (None, (",", ":"))):
+                style = {"indent": indent, "ensure_ascii": ascii_, **({"separators": seps} if seps else {})}
+                if json.dumps(data, **style) == body:
+                    return style
+    return None
+
+
+def json_merge_text(base: str | None, ours: str, theirs: str) -> str | None:
+    """The merged file text in `theirs` (main's) formatting, or None when the merge is not mechanical."""
+    style = json_style(theirs)
+    if style is None:
+        return None
+    try:
+        b = json.loads(base) if base is not None else _GONE
+        ok, merged = json_merge3(b, json.loads(ours), json.loads(theirs))
+    except ValueError:
+        return None
+    if not ok or merged is _GONE:
+        return None
+    return json.dumps(merged, **style) + ("\n" if theirs.endswith("\n") else "")
+
+
+def json_merge_pr(n: int, branch: str | None) -> bool:
+    """Merge origin/main into PR n's branch when it conflicts only in JSON files whose sides changed different keys.
+    True when the merge commit was pushed; False (and nothing changed) otherwise."""
+    if not JSON_MERGE or not branch:
+        return False
+    files = conflict_files(n)
+    if not files or not all(f.endswith(".json") for f in files):
+        return False
+    try:
+        wt = Path(tempfile.mkdtemp(prefix=f"_jsonmerge-{n}-", dir=WT))
+    except OSError:
+        return False
+
+    def git(*args: str, timeout: int = 300):
+        return run(["git", "-C", str(wt), *args], timeout=timeout)
+
+    try:
+        if run(["git", "-C", str(V6), "worktree", "add", "-q", "--detach", str(wt), f"refs/churn/regraft/{n}"],
+               timeout=600).returncode:
+            return False
+        git("merge", "--no-commit", "--no-ff", "origin/main", timeout=600)
+        unmerged = [x for x in git("diff", "--name-only", "--diff-filter=U").stdout.splitlines() if x.strip()]
+        if not unmerged or not all(f.endswith(".json") for f in unmerged):
+            return False
+        for f in unmerged:
+            base, ours, theirs = (git("show", f":{stage}:{f}") for stage in (1, 2, 3))
+            if ours.returncode or theirs.returncode:  # one side deleted the file: not mechanical
+                return False
+            text = json_merge_text(None if base.returncode else base.stdout, ours.stdout, theirs.stdout)
+            if text is None:
+                return False
+            (wt / f).write_text(text)
+            if git("add", "--", f).returncode:
+                return False
+        msg = (f"Merge main: {len(unmerged)} JSON file(s) merged by key ({', '.join(unmerged[:3])}"
+               f"{', ...' if len(unmerged) > 3 else ''})\n\nBy promoter-bot's gate, no worker: each side changed "
+               "different keys of the same file.")
+        if git("commit", "-q", "-m", msg, timeout=900).returncode:
+            return False
+        return not git("push", "-q", "origin", f"HEAD:refs/heads/{branch}").returncode
+    except Exception:  # noqa: BLE001 -- any surprise leaves the PR for a worker
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            run(["git", "-C", str(V6), "worktree", "remove", "--force", str(wt)], timeout=300)
+        shutil.rmtree(wt, ignore_errors=True)
+
+
 def was_regrafted(pr: int, issue: int) -> str | None:
     """The newest finished regraft run that carried PR pr (one regraft per PR; a crashed or limit-killed one does not
     count), or None."""
@@ -8128,7 +8277,7 @@ def carry_reviews(state: dict, snap: dict, compare=None) -> list[str]:
 
 
 def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=None, conflicts=None, read=None,
-                   open_issue=None) -> list[str]:
+                   open_issue=None, json_merge=None) -> list[str]:
     """Owner 2026-10-13: #5038/#5041 sat conflicting for hours because a tick with no free slot only logged them and
     stuck_seen then hid them. Any watched open PR that is conflicting (dirty) or shepherd:needs-fix, with no live worker
     on it and no queue item for it, gets a fix item at the FRONT of the queue (key "pr").
@@ -8162,6 +8311,11 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
             if (update or update_branch)(int(n)):
                 entry["updated_from"] = v.get("head")
                 added.append(f"updated:#{n}")
+                continue
+            # a real conflict, but only in JSON maps whose sides changed different keys: the gate merges it (the
+            # review is not carried: the merged file is new content, so the PR is reviewed again at its new head)
+            if (merge := json_merge or (None if update else json_merge_pr)) and merge(int(n), v.get("branch")):
+                added.append(f"jsonmerged:#{n}")
                 continue
         if why == ["shepherd:needs-fix"]:  # a red, not a conflict: only a REAL failure is a worker's job
             kinds = (triage or ci_triage)(int(n))
@@ -9494,8 +9648,10 @@ def cmd_tick(a) -> int:
             expired = [x[8:] for x in fixes if x.startswith("expired:")]
             ended = [x for x in fixes if x.startswith(("restart:", "closed:"))]
             shared = [x[7:] for x in fixes if x.startswith("shared:")]
+            if jm := [x[11:] for x in fixes if x.startswith("jsonmerged:")]:
+                log("merged main by the gate (JSON files merged by key, no worker): " + ", ".join(jm))
             fixes = [x for x in fixes if not x.startswith(("noise:", "updated:", "expired:", "restart:", "closed:",
-                                                           "shared:"))]
+                                                           "shared:", "jsonmerged:"))]
             if shared:
                 log("shared red is main's (no fix worker on these PRs; one ci-lane fix): " + "; ".join(shared))
             if expired:
@@ -10016,7 +10172,7 @@ def run_cause(rd: Path, meta: dict, labels: dict[str, str]) -> str | None:
 def quality(day: dt.date, merged_prs: list[dict], runs_dir: Path | None = None, files=None, classify=None) -> dict:
     """This host's numbers for one UTC day: its churn PRs merged that day by hand-written file count, with how many
     needed a review / CI fix run (send-back or PR fix; the precheck's own retry is the mechanical one and is not
-    counted) and how many merged first pass (no further run at all); and its fix runs started that day by cause."""
+    counted) and how many merged first pass (no such fix run); and its fix runs started that day by cause."""
     lo = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
     hi = lo + dt.timedelta(days=1)
     rd = runs_dir or RUNS
@@ -10040,9 +10196,12 @@ def quality(day: dt.date, merged_prs: list[dict], runs_dir: Path | None = None, 
         runs = by_pr.get(int(p["number"]), [])
         b = by_size[size_bucket(len(hand_written(paths)))]
         b["merged"] += 1
-        b["fixed"] += any(run_kind(meta, rd) in ("pr_fix", "send_back") for _, meta in runs[1:])
+        fixed = any(run_kind(meta, rd) in ("pr_fix", "send_back") for _, meta in runs[1:])
+        b["fixed"] += fixed
         fp["merged"] += 1
-        fp["first_pass"] += len(runs) <= 1
+        # 2026-11-13: first pass is "no fix run". It was "no second run of any kind", so the precheck's mechanical retry
+        # and a continued plan read as failures (7 of the 19 misses on Nov 8 were precheck retries alone)
+        fp["first_pass"] += not fixed
     todays = [(d, meta) for d, meta in fixes if lo <= (parse_iso(meta.get("started")) or hi) < hi]
     todo = [{"id": meta["run_id"], "sendback": str(meta.get("task") or "")[:400],
              "report": (d / "report.md").read_text(errors="replace").split("## Worker's final report", 1)[-1][:1200]}
@@ -10604,6 +10763,8 @@ def cmd_queue(a) -> int:
                     f"{', '.join(f'#{n}' for n in a.after_pr)} waits for the merge, not the approval")
             if a.allow_workflows:
                 item["allow_workflows"] = True
+            if getattr(a, "file_cap_exception", False) and not FILE_CAP_GRANT.search(item.get("task") or ""):
+                item["task"] = (item.get("task") or "") + FILE_CAP_GRANT_NOTE
             if a.agy_step:
                 item["agy_step"] = a.agy_step
             if a.lane and a.lane != "normal":
@@ -11242,6 +11403,8 @@ def main() -> int:
     qp.add_argument("--after-merge", action="store_true", help="with --after-pr: hold until it MERGES, even once approved "
                     "(the item branches off main after it, e.g. it edits the same files)")
     qp.add_argument("--allow-workflows", action="store_true", help="owner allowed .github/workflows edits")
+    qp.add_argument("--file-cap-exception", action="store_true",
+                    help="grant this item's PR an exception to the 5-file rule (the worker cannot grant its own)")
     qp.add_argument("--agy-step", type=int, help="agy ladder step of this item")
     qp.add_argument("--note", help="why (park)")
     qp.add_argument("--repo", choices=sorted(CRUCIBLE_REPOS), help="a step on this crucible repo (no gating CI)")
