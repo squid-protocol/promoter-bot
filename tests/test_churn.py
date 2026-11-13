@@ -5210,6 +5210,30 @@ def test_focus_set_warns_about_issues_that_cannot_launch_useful_work(churn, monk
     assert "preflight: all 1" in capsys.readouterr().out
 
 
+def test_focus_set_keeps_a_numeric_first_argument_as_an_issue(churn, monkeypatch, capsys):
+    """2026-11-12: `churn focus set 7993 7994 ..` named the focus "7993" and dropped that issue from it.
+    The first argument is the NAME, but a bare number is never a name anyone means, so it is kept as an
+    issue and the focus is auto-named instead of silently losing the issue the owner put first."""
+    monkeypatch.setattr(churn, "focus_preflight", lambda st, ns, gh=None: [])
+    ns = lambda action, *args: argparse.Namespace(action=action, args=list(args), skip=None)
+
+    churn.cmd_focus(ns("set", "7993", "7994", "8002"))
+    f = churn.load_state()["focus"]
+    assert f["issues"] == [7993, 7994, 8002], "the numeric name must be kept as an issue"
+    assert f["name"] == "issues-7993"
+    out = capsys.readouterr().out
+    assert "NOTE: the first argument" in out and "#7993" in out
+
+    churn.cmd_focus(ns("set", "#7993", "7994"))          # the "#7993" spelling too
+    assert churn.load_state()["focus"]["issues"] == [7993, 7994]
+    assert "NOTE: the first argument" in capsys.readouterr().out
+
+    churn.cmd_focus(ns("set", "breadth", "7994", "8002"))   # a real name still names the focus
+    f = churn.load_state()["focus"]
+    assert f["name"] == "breadth" and f["issues"] == [7994, 8002]
+    assert "NOTE: the first argument" not in capsys.readouterr().out
+
+
 def test_only_the_owner_edits_the_focus(churn, monkeypatch, capsys):
     ns = lambda action, *args, skip=None: argparse.Namespace(action=action, args=list(args), skip=skip)
     churn.cmd_focus(ns("set", "L1-L4", "6271", "5252"))
