@@ -1594,6 +1594,27 @@ def test_factory_days_of_two_hosts_add_up_and_one_host_stays_exact():
     assert c["review_wait_min_median"] == 15.0 and c["hosts"] == 2
 
 
+def test_a_day_two_hosts_reported_keeps_its_api_numbers(churn):
+    """The dashboard's GitHub API panel lost its bar on every day the second host published: `api` was not combined."""
+    a = {**_day(6, 12.0, 3.0, 1.0, 2, 0.5, 10.0), "api": {
+        "used_by_hour": {"00": 900, "01": 4444}, "peak_hour": 4444, "readings": 10, "readings_at_zero": 0,
+        "churn_calls": 100, "churn_writes": 7, "churn_writes_busiest_hour": 5, "worker_calls": 30, "worker_writes": 2,
+        "churn_by_caller": {"ci_occupancy": 60, "cmd_pr": 40}, "worker_top_runs": {"worker:1": 30}}}
+    b = {**_day(2, 8.0, 1.0, 1.0, 1, 0.25, 30.0), "api": {
+        "used_by_hour": {"00": 1200, "02": 50}, "peak_hour": 1200, "readings": 4, "readings_at_zero": 2,
+        "churn_calls": 20, "churn_writes": 1, "churn_writes_busiest_hour": 1, "worker_calls": 0, "worker_writes": 0,
+        "churn_by_caller": {"ci_occupancy": 20}, "worker_top_runs": {}}}
+    api = churn.combine_factory_days({"melek": {"d": a}, "nyx": {"d": b}})["d"]["api"]
+    assert api["used_by_hour"] == {"00": 1200, "01": 4444, "02": 50} and api["peak_hour"] == 4444
+    assert api["readings"] == 14 and api["readings_at_zero"] == 2 and api["churn_calls"] == 120
+    assert api["churn_by_caller"] == {"ci_occupancy": 80, "cmd_pr": 40} and api["churn_writes_busiest_hour"] == 5
+    # a host with no readings that day (paused, or an older build) leaves the other host's numbers as they are
+    quiet = churn.combine_factory_days({"melek": {"d": a}, "nyx": {"d": _day(2, 8.0, 1.0, 1.0, 1, 0.25, 30.0)}})["d"]
+    assert quiet["api"]["peak_hour"] == 4444 and quiet["api"]["churn_calls"] == 100
+    none = churn.combine_factory_days({"melek": {"d": _day(1, 1.0, 1.0, 1.0, 1, 0.5, 1.0)}, "nyx": {"d": _day(1, 1.0, 1.0, 1.0, 1, 0.5, 1.0)}})
+    assert "api" not in none["d"]
+
+
 def test_publishing_replaces_only_this_hosts_days(churn, monkeypatch):
     import base64
     remote = {"hosts": {"melek": {"d1": _day(6, 12.0, 3.0, 1.0, 2, 0.5, 10.0)}}, "days": {}}
