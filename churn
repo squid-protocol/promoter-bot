@@ -239,7 +239,7 @@ LANES = ("normal", "ci", "backfill")
 CRUCIBLE_REPOS = {"estate-crucible", "cics-crucible"}
 QUEUE_KEYS = {"issue", "model", "task", "needs_owner", "backend", "pr", "after_prs", "allow_workflows", "agy_step", "lane", "repo", "after_merge",
               "agy_model", "auto", "note", "parked", "tier", "head", "wait_run", "wait_until", "wait_set", "wait_worker", "scope", "promoted", "rescue",
-              "regraft", "also_prs", "owner_hold", "covered_note", "sibling_hold", "regen_only"}
+              "regraft", "also_prs", "owner_hold", "covered_note", "sibling_hold", "regen_only", "recover"}
 # Scope labels (scope:core|sweep|frontier|infra) are kept on items for the scorecard; they no longer order or hold work.
 # Tiers, promotion and scope ranks were retired 2026-10-25: the owner's focus decides what launches.
 SCOPES = ("core", "sweep", "frontier", "infra")
@@ -1772,9 +1772,14 @@ def slot_free(state: dict, b: dict) -> bool:
 SELF_WAIT_HOOK = Path(SELF).parent / "tools" / "block-self-wait.py"
 # #64: and the gh-call log (never blocks), so a worker's API calls are attributed instead of landing in "other"
 GH_LOG_HOOK = Path(SELF).parent / "tools" / "log-gh-calls.py"
-SESSION_SETTINGS = json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
-    {"type": "command", "command": f"python3 {SELF_WAIT_HOOK}", "timeout": 10},
-    {"type": "command", "command": f"python3 {GH_LOG_HOOK}", "timeout": 5}]}]}})
+# 2026-11-13: and the step journal (never blocks; a no-op without CHURN_JOURNAL, so ticks write none): see RECOVERY.
+STEP_JOURNAL_HOOK = Path(SELF).parent / "tools" / "step-journal.py"
+SESSION_SETTINGS = json.dumps({"hooks": {
+    "PreToolUse": [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": f"python3 {SELF_WAIT_HOOK}", "timeout": 10},
+        {"type": "command", "command": f"python3 {GH_LOG_HOOK}", "timeout": 5}]}],
+    "PostToolUse": [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": f"python3 {STEP_JOURNAL_HOOK}", "timeout": 30}]}]}})
 
 
 # 2026-11-13 (owner, after reading agentrun): workers ran on the host with only the permission allowlist between them
@@ -2105,6 +2110,8 @@ def cmd_worker(a) -> int:
             "head_start": run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip() or None,
             "rules_rev": rules_rev(str(wt)),
             **({"filler": True} if filler else {})}
+    if rec := getattr(a, "recover_of", None):  # RECOVERY: this run takes over a dead one
+        meta.update(recovered_from=rec, recover_depth=int(_run_meta(rec).get("recover_depth") or 0) + 1)
     with contextlib.suppress(Exception):  # promoter-bot #108: judged at launch, so a focus issue that later closes
         meta["focus_at_launch"] = bool(in_focus(load_state(), {"issue": issue, "task": task,  # (and leaves the
                                                                  "lane": getattr(a, "lane", None)}))  # focus) stays focus
@@ -2287,7 +2294,8 @@ def cmd_run(a) -> int:
     """Detached body of one worker: (plan, impact check,) run claude, save its JSON, then nudge a tick."""
     rd = RUNS / a.run_id
     meta = json.loads((rd / "meta.json").read_text())
-    env = plan_env(PYTHONPATH=meta["worktree"], CHURN_RUN_ID=a.run_id, CHURN_GH_LOG=str(GH_WORKER_CALLS))
+    env = plan_env(PYTHONPATH=meta["worktree"], CHURN_RUN_ID=a.run_id, CHURN_GH_LOG=str(GH_WORKER_CALLS),
+                   CHURN_JOURNAL=str(rd / "journal.jsonl"))
     # --max-budget-usd is checked against the session's total, which on a resume includes the earlier runs
     budget = float(meta.get("budget_usd") or WORKER_BUDGET[meta["model"]]) + float(meta.get("resume_base_usd") or 0)
     if meta.get("lane") == "credit":
@@ -4420,6 +4428,13 @@ def reap(state: dict) -> list[dict]:
             if pr:
                 orig["pr"] = pr
             state.setdefault("queue", []).insert(0, orig)
+        elif (status != "crashed" or not out) and (  # a crash WITH a result (a login failure) is not a death
+                rec := recover_item(state, r, meta, status)) is not None:  # RECOVERY: a dead run is taken over, not reviewed
+            state.setdefault("queue", []).insert(0, rec)
+            if status == "offline":
+                state.setdefault("offline", {})["requeued"] = int(state.get("offline", {}).get("requeued", 0)) + 1
+            log(f"recovery: run {rid} ({status}) is taken over in its own worktree (takeover "
+                f"{int(meta.get('recover_depth') or 0) + 1} of {RECOVER_MAX}); its finished steps are kept")
         elif status == "offline" and r.get("lane") != "experiment":  # nothing to review: requeue the same work
             item = {"issue": r["issue"], "model": r.get("model", "sonnet"), "needs_owner": False,
                     "task": (f"RESUME run {rid} (lost the network {iso(now())}): same worktree {meta['worktree']} / "
@@ -9040,6 +9055,158 @@ def _run_meta(rid: str) -> dict:
     return {}
 
 
+# ---------------------------------------------------------------- RECOVERY: step-level recovery of a dead run
+# 2026-11-13 (owner, after reading agentrun: "a finished step is never run again"). A run that died without a verdict
+# on its work -- the process vanished (a reboot, an OOM kill), the network dropped, a limit cut it off -- used to go to
+# a model tick, which read what it could and usually started the work again. Now the gate takes it over by itself, in
+# the same worktree, with a brief that states what is finished and must not be redone, from two sources that need no
+# model: what git and GitHub show (commits, the push, the PR), and the run's step journal (tools/step-journal.py:
+# the gates' verdict, the self-check and long tool runs, each with the commit it was done at). A warm session is
+# resumed; otherwise a fresh one starts from the brief. At most RECOVER_MAX takeovers in a chain: a run that keeps
+# dying goes to the tick as before. A run that ended with a result of its own (done, denied, error, budget) is not
+# dead and is reviewed as before. `recover: false` in config turns it off.
+RECOVER = bool(_CFG.get("recover", True))
+RECOVER_MAX = int(_CFG.get("recover_max", 2))
+RECOVER_STATUSES = ("crashed", "offline", "limit")
+
+
+def journal(rid: str, runs_dir: Path | None = None) -> list[dict]:
+    """The step journal of run `rid` and of the dead runs it took over (oldest first)."""
+    rd = runs_dir or RUNS
+    chain, seen = [], set()
+    while rid and rid not in seen:
+        seen.add(rid)
+        chain.append(rid)
+        m = {}
+        with contextlib.suppress(OSError, ValueError):
+            m = json.loads((rd / rid / "meta.json").read_text())
+        rid = m.get("recovered_from") or m.get("resume_of")
+    out = []
+    for r in reversed(chain):
+        with contextlib.suppress(OSError):
+            for line in (rd / r / "journal.jsonl").read_text().splitlines():
+                with contextlib.suppress(ValueError):
+                    e = json.loads(line)
+                    if isinstance(e, dict) and e.get("step"):
+                        out.append({**e, "run": r})
+    return out
+
+
+def run_steps(meta: dict, runs_dir: Path | None = None, git=None) -> dict:
+    """What a dead run had finished, from its worktree and its journal. `done`: lines for the brief, in the order the
+    work goes; `todo`: what is plainly left; `head`: the worktree's commit. Reads only local git (no GitHub call):
+    the PR is the one recorded on the run when it was reaped."""
+    wt, rid = str(meta.get("worktree") or ""), str(meta.get("run_id") or "")
+    git = git or (lambda *a: run(["git", "-C", wt, *a], timeout=60).stdout.strip())
+    head = git("rev-parse", "--short=12", "HEAD")
+    branch = git("branch", "--show-current") or meta.get("branch") or ""
+    commits = [x for x in git("log", "--no-merges", "--format=%h %s", "HEAD", "^origin/main").splitlines() if x.strip()]
+    dirty = [x for x in git("status", "--porcelain").splitlines() if x.strip()]
+    pushed_head = git("rev-parse", "--short=12", "--verify", "--quiet", f"origin/{branch}") if branch else ""
+    steps = journal(rid, runs_dir)
+    done, todo = [], []
+    rd = (runs_dir or RUNS) / rid
+    if (rd / "plan.md").exists() and (rd / "plan.md").stat().st_size:
+        done.append(f"the plan is written: {rd / 'plan.md'} (follow it; do not plan again)")
+    if any(e["step"] == "merged-main" for e in steps):
+        done.append("origin/main was merged into the branch (merge again only if main has moved since)")
+    if commits:
+        done.append(f"{len(commits)} commit(s) of this work are on the branch, newest first: " + "; ".join(commits[:6])
+                    + ("; ..." if len(commits) > 6 else ""))
+    if dirty:
+        todo.append(f"{len(dirty)} uncommitted change(s) are in the worktree ({', '.join(x.split(maxsplit=1)[-1] for x in dirty[:6])}"
+                    f"{', ...' if len(dirty) > 6 else ''}): read them first; they are the step the run died in. Keep "
+                    "what is right, finish it and commit; never discard them unread")
+    for e in steps:  # the latest verdict of each check, with whether it still holds at this commit
+        if e["step"] in ("gates", "selfcheck") or e["step"].startswith("tool:"):
+            last = next(x for x in reversed(steps) if x["step"] == e["step"] and x.get("args") == e.get("args"))
+            if e is not last:
+                continue
+            what = {"gates": f"pr_gates {e.get('args') or ''}".strip(), "selfcheck": "churn selfcheck"}.get(
+                e["step"], f"{e['step'][5:]} ({e.get('detail')}: `{e.get('cmd', '')[:120]}`)")
+            holds = e.get("head") == head and e.get("clean") and not dirty
+            if e.get("ok") and holds:
+                done.append(f"{what} passed at this commit ({head}): do not run it again unless you change a file")
+            elif e.get("ok"):
+                todo.append(f"{what} passed at {e.get('head')}, before the changes since: run it again once, at the end")
+            else:
+                todo.append(f"{what} FAILED at {e.get('head')} ({e.get('detail') or 'see its output'}): that is the "
+                            "next thing to fix")
+    if commits and pushed_head == head:
+        done.append(f"the branch {branch} is pushed at this commit")
+    elif commits:
+        todo.append(f"the branch {branch} is not pushed at this commit" + (f" (the remote has {pushed_head})" if pushed_head
+                                                                         else " (nothing pushed yet)"))
+    if meta.get("pr"):
+        done.append(f"PR #{meta['pr']} is open for this branch: update it, never open a second one")
+    elif any(e["step"] == "pr" for e in steps):
+        pr = next(e for e in reversed(steps) if e["step"] == "pr")
+        done.append(f"a PR was opened from this branch ({pr.get('detail') or 'see `gh pr list --head ' + branch + '`'}): "
+                    "update it, never open a second one")
+    else:
+        todo.append("no PR is open for this branch yet")
+    notes = sorted((p for p in H.glob(f"handoff-{meta.get('issue')}*.md")
+                    if (t := parse_iso(meta.get("started"))) and p.stat().st_mtime >= t.timestamp()),
+                   key=lambda p: p.stat().st_mtime)
+    if notes:
+        done.append(f"the run left a handoff note: {notes[-1]} (read it before anything else)")
+    return {"head": head, "branch": branch, "done": done, "todo": todo, "journal": len(steps)}
+
+
+def recovery_brief(meta: dict, steps: dict, status: str, task: str, warm: bool = False) -> str:
+    """The brief of the run that takes over dead run `meta`: where it stands, what not to redo, then (for a fresh
+    session) the dead run's own brief."""
+    why = {"crashed": "its process ended without a result (a reboot or a kill)", "offline": "the network dropped",
+           "limit": "a usage limit cut it off"}.get(status, status)
+    head = (f"RECOVERY of run {meta.get('run_id')}: {why} at {meta.get('finished') or 'an unknown time'}. You continue "
+            f"its work in the SAME worktree {meta.get('worktree')} on branch {steps.get('branch')} (commit "
+            f"{steps.get('head')}). The lists below were read from git and from the run's step journal, not written "
+            "by a model: trust them over memory, and check anything that looks wrong before acting on it.\n\n"
+            "FINISHED, do not do again:\n" + ("".join(f"- {x}\n" for x in steps["done"]) or "- nothing recorded\n")
+            + "\nNOT FINISHED:\n" + ("".join(f"- {x}\n" for x in steps["todo"]) or "- nothing recorded: read the "
+                                      "brief and `git log` to find where the work stands\n")
+            + "\nStart from the first unfinished line. Do not rebase, do not open a new branch, do not start the task "
+              "over. If the finished work is wrong, fix it forward with a new commit and say so in your report.\n")
+    if warm:
+        return head
+    prompt = ""
+    with contextlib.suppress(OSError):
+        prompt = (RUNS / str(meta.get("run_id")) / "prompt.md").read_text()
+    return head + f"\nQueue task: {task}\n\n----- the dead run's brief -----\n{prompt}"
+
+
+def cmd_steps(a) -> int:
+    """`churn steps RUN`: what the run has finished and what is left, as a takeover would be told."""
+    meta = _run_meta(a.run_id)
+    if not meta:
+        raise SystemExit(f"no run {a.run_id}")
+    if not meta.get("worktree") or not Path(meta["worktree"]).is_dir():
+        print(f"{a.run_id}: its worktree is gone; journal: {len(journal(a.run_id))} step(s)")
+        for e in journal(a.run_id):
+            print(f"  {e.get('t')} {e['step']} {'ok' if e.get('ok') else 'FAILED'} at {e.get('head')} {e.get('detail') or ''}")
+        return 0
+    st = run_steps(meta)
+    print(f"{a.run_id} ({meta.get('status', 'running')}) on {st['branch']} at {st['head']}; {st['journal']} journal step(s)")
+    print("finished:" + ("".join(f"\n  - {x}" for x in st["done"]) or " nothing recorded"))
+    print("not finished:" + ("".join(f"\n  - {x}" for x in st["todo"]) or " nothing recorded"))
+    return 0
+
+
+def recover_item(state: dict, r: dict, meta: dict, status: str) -> dict | None:
+    """The queue item that takes over dead run `meta`, or None when it is not recoverable (off, not a death, its
+    worktree is gone, a lane with its own handling, or the chain is at RECOVER_MAX)."""
+    if (not RECOVER or status not in RECOVER_STATUSES or r.get("lane") in ("experiment", "credit")
+            or meta.get("check_of") or meta.get("precheck_of")
+            or not meta.get("worktree") or not Path(meta["worktree"]).is_dir()
+            or int(meta.get("recover_depth") or 0) >= RECOVER_MAX):
+        return None
+    return {"issue": r["issue"], "model": r.get("model", "sonnet"), "needs_owner": False, "auto": "recover",
+            "recover": meta["run_id"],
+            "task": f"RECOVER run {meta['run_id']} ({status} {iso(now())}): {str(r.get('task') or meta.get('task') or '')[:300]}",
+            **({"lane": r["lane"]} if r.get("lane") else {}), **({"repo": meta["repo"]} if meta.get("repo") else {}),
+            **({"scope": r["scope"]} if r.get("scope") else {})}
+
+
 WARM_RESUME_MIN = 55  # a run finished this recently resumes inside the 1 h prompt cache (send-back's limit is 60)
 
 
@@ -9051,6 +9218,17 @@ def direct_spec(state: dict, snap: dict, x: dict) -> dict | None:
     - an item whose plan was held, once the overlap cleared: it implements the saved plan, no new plan run."""
     def tree(meta):
         return meta if meta.get("worktree") and Path(meta["worktree"]).is_dir() else None
+    if x.get("recover"):  # RECOVERY: take over a dead run in its own worktree, with what it had finished
+        m = tree(_run_meta(str(x["recover"])))
+        if not m:
+            return None  # the worktree is gone: the model tick decides
+        status = str(m.get("status") or "crashed")
+        warm = bool(m.get("session_id")) and status != "crashed" and bool(
+            (t := parse_iso(m.get("finished"))) and now() - t < dt.timedelta(minutes=WARM_RESUME_MIN))
+        brief = recovery_brief(m, run_steps(m), status, str(x.get("task") or ""), warm=warm)
+        return {"worktree": m["worktree"], "branch": m.get("branch"), "plan": False, "brief": brief, "recover": m["run_id"],
+                "repo": m.get("repo"), **({"lane": x["lane"]} if x.get("lane") else {}),
+                **({"resume_run": m["run_id"]} if warm else {})}
     if x.get("regraft"):  # a fresh branch off current main, made at launch (direct_launches)
         return {"worktree": None, "branch": None, "plan": False, "fresh": True, "brief": x["task"]}
     if x.get("pr"):
@@ -9158,7 +9336,9 @@ def direct_launches(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
         ok, _ = (True, "") if plan else pace_allows(state, x.get("model", "sonnet"))
         if not ok:
             break
-        what = (f"PR fix #{x['pr']}" + (" (warm resume)" if spec.get("resume_run") else " (regraft)" if spec.get("fresh")
+        what = (f"recovery of {spec['recover']}" + (" (warm resume)" if spec.get("resume_run") else "")
+                if spec.get("recover") else
+                f"PR fix #{x['pr']}" + (" (warm resume)" if spec.get("resume_run") else " (regraft)" if spec.get("fresh")
                                         else "") if x.get("pr") else "backfill resume" if spec.get("lane") else
                 f"held plan {spec['held_plan']}" if spec.get("held_plan") else "new issue, gate brief")
         did.append(f"#{x['issue']} ({what})")
@@ -9168,7 +9348,7 @@ def direct_launches(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
             with contextlib.redirect_stdout(open(os.devnull, "w")):
                 if spec.get("resume_run"):
                     cmd_worker(argparse.Namespace(resume_run=spec["resume_run"], message=spec["brief"], force=False,
-                                                  plan=False))
+                                                  plan=False, recover_of=spec.get("recover")))
                 else:
                     if spec.get("fresh"):
                         wt, branch = new_worktree(x["issue"], now().strftime("%Y%m%dT%H%MZ") + "-regraft")
@@ -9178,7 +9358,8 @@ def direct_launches(b: dict, snap: dict, dry_run: bool = False) -> list[str]:
                     cmd_worker(argparse.Namespace(resume_run=None, issue=x["issue"], model=x.get("model", "sonnet"),
                                                   task=x.get("task"), brief=spec["brief"], brief_file=None, force=False,
                                                   plan=spec["plan"], worktree=spec["worktree"], branch=spec.get("branch"),
-                                                  check_of=None, repo=spec.get("repo"), lane=spec.get("lane")))
+                                                  check_of=None, repo=spec.get("repo"), lane=spec.get("lane"),
+                                                  recover_of=spec.get("recover")))
         except (SystemExit, OSError, RuntimeError) as e:  # a cap / missing tree: leave the item to the model tick
             did.pop()
             log(f"direct launch of #{x['issue']} refused, left queued for the tick: {str(e)[:200]}")
@@ -11838,6 +12019,8 @@ def main() -> int:
     sb.add_argument("message")
     sb.add_argument("--force", action="store_true", help="resume even if the run finished over 1 h ago")
     sub.add_parser("status")
+    sp = sub.add_parser("steps", help="what a run has finished and what is left (git + its step journal)")
+    sp.add_argument("run_id")
     qp = sub.add_parser("queue", help="list (default) / add / rm / top queue items")
     qp.add_argument("action", nargs="?", default="list", choices=["list", "add", "rm", "top", "route", "park", "lane",
                                                                                 "wait"])
@@ -12044,6 +12227,8 @@ def main() -> int:
         return cmd_worker(ns)
     if a.cmd == "status":
         return cmd_status(a)
+    if a.cmd == "steps":
+        return cmd_steps(a)
     if a.cmd == "goal":
         return cmd_goal(a)
     if a.cmd == "focus":
