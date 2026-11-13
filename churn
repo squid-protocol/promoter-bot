@@ -1321,6 +1321,9 @@ def _hour24(h: str, ap: str | None) -> int:
     return hour % 24
 
 
+SESSION_LIMIT_H = 5  # a session (5-hour) limit always resets within this many hours of its message
+
+
 def limit_reset(text: str) -> dt.datetime | None:
     """A 'session limit ... resets 9pm' message -> the next such local time, as UTC + 5 min. A dated reset ("resets
     Oct 21, 9pm", "resets Monday 9am": the weekly limit) -> that day."""
@@ -1356,6 +1359,11 @@ def limit_reset(text: str) -> dt.datetime | None:
         hour = 0
     cand = local.replace(hour=hour % 24, minute=minute, second=0, microsecond=0)
     if cand <= local:
+        # A session limit resets within SESSION_LIMIT_H of the message. A stated time that passed less than that long
+        # ago was read late (2026-11-13: a worker that hit the limit at 13:01 was reaped at 13:11, after the 13:10
+        # reset, and "resets 1:10pm" rolled to the next day: churn sat paused 24 h for nothing). It has already reset.
+        if local - cand < dt.timedelta(hours=SESSION_LIMIT_H):
+            return utc(local)
         cand += dt.timedelta(days=1)
     return utc(cand)
 
@@ -5572,6 +5580,15 @@ def cmd_stop(a) -> int:
 
 def cmd_start(a) -> int:
     owner_only("churn start")  # a stop is the owner's (or expires); the rescue and workers never lift one
+    if getattr(a, "clear_pause", False):
+        # owner 2026-11-13: a limit pause the owner knows is wrong (a misread reset, a limit already reset) is lifted
+        # here, never by a hand edit of churn-state.json
+        with edit_state() as st:
+            was = st.get("paused_until")
+            st["paused_until"] = None
+        msg = f"limit pause lifted by the owner (was until {was})" if was else "no limit pause to lift"
+        log(msg)
+        print(msg)
     info = stop_info()
     if info is None:
         print("not stopped")
@@ -11326,7 +11343,9 @@ def main() -> int:
     sp.add_argument("--hours", type=float)
     sp.add_argument("--indefinite", action="store_true", help="no expiry: pages the owner every stop_remind_h")
     sp.add_argument("--reason", help="one plain sentence: why, and what ends it")
-    sub.add_parser("start", help="lift a stop now")
+    p_start = sub.add_parser("start", help="lift a stop now")
+    p_start.add_argument("--clear-pause", action="store_true",
+                         help="also lift a limit pause (paused_until) the owner knows is wrong, e.g. a misread reset")
     rp = sub.add_parser("rescue", help="the idle-box rescue (an Opus on-call session): status / brief / now")
     rp.add_argument("action", nargs="?", default="status", choices=["status", "brief", "now"])
     rr = sub.add_parser("_rescue")
