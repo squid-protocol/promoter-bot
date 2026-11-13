@@ -1809,8 +1809,15 @@ def sandbox_settings(cfg: dict | None = None) -> dict | None:
            "filesystem": {"allowWrite": writes}}
     if excluded := cfg.get("excluded_commands", ["docker *"]):
         out["excludedCommands"] = list(excluded)
-    if deny := cfg.get("deny_read"):
-        out["filesystem"]["denyRead"] = [str(x) for x in deny]
+    # With a worker token, a worker needs neither the owner's ssh keys nor the owner's gh login, so they are unreadable
+    # unless the host says otherwise (2026-11-13: an outside review noted the token alone leaves both on disk for the
+    # same user). Without a token the worker pushes with those very credentials, so nothing is denied by default.
+    deny = cfg.get("deny_read")
+    if deny is None and WORKER_TOKEN_FILE:
+        deny = [str(Path.home() / ".ssh"), str(Path.home() / ".config" / "gh"),
+                str(Path(WORKER_TOKEN_FILE).expanduser())]
+    if deny:
+        out["filesystem"]["denyRead"] = [str(Path(str(x)).expanduser()) for x in deny]
     return out
 
 
