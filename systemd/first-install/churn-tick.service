@@ -4,7 +4,7 @@ Description=promoter-bot gate (churn tick): cheap checks; a model session only w
 [Service]
 Type=oneshot
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/python3 %h/.local/bin/churn tick
+ExecStart=/usr/bin/python3 %h/.local/bin/promoter-bot tick
 # a model tick is capped at 90 min inside churn; leave room for the gate
 TimeoutStartSec=6000
 Nice=5

@@ -13,5 +13,5 @@ systemctl --user enable --now churn-tick.timer churn-watchdog.timer churn-poll.t
 loginctl enable-linger "$USER"     # so the timers run when you are not logged in
 ```
 
-`churn status` shows whether the timer is active. `churn stop --hours 8 --reason "..."` pauses the gate without
-removing anything.
+`promoter-bot status` shows whether the timer is active. `promoter-bot stop --hours 8 --reason "..."` pauses the gate
+without removing anything. The units are still named `churn-*`: the program looks for them under that name.

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "churn"
+SCRIPT = Path(__file__).resolve().parents[1] / "promoter-bot"
 
 
 @pytest.fixture
