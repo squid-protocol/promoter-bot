@@ -3289,6 +3289,49 @@ def test_limit_reset_reads_a_dated_weekly_reset(churn):
     assert churn.limit_reset("tests failed") is None
 
 
+def test_a_session_reset_read_after_it_passed_is_not_tomorrow(churn, monkeypatch):
+    """2026-11-13: a worker hit the limit at 13:01 and was reaped at 13:11; its "resets 1:10pm" had already passed and
+    rolled to the next day, so churn sat paused 24 h. A stated time under SESSION_LIMIT_H ago has reset."""
+    import time
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+
+    def at(h, m):
+        class Frozen(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                wall = cls(2026, 11, 13, h, m)
+                return wall if tz is None else wall.astimezone(tz)
+        return Frozen
+
+    try:
+        monkeypatch.setattr(churn.dt, "datetime", at(13, 11))
+        got = churn.limit_reset("You've hit your 5-hour limit · resets 1:10pm (America/Detroit)").astimezone()
+        assert (got.day, got.hour, got.minute) == (13, 13, 16)  # now + the 5-minute margin, not tomorrow
+        monkeypatch.setattr(churn.dt, "datetime", at(13, 1))  # read in time: still the stated reset
+        got = churn.limit_reset("You've hit your 5-hour limit · resets 1:10pm (America/Detroit)").astimezone()
+        assert (got.day, got.hour, got.minute) == (13, 13, 15)
+        monkeypatch.setattr(churn.dt, "datetime", at(19, 0))  # more than 5 h past: tomorrow's 1:10pm, as before
+        got = churn.limit_reset("You've hit your session limit · resets 1:10pm").astimezone()
+        assert (got.day, got.hour, got.minute) == (14, 13, 15)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+def test_start_clear_pause_lifts_a_limit_pause_and_logs_it(churn, monkeypatch):
+    monkeypatch.delenv("CHURN_RUN", raising=False)
+    with churn.edit_state() as st:
+        st["paused_until"] = "2026-11-14T18:15Z"
+    churn.cmd_start(type("A", (), {"clear_pause": True})())
+    assert churn.load_state().get("paused_until") is None
+    assert "limit pause lifted by the owner (was until 2026-11-14T18:15Z)" in churn.LOG.read_text()
+    with churn.edit_state() as st:
+        st["paused_until"] = "2026-11-14T18:15Z"
+    churn.cmd_start(type("A", (), {"clear_pause": False})())  # a plain start leaves a limit pause alone
+    assert churn.load_state().get("paused_until") == "2026-11-14T18:15Z"
+
+
 def test_limit_reset_keeps_the_wall_clock_across_a_dst_change(churn, monkeypatch):
     """Read on Wed Oct 28 (EDT), a reset on or after Sun Nov 1 (EST) is still at its stated local time."""
     import time
