@@ -10264,8 +10264,35 @@ def combine_factory_days(hosts: dict[str, dict]) -> dict[str, dict]:
         for k in ("review_wait_min_median", "pr_open_to_merge_h_median"):
             w = [(r[k], r.get("churn_merged") or 1) for r in rows if r.get(k) is not None]
             c[k] = round(sum(v * n for v, n in w) / sum(n for _, n in w), 2) if w else None
+        api = combine_api([r["api"] for r in rows if r.get("api")])
+        if api:
+            c["api"] = api
         c["hosts"] = len(rows)
         out[day] = c
+    return out
+
+
+def combine_api(apis: list[dict]) -> dict | None:
+    """The API numbers of a day both hosts reported. The combined day had none, so the dashboard's GitHub API panel lost
+    its bar on every day the second host published. Quota readings are of one hourly counter per token: each hour keeps
+    the highest reading of any host (hosts on one token read the same counter; on two tokens this is the busier one), and
+    the peak follows. Calls and writes are each host's own, so they add up."""
+    if not apis:
+        return None
+    hours: dict[str, int] = {}
+    for a in apis:
+        for h, u in (a.get("used_by_hour") or {}).items():
+            hours[h] = max(hours.get(h, 0), int(u or 0))
+    out: dict = {"used_by_hour": dict(sorted(hours.items())), "peak_hour": max(hours.values()) if hours else None,
+                 "readings_at_zero": max(int(a.get("readings_at_zero") or 0) for a in apis)}
+    for k in ("readings", "churn_calls", "churn_writes", "worker_calls", "worker_writes"):
+        out[k] = sum(int(a.get(k) or 0) for a in apis)
+    out["churn_writes_busiest_hour"] = max(int(a.get("churn_writes_busiest_hour") or 0) for a in apis)
+    for k in ("churn_by_caller", "worker_top_runs"):
+        both: collections.Counter = collections.Counter()
+        for a in apis:
+            both.update(a.get(k) or {})
+        out[k] = dict(both.most_common(8 if k == "churn_by_caller" else 5))
     return out
 
 
