@@ -25,11 +25,19 @@ Then start the gate: [`systemd/first-install/`](systemd/first-install/README.md)
 
 ## What the workers can touch
 
-Workers are not confined in a container. Each runs as the user who started the gate, in its own git worktree, under Claude Code's `auto` permission mode. Three settings narrow that, all off by default:
+Workers are not confined in a container. By default each one runs as the user who started the gate, with that user's GitHub login and ssh keys, in its own git worktree, under Claude Code's `auto` permission mode. Know these four things before pointing it at a repository:
 
-- **A separate GitHub identity for workers.** `"worker_token_file": "~/.config/promoter-bot/worker.token"` (a file only you can read) makes every worker's `gh` and `git push` use that token instead of your own login. Use a bot account, or a fine-grained token limited to the one repository with contents, pull requests and issues read/write and nothing else. The gate's own review and merge decisions keep your login, so the account that writes a change is not the account that approves it. If the file is missing, empty or readable by others, the worker does not start.
-- **A sandbox.** `"sandbox": {"enabled": true}` turns on Claude Code's Bash sandbox for workers: outbound connections only to an allowlist, writes only in the worktree, the temp directory and listed paths. `promoter-bot sandbox probe` checks a host first. docker cannot run inside it and is excluded by default, so a worker that uses docker is not contained.
-- **Collaborators only.** Workers read issue and comment text. On a public repository, restrict who can open issues that reach the queue, or review what is queued: text from a stranger is input to a program with a shell.
+- **Anyone who can file an issue can put text in front of a worker.** Workers read the issue they are given and its comments, and nothing in the code filters by author. On a public repository, limit who can open issues, or queue only issues you have read. Text from a stranger is input to a program with a shell.
+- **A model approves the merges.** The gate's review step, a model session on your login, decides whether a pull request is merged; a person sees only what it escalates. With the default single login, nothing but the worker's instructions stops a worker from approving its own work.
+- **The launcher updates itself.** Every hour it fetches this repository's `main`, runs its tests and fast-forwards. Whatever is on that branch runs on your host, outside any sandbox, so protect the branch and do not give workers a token that can push to it.
+- **Model sessions that drive the system are never sandboxed.** The settings below apply to workers. The gate's own model ticks and the rescue session run with your login.
+
+Two settings narrow what a worker can do. Both are off by default:
+
+- **A separate GitHub identity.** `"worker_token_file": "~/.config/promoter-bot/worker.token"` (a file only you can read) makes every worker's `gh` and `git push` use that token instead of your login. Use a bot account, or a fine-grained token limited to the one repository with contents, pull requests and issues read/write and nothing else. Workers then write as the bot while the review step still approves as you. If the file is missing, empty or readable by others, the worker does not start. On its own this changes only what `gh` and `git` use: your own login and keys are still on disk, readable by the same user, until the sandbox is on too.
+- **A sandbox.** `"sandbox": {"enabled": true}` turns on Claude Code's Bash sandbox for workers: outbound connections only to an allowlist (GitHub is on it), writes only in the worktree, the temp directory, the primary checkout's `.git` and listed paths. With a worker token set, it also makes `~/.ssh`, `~/.config/gh` and the token file unreadable. `promoter-bot sandbox probe` checks a host first. docker cannot run inside it and is excluded by default, so a worker that uses docker is not contained.
+
+With both on, a worker has a token for one repository, cannot read your credentials, and can reach only the listed hosts. It is still the same Unix user on the same machine; this is a narrower blast radius, not isolation.
 
 ## When a worker dies
 
