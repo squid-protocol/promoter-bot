@@ -76,3 +76,13 @@ def test_the_inbox_lists_everything_that_waits_on_a_person_oldest_first(churn, m
     assert budget["ref"] == "run 7-a" and "churn budget continue 7-a" in budget["how"] and "$15.0" in budget["what"]
     assert items[3]["ref"] == "queue #5 (PR #4)" and not items[3]["answered"]
     assert all(x["how"] for x in items) and churn.inbox({}, {}) == []
+
+
+def test_with_a_worker_token_the_sandbox_hides_the_owners_credentials(churn, monkeypatch, tmp_path):
+    assert "denyRead" not in churn.sandbox_settings({"enabled": True})["filesystem"]  # no token: the worker needs them
+    monkeypatch.setattr(churn, "WORKER_TOKEN_FILE", str(tmp_path / "bot.token"))
+    deny = churn.sandbox_settings({"enabled": True})["filesystem"]["denyRead"]
+    home = churn.Path.home()
+    assert deny == [str(home / ".ssh"), str(home / ".config" / "gh"), str(tmp_path / "bot.token")]
+    assert "denyRead" not in churn.sandbox_settings({"enabled": True, "deny_read": []})["filesystem"]  # the host's say
+    assert churn.sandbox_settings({"enabled": True, "deny_read": ["~/x"]})["filesystem"]["denyRead"] == [str(home / "x")]
