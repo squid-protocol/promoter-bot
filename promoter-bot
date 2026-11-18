@@ -10797,7 +10797,9 @@ def core_parts(gh, merged: list[dict], lo: dt.datetime, hi: dt.datetime) -> dict
 # ---------------------------------------------------------------- PR quality by size and fix causes (2026-10-26)
 # Owner 2026-10-26: a routine weekly score of what the 5-file rule rests on -- how often a merged PR needed a fix, by its
 # hand-written file count, and what broke when it did -- drawn on squid-bot's dashboard (quality.svg) from factory.json.
-SIZE_BUCKETS = (("1-2", 2), ("3-4", 4), ("5", 5), ("6+", 10**9))
+# 2026-11-18 (owner): 5 files was cracked, so are 6 and 7 ok too? "6+" hid the answer: 6, 7 and 8+ are recorded apart. Days
+# recorded before this hold one "6+" bucket, which squid-bot's quality.svg draws as its own dashed line.
+SIZE_BUCKETS = (("1-2", 2), ("3-4", 4), ("5", 5), ("6", 6), ("7", 7), ("8+", 10**9))
 FIX_CAUSES = ("env", "conflict", "stale", "collateral", "own_test", "review", "other")
 CAUSE_PROMPT = """Classify why each automated pull request needed a fix run. Judge from what the worker found, not the request
 wording. One cause per item:
