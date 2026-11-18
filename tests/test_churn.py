@@ -5601,6 +5601,11 @@ def test_gzipped_goldens_are_regenerated_not_hand_written(churn):
     assert churn.hand_written(files + ["gitgalaxy/core/calls_out.py", "data/raw.gz"]) == ["gitgalaxy/core/calls_out.py", "data/raw.gz"]
 
 
+def test_size_buckets_split_5_6_7_and_8_plus(churn):
+    assert [churn.size_bucket(n) for n in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 40)] == [
+        "1-2", "1-2", "1-2", "3-4", "3-4", "5", "6", "7", "8+", "8+", "8+"]
+
+
 def test_quality_counts_merged_prs_by_size_first_pass_and_the_days_fix_causes(churn, tmp_path):
     runs = tmp_path / "runs"
 
@@ -5625,7 +5630,8 @@ def test_quality_counts_merged_prs_by_size_first_pass_and_the_days_fix_causes(ch
     assert out["first_pass"] == {"merged": 4, "first_pass": 2}  # PR 3's precheck retry is not a fix run: first pass
     q = out["quality"]
     assert q["by_size"]["1-2"] == {"merged": 2, "fixed": 0}  # the golden file does not count; a precheck retry is not a fix
-    assert q["by_size"]["5"] == {"merged": 1, "fixed": 1} and q["by_size"]["6+"] == {"merged": 1, "fixed": 1}
+    assert q["by_size"]["5"] == {"merged": 1, "fixed": 1} and q["by_size"]["7"] == {"merged": 1, "fixed": 1}  # PR 4: 7 files
+    assert q["by_size"]["6"] == q["by_size"]["8+"] == {"merged": 0, "fixed": 0} and "6+" not in q["by_size"]  # 6, 7, 8+ apart
     assert q["causes"] == {"env": 1} and q["fix_runs"] == 1  # d2 started the day before
     assert [i["id"] for i in asked] == ["b2"] and "main was red" in asked[0]["report"]
     assert json.loads((runs / "b2" / "cause.json").read_text())["cause"] == "env"  # cached: never asked twice
