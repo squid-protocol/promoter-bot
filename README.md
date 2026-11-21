@@ -51,10 +51,9 @@ A run that ends without a result (its process vanished, the network dropped, a u
 - **Workers.** Detached headless coding-agent runs (Claude Code; an agy/Gemini lane), each in its own git worktree,
   paced by box capacity and a rolling spend ledger; a usage limit pauses until the reset (weekly resets included).
 - **Queue.** Tiered and self-refilling (rules, then a model refill, then standing call-graph work).
-- **Goal (`promoter-bot goal`, owner 2026-10-21).** An ordered list of stages (default `translate > l5 > breadth`), each an
-  issue set. The active stage's issues launch first in every pick (PR fixes, the core slot, normal work) and lead the
-  rule refill; later stages follow, then everything else. With `goal_reports` set, `promoter-bot goal measure` (the gate every
-  6 h) reads the repo's evidence reports, counts programs per level, writes `progress-snapshots/goal-*.json` and names
+- **Goal measure (`promoter-bot goal`, owner 2026-10-21).** The goal's ordered stages became the focus on 2026-10-25
+  and were removed on 2026-11-21; the evidence measure is what is left. With `goal_reports` set, `promoter-bot goal
+  measure` (the gate every 6 h) reads the repo's evidence reports, counts programs per level, writes `progress-snapshots/goal-*.json` and names
   the programs that do not translate whole and no open issue mentions; the model tick is asked to file those. A
   checklist line that merged 3 partial slices is requeued as "SPLIT FIRST" so it gets broken up instead of cycling.
 - **Housekeeping.** Removes finished worktrees, reaps stale containers, keeps a daily scorecard.

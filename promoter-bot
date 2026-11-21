@@ -418,6 +418,8 @@ def normalize_state(state: dict) -> list[str]:
         if not isinstance(state.get(key, {}), dict):
             quarantine(key, state[key], "not an object")
             state[key] = {}
+    for gone in ("stage", "issues", "order"):  # goal stages: the focus replaced them 2026-10-25, dropped 2026-11-21
+        (state.get("goal") or {}).pop(gone, None)
     try:
         mo = _int(state.get("max_opus", 1))
         if not 0 <= mo <= 4:
@@ -11332,8 +11334,8 @@ def cmd_status(a) -> int:
     print("owner policy: " + (", ".join(f"{k} on since {v}" for k, v in pol.items()) if pol else
                               "none (workflow edits need an allow_workflows item or `churn pr allow-workflows N`)"))
     g = goal_cfg(state)
-    print(f"goal: {g['stage']} ({len((g.get('issues') or {}).get(g['stage'], []))} issues)"
-          + (f"; {goal_summary(g['measure'])} at {g['measure']['t']}" if g.get("measure") else ""))
+    if g.get("measure"):
+        print(f"goal measure: {goal_summary(g['measure'])} at {g['measure']['t']}")
     print("queue head: " + ", ".join(f"#{q['issue']}" + ("*" if q.get("needs_owner") else "") + ("(agy)" if q.get("backend") == "agy" else "")
                                      for q in state.get("queue", [])[:6]))
     cfg = agy_cfg(state)
