@@ -4958,12 +4958,36 @@ def test_gh_calls_are_marked_read_or_write_for_the_secondary_limits(churn):
 # ---------------------------------------------------------------- ladder refill (owner 2026-10-25)
 def _ladder_state(**goal):
     return {"queue": [], "running": [], "prs": [],
-            "goal": {"issues": {"ladder": [6072, 6271]}, "order": ["translate", "ladder"], "stage": "ladder",
-                     "ladder_anchor": 6072,
+            "goal": {"ladder_anchor": 6072,
                      "measure": {"t": "2026-10-25T01:25Z",
                                  "below": {"cics-genapp": [["lgapvs01", "L3"], ["lgtestp1", "L2"]],
                                            "cics-banking-sample-application-cbsa": [["CRECUST", "L3"], ["INQACC", "L2"]],
                                            "zecs": [["ZECS001", "L2"]]}}, **goal}}
+
+
+def test_the_dead_goal_stage_is_dropped_and_the_measure_kept(churn):
+    """Goal stages stopped ranking picks on 2026-10-25 (the focus replaced them); the state drops them (2026-11-21)."""
+    m = {"t": "2026-11-20T01:00Z", "below": {}}
+    st = {"prs": [], "queue": [], "running": [],
+          "goal": {"stage": "doom", "issues": {"doom": [1, 2]}, "order": ["doom"], "measure": m, "measure_due": True,
+                   "ask": ["prog"]}}
+    churn.normalize_state(st)
+    assert st["goal"] == {"measure": m, "measure_due": True, "ask": ["prog"]} and not st.get("quarantine")
+    bare = {"prs": [], "queue": [], "running": []}
+    churn.normalize_state(bare)
+    assert "goal" not in bare  # no goal: nothing to drop, nothing added
+
+
+def test_status_prints_the_goal_measure_and_no_stage(churn, capsys, monkeypatch):
+    monkeypatch.setattr(churn, "stop_info", lambda: None)
+    monkeypatch.setattr(churn, "goal_summary", lambda m: "3 programs")
+    put(churn, goal={"stage": "doom", "issues": {"doom": [1]}, "order": ["doom"]})
+    churn.cmd_status(argparse.Namespace())
+    out = capsys.readouterr().out
+    assert not [ln for ln in out.splitlines() if ln.startswith("goal")]  # no measure yet: no goal line at all
+    put(churn, goal={"measure": {"t": "2026-11-20T01:00Z"}})
+    churn.cmd_status(argparse.Namespace())
+    assert "goal measure: 3 programs at 2026-11-20T01:00Z" in capsys.readouterr().out
 
 
 def test_goal_measure_lists_programs_below_l4_by_estate(churn):
