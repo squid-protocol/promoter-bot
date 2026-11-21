@@ -4724,6 +4724,9 @@ def fold_covered(state: dict, snap: dict) -> list[str]:
 # NOT after_merge): blocked_by releases it once that PR is approved at its head and mergeable, as for any after_prs, so
 # the next slice starts from code that is final. A PR on hold is not waited on (it may sit for days).
 SIBLING_HOLD = _CFG.get("features", {}).get("sibling_hold", True)
+# Owner 2026-11-21: close existing issues; a merged slice queues no automatic next slice (state.features.closeout=false
+# restores the old chain).
+CLOSEOUT = _CFG.get("features", {}).get("closeout", True)
 
 
 def _sibling_gateable(x: dict) -> bool:
@@ -11631,6 +11634,8 @@ def requeue_next_slice(state: dict, f: dict, nxt: str | None) -> str | None:
     sweep/infra focus issues (#5126, #7064, #4269 ...) got no next slice overnight and the box idled; the focus
     allowlist above now does that job. None = nothing queued."""
     issue = f.get("issue")
+    if issue and f.get("kind") == "merged" and CLOSEOUT and state.get("features", {}).get("closeout", True):
+        return None  # owner 2026-11-21: finish and stop; the issue stays open for the owner or a deliberate `queue add`
     if not issue or f.get("kind") != "merged" or (not nxt and (state.get("workers_paused")
                                                                or not focus_on(state))):
         return None
