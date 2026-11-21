@@ -285,6 +285,7 @@ class TestGateRules:
 
     def test_a_followup_that_leaves_the_issue_open_queues_the_next_slice(self, churn, monkeypatch):
         # #37: #5648 / #5649 slices merged, the followups left the issues open, and nothing queued the next slice
+        monkeypatch.setattr(churn, "CLOSEOUT", False)  # the old chain, kept behind features.closeout
         issues = {5648: {"number": 5648, "state": "open", "title": "Shared COBOL preprocessor",
                          "labels": [{"name": "scope:core"}, {"name": "lane:nyx"}]},
                   5700: {"number": 5700, "state": "open", "title": "a sweep", "labels": [{"name": "scope:sweep"}]},
@@ -5243,6 +5244,7 @@ def test_the_filler_refill_only_runs_for_an_open_window_that_can_launch_nothing(
 
 
 def test_queue_add_and_followups_park_off_focus_work_instead_of_queueing_it(churn, monkeypatch, capsys):
+    monkeypatch.setattr(churn, "CLOSEOUT", False)
     put(churn, focus=_focus(churn, monkeypatch))
     a = argparse.Namespace(action="add", issue=3799, model="sonnet", task="next ledger slice", needs_owner=False,
                            backend=None, pr=None, after_pr=None, after_merge=False, allow_workflows=False, agy_step=None,
@@ -6613,3 +6615,10 @@ def test_a_conflict_github_refused_is_offered_to_the_json_merge_before_a_worker(
     st["prs"][0].pop("update_tried")
     out = churn.queue_pr_fixes(st, snap, update=lambda n: False, json_merge=lambda n, b: False)
     assert out == ["#5180"] and st["queue"][0]["pr"] == 5180  # not mechanical: a worker fixes it
+
+
+def test_closeout_queues_no_next_slice_after_a_merged_part_of_followup(churn, monkeypatch):
+    put(churn, focus=_focus(churn, monkeypatch))
+    st = churn.load_state()
+    assert churn.requeue_next_slice(st, {"pr": 1, "kind": "merged", "issue": 3799}, "more") is None
+    assert st.get("queue", []) == []
