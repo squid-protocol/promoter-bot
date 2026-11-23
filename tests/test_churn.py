@@ -6423,6 +6423,158 @@ def test_a_closed_shared_red_issue_is_fixed_only_when_closed_as_completed(churn,
     assert ("fixed" in notes[0]) is fixed and ("closed as not main's" in notes[0]) is not fixed
 
 
+SNAPF = "tests/golden_master_audit/12_scan_output_snapshots/gpu_json.json"
+SRC = "gitgalaxy/standards/language_standards/languages/swift.py"
+
+
+def rb_snap(n_prs, ms="dirty", **kw):
+    return {str(100 + i): pr(ms=ms, head=f"h{100 + i}", branch=f"churn/{900 + i}-x", **kw) for i in range(n_prs)}
+
+
+def rb_files(extra=None):
+    table = {"snap": {SNAPF, SRC}, "src": {SRC}, **(extra or {})}
+    return lambda n, head: table.get(extra and extra.get(n) and "x" or "snap")
+
+
+def test_a_conflicting_pr_with_snapshot_files_owes_a_rebless_only_snapshot_conflicts_are_batchable(churn):
+    st = {"prs": [], "queue": []}
+    snap = rb_snap(3)
+    conf = {100: [SNAPF], 101: [SNAPF, SRC], 102: None}  # only snapshots / a hand-written conflict too / unreadable
+    owed = churn.rebless_owed(st, snap, files=lambda n, h: {SNAPF, SRC}, conflicts=lambda n: conf[n])
+    assert [(o["pr"], o["batchable"]) for o in owed] == [(100, True), (101, False), (102, False)]
+    assert [o["why"] for o in owed] == ["conflicts only in snapshots", "conflicts beyond snapshots", "conflicts, list unknown"]
+
+
+def test_a_pr_without_snapshot_files_or_not_red_owes_nothing(churn):
+    st = {"prs": [], "queue": []}
+    snap = {**rb_snap(1), "200": pr(ms="clean", head="h200"), "201": pr(ms="dirty", head="h201"), "202": pr(state="closed")}
+    files = {100: {SNAPF}, 200: {SNAPF}, 201: {SRC}, 202: {SNAPF}}
+    owed = churn.rebless_owed(st, snap, files=lambda n, h: files[n], conflicts=lambda n: [SNAPF])
+    assert [o["pr"] for o in owed] == [100]  # 200 is clean and green, 201 has no snapshot file, 202 is closed
+
+
+def test_a_green_snapshot_pr_that_fails_a_golden_check_is_batchable_without_a_conflict_read(churn):
+    st = {"prs": [], "queue": []}
+    churn.CI_CHECKS[100] = ["Golden Crucible Resilience Test", "ruff-audit"]
+    owed = churn.rebless_owed(st, rb_snap(1, ms="blocked"), files=lambda n, h: {SNAPF}, conflicts=lambda n: 1 / 0)
+    assert owed[0]["batchable"] and owed[0]["why"].startswith("red: ")
+
+
+def test_conflicts_are_read_once_per_head_and_capped_per_tick(churn):
+    st, reads = {"prs": [], "queue": []}, []
+    snap = rb_snap(5)
+    f = lambda n, h: {SNAPF}  # noqa: E731
+    c = lambda n: reads.append(n) or [SNAPF]  # noqa: E731
+    churn.rebless_owed(st, snap, files=f, conflicts=c)
+    assert len(reads) == churn.REBLESS_READS_PER_TICK  # the rest wait for the next tick
+    churn.rebless_owed(st, snap, files=f, conflicts=c)
+    assert len(reads) == 5 and sorted(set(reads)) == [100, 101, 102, 103, 104]  # each read once
+    churn.rebless_owed(st, snap, files=f, conflicts=c)
+    assert len(reads) == 5  # cached per head
+    snap["100"] = {**snap["100"], "head": "new"}
+    churn.rebless_owed(st, snap, files=f, conflicts=c)
+    assert reads[-1] == 100 and len(reads) == 6  # a new head is read again
+
+
+def test_owner_holds_are_left_out_but_fix_loop_holds_count(churn):
+    snap = rb_snap(3)
+    st = {"queue": [{"pr": 100, "owner_hold": True}],
+          "prs": [{"number": 101, "verdict": "hold", "note": f"{churn.FIX_LOOP_NOTE} rosetta-audit: blocked"},
+                  {"number": 102, "verdict": "hold", "note": "owner ruling: needs a human"}]}
+    owed = churn.rebless_owed(st, snap, files=lambda n, h: {SNAPF}, conflicts=lambda n: [SNAPF])
+    assert [o["pr"] for o in owed] == [101]
+
+
+def queue_batch(churn, st, snap, opened=None, owed=None, read=None):
+    def open_issue(prs):
+        if opened is not None:
+            opened.append(prs)
+        return 700
+    return churn.queue_rebless_batch(st, snap, owed=owed, open_issue=open_issue, read=read)
+
+
+def owed_n(churn, n, batchable=True):
+    return [{"pr": 100 + i, "head": "h", "since": f"2026-11-23T0{i}:00Z", "batchable": batchable, "why": "x"} for i in range(n)]
+
+
+def test_three_batchable_prs_queue_one_batch_item_in_the_ci_lane(churn):
+    st, opened = {"prs": [], "queue": [], "running": []}, []
+    notes = queue_batch(churn, st, rb_snap(3), opened, owed=owed_n(churn, 3))
+    (q,) = st["queue"]
+    assert q["auto"] == "rebless-batch" and q["lane"] == "ci" and q["model"] == "sonnet" and q["issue"] == 700
+    assert q["needs_owner"] is False and q["allow_workflows"] is False
+    assert "rebless_batch.py --prs 100,101,102 --push" in q["task"] and "Do NOT merge" in q["task"]
+    assert opened == [[100, 101, 102]] and st["rebless"]["batch"]["issue"] == 700 and "queued" in notes[0]
+    assert churn.in_focus(st, q)  # a ci-lane blocker-remover is not held back by the focus lock
+
+
+def test_below_the_threshold_or_unbatchable_queues_nothing(churn):
+    st = {"prs": [], "queue": [], "running": []}
+    assert queue_batch(churn, st, rb_snap(2), owed=owed_n(churn, 2)) == []
+    assert queue_batch(churn, st, rb_snap(5), owed=owed_n(churn, 5, batchable=False)) == []
+    assert st["queue"] == []
+
+
+def test_one_batch_at_a_time_no_double_queue(churn):
+    st = {"prs": [], "queue": [], "running": []}
+    snap = rb_snap(4)
+    assert queue_batch(churn, st, snap, owed=owed_n(churn, 4))
+    assert queue_batch(churn, st, snap, owed=owed_n(churn, 4)) == [] and len(st["queue"]) == 1  # book + queue item
+    st["queue"] = []  # the item launched: the book's issue is still the lock
+    assert queue_batch(churn, st, snap, owed=owed_n(churn, 4)) == []
+    st2 = {"prs": [], "queue": [], "running": []}  # no book, but an open PR carries rebless-batch in its branch
+    snap2 = {**rb_snap(4), "500": pr(branch="rebless-batch-9")}
+    assert queue_batch(churn, st2, snap2, owed=owed_n(churn, 4)) == []
+
+
+def test_the_batch_lock_releases_when_its_issue_closes_or_its_prs_go(churn):
+    st = {"prs": [], "queue": [], "running": []}
+    snap = rb_snap(3)
+    queue_batch(churn, st, snap, owed=owed_n(churn, 3))
+    st["queue"] = []
+    st["rebless"]["batch"]["at"] = churn.iso(churn.now() - churn.dt.timedelta(hours=2))  # past the settle window, not stale
+    assert queue_batch(churn, st, snap, owed=owed_n(churn, 3), read=lambda path: {"state": "open"}) == []
+    notes = queue_batch(churn, st, snap, owed=owed_n(churn, 3), read=lambda path: {"state": "closed"})
+    assert notes and len(st["queue"]) == 1  # the closed issue released the lock; three PRs still wait, so a new batch queues
+    st3 = {"prs": [], "queue": [], "running": [], "rebless": {"batch": {"issue": 9, "prs": [1, 2], "at": iso_now(churn)}}}
+    assert queue_batch(churn, st3, rb_snap(0), owed=[]) == [] and "batch" not in st3["rebless"]  # its PRs are gone
+
+
+def iso_now(churn):
+    return churn.iso(churn.now())
+
+
+def test_a_stale_batch_with_no_worker_and_no_pr_releases_its_lock(churn):
+    st = {"prs": [], "queue": [], "running": [], "rebless": {"batch": {"issue": 9, "prs": [100], "at": "2026-01-01T00:00Z"}}}
+    queue_batch(churn, st, rb_snap(1), owed=[], read=lambda path: {"state": "open"})
+    assert "batch" not in st["rebless"]
+
+
+def test_a_batch_is_capped_at_twelve_prs_oldest_first(churn):
+    st, opened = {"prs": [], "queue": [], "running": []}, []
+    owed = [{"pr": 100 + i, "head": "h", "since": f"2026-11-{10 + i:02d}T00:00Z", "batchable": True, "why": "x"} for i in range(15)]
+    queue_batch(churn, st, rb_snap(15), opened, owed=owed)
+    assert opened == [list(range(100, 112))] and "#112" not in st["queue"][0]["task"]  # the 12 oldest
+
+
+def test_the_lane_can_be_switched_off(churn, monkeypatch):
+    monkeypatch.setattr(churn, "REBLESS_BATCH_MIN", 0)
+    st = {"prs": [], "queue": [], "running": []}
+    assert queue_batch(churn, st, rb_snap(5), owed=owed_n(churn, 5)) == [] and st["queue"] == []
+    assert churn.rebless_status_line(st).endswith("batch lane off")
+
+
+def test_the_status_line_counts_owed_prs_and_names_the_batch(churn):
+    st = {"prs": [], "queue": [], "running": []}
+    assert churn.rebless_status_line(st) == "rebless pipeline: none owed; batch: none queued (queues at 3 batchable)"
+    owed = churn.rebless_owed(st, rb_snap(4), files=lambda n, h: {SNAPF}, conflicts=lambda n: [SNAPF] if n != 103 else [SNAPF, SRC])
+    line = churn.rebless_status_line(st)
+    assert line.startswith("rebless pipeline: 4 PRs owe a rebless (#100 #101 #102 #103), 3 batchable, oldest ")
+    assert line.endswith("batch: none queued (queues at 3 batchable)")
+    queue_batch(churn, st, rb_snap(4), owed=owed)
+    assert churn.rebless_status_line(st).endswith("batch #700 open for #100, #101, #102")
+
+
 def test_a_program_refused_by_design_is_settled_and_listed_apart(churn):
     # owner 2026-11-03 (#5106): DBB epscsmrd.cbl stays at L0 as a stated boundary, not untranslated work
     reps = [{"file": "docs/language_status/evidence_report/dbb-mortgage-application/report.json", "programs": [
