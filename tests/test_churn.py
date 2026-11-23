@@ -6365,6 +6365,64 @@ def test_a_shared_red_issue_closed_with_no_merge_sends_the_prs_back_to_their_fix
     assert {q.get("pr") for q in st["queue"]} == {7, 9}  # main was green: each PR's own fixer has it again
 
 
+ROSETTA = [{"check": "rosetta-audit", "triage": "real", "tests": [], "cases": [], "errors": [
+    "unreviewed n/a cells: 20 (19 baselined)", "- clist/short_circuit", "##[error]Process completed with exit code 1."]}]
+
+
+def test_a_test_less_failure_is_read_by_its_error_lines(churn):
+    # 2026-11-23: rosetta-audit failed ~13 PRs for one main-wide reason and named no test, so red_sigs was empty
+    assert churn.red_sigs(ROSETTA) == ["rosetta-audit::- clist/short_circuit",
+                                       "rosetta-audit::unreviewed n/a cells: n (n baselined)"]
+    other = [{**ROSETTA[0], "errors": ["unreviewed n/a cells: 21 (19 baselined)", "- clist/short_circuit"]}]
+    assert churn.red_sigs(other) == churn.red_sigs(ROSETTA)  # numbers never split one red in two
+
+
+def test_error_line_sigs_skip_generic_noise_and_rollups(churn):
+    generic = [{"check": "lint", "triage": "real", "errors": ["##[error]Process completed with exit code 2."]},
+               {"check": "det", "triage": "real", "tests": [], "cases": [], "errors": ["some long roll-up error line"]},
+               {"check": "rosetta-audit", "triage": "infra", "errors": ["unreviewed n/a cells: 20 (19 baselined)"]},
+               {"check": "ruff", "triage": "real", "tests": ["tests/a.py::t"], "errors": ["a named test wins over lines"]}]
+    assert churn.red_sigs(generic) == ["ruff::tests/a.py::t"]
+
+
+def test_two_issues_failing_a_test_less_check_the_same_way_get_one_shared_issue(churn):
+    st = {"prs": [], "queue": [], "running": []}
+    sigs = churn.red_sigs(ROSETTA)
+    opened = []
+    churn.queue_pr_fixes(st, SNAP_SHARED, triage=shared_triage(churn, {7: (["rosetta-audit"], sigs), 9: (["rosetta-audit"], sigs)}),
+                         open_issue=lambda s, n: opened.append(sorted(s)) or 500)
+    (q,) = st["queue"]  # one ci-lane fix for the shared red; neither PR gets its own worker
+    assert q["auto"] == "shared-red" and opened and "companion repo" in q["task"] and "not planned" in q["task"]
+    assert st["shared_red"]["issues"][0]["prs"] == [7, 9]
+
+
+def test_a_merged_shared_red_fix_releases_prs_its_fix_loop_held(churn, monkeypatch):
+    st = {"prs": [], "queue": [], "running": []}
+    sigs = churn.red_sigs(ROSETTA)
+    churn.queue_pr_fixes(st, SNAP_SHARED, triage=shared_triage(churn, {7: (["rosetta-audit"], sigs), 9: (["rosetta-audit"], sigs)}),
+                         open_issue=lambda s, n: 500)
+    held = next(p for p in st["prs"] if p["number"] == 7)
+    held.update(verdict="hold", reviewed_head="h7", note=f"{churn.FIX_LOOP_NOTE} rosetta-audit: blocked (2 rounds)")
+    other = next(p for p in st["prs"] if p["number"] == 9)
+    other.update(verdict="hold", reviewed_head="h9", note="owner ruling: needs a human")  # a different hold stays
+    monkeypatch.setattr(churn, "update_branch", lambda n: True)
+    notes = churn.release_shared_red(st, 500, True)
+    assert "verdict" not in held and "reviewed_head" not in held and "released from their fix-loop hold #7" in notes[0]
+    assert other["verdict"] == "hold"
+
+
+@pytest.mark.parametrize("reason, fixed", [("completed", True), ("not_planned", False), (None, False)])
+def test_a_closed_shared_red_issue_is_fixed_only_when_closed_as_completed(churn, monkeypatch, reason, fixed):
+    st = {"prs": [], "queue": [], "running": []}
+    tri = shared_triage(churn, {7: (["det"], [UNLOCK]), 9: (["det"], [UNLOCK])})
+    churn.queue_pr_fixes(st, SNAP_SHARED, triage=tri, open_issue=lambda sigs, n: 500)
+    st["shared_red"]["issues"][0]["at"] = "2026-01-01T00:00Z"
+    monkeypatch.setattr(churn, "update_branch", lambda n: True)
+    sh = churn.shared_for(st, "7")
+    notes = churn.take_shared(st, "7", "h7", sh, read=lambda path: {"state": "closed", "state_reason": reason})
+    assert ("fixed" in notes[0]) is fixed and ("closed as not main's" in notes[0]) is not fixed
+
+
 def test_a_program_refused_by_design_is_settled_and_listed_apart(churn):
     # owner 2026-11-03 (#5106): DBB epscsmrd.cbl stays at L0 as a stated boundary, not untranslated work
     reps = [{"file": "docs/language_status/evidence_report/dbb-mortgage-application/report.json", "programs": [

@@ -8174,10 +8174,36 @@ SHARED_RED_TITLE = "Shared red on PRs"
 ROLLUP_CHECKS = {"det", "ground-truth", "full-suite", "equivalence-e2e", "crucible"}  # ci_digest PARTS: no tests of their own
 
 
+ERR_SIG_LINES = 3  # error lines of a test-less failure that count as signatures
+ERR_SIG_MIN_LEN = 12
+_ERR_GENERIC_RE = re.compile(r"(?i)^(?:##\[error\])?\s*(?:process completed with exit code N\.?|error:? ?)$")
+
+
+def err_sigs(f: dict) -> list[str]:
+    """Signatures for a real failure that names no test and no det case: its first ERR_SIG_LINES non-generic error lines
+    with numbers and hashes collapsed, so the same step failing the same way on two PRs reads as one red. 2026-11-23:
+    rosetta-audit failed ~13 PRs for one main-wide reason (`unreviewed n/a cells: 20 (19 baselined)` /
+    `- clist/short_circuit`); it names no pytest node, red_sigs came back empty, shared_red never fired, and every PR
+    went through its own fix loop and was held for the owner. Roll-up checks (ROLLUP_CHECKS) stay out: their errors
+    are the parts' own."""
+    if f.get("tests") or f.get("cases") or f.get("check") in ROLLUP_CHECKS:
+        return []
+    out: list[str] = []
+    for line in f.get("errors") or []:
+        s = re.sub(r"\s+", " ", re.sub(r"\d+", "N", re.sub(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b", "H", str(line)))).strip().lower()
+        if len(s) >= ERR_SIG_MIN_LEN and not _ERR_GENERIC_RE.match(s) and s not in out:
+            out.append(s[:160])
+        if len(out) >= ERR_SIG_LINES:
+            break
+    return [f"{f.get('check')}::{s}" for s in out]
+
+
 def red_sigs(failed: list[dict]) -> list[str]:
-    """ "check::name" for each failing pytest node id and unproven det case of ci_digest's real (not noise) failures."""
+    """ "check::name" for each failing pytest node id and unproven det case of ci_digest's real (not noise) failures, and
+    for a real failure that names neither, "check::<error line>" (err_sigs)."""
     return sorted({f"{f.get('check')}::{t}" for f in failed if f.get("triage") not in NOISE
-                   for t in [*(f.get("tests") or []), *(f.get("cases") or [])]})
+                   for t in [*(f.get("tests") or []), *(f.get("cases") or [])]}
+                  | {s for f in failed if f.get("triage") not in NOISE for s in err_sigs(f)})
 
 
 def shared_red(state: dict, n: str, issue: int, head: str, checks: list[str], sigs: list[str], snap: dict) -> dict:
@@ -8234,7 +8260,10 @@ def take_shared(state: dict, n: str, head: str, sh: dict, read=None, update=None
     e = sh["entry"]
     young = e is not None and (t := parse_iso(e.get("at"))) and now() - t < dt.timedelta(minutes=FIX_SETTLE_MIN)
     if e is not None and not young and issue_closed(int(e["issue"]), read) is True:
-        return [f"shared:{x}" for x in release_shared_red(state, int(e["issue"]), False, update)]  # main was green
+        # closed as completed = its fix landed (possibly in a companion repo, where `Fixes` cannot close it); closed as
+        # not planned, or with no reason read = main was green after all
+        fixed = issue_close_reason(int(e["issue"]), read) == "completed"
+        return [f"shared:{x}" for x in release_shared_red(state, int(e["issue"]), fixed, update)]
     if e is None:
         if not (k := (open_issue or shared_red_issue)(sh["sigs"], n)):
             return None  # could not open the issue: fix as before
@@ -8247,7 +8276,12 @@ def take_shared(state: dict, n: str, head: str, sh: dict, read=None, update=None
                      f"det cases ({'; '.join(sorted(sh['sigs']))[:300]}), so main broke them and the check does not "
                      f"run on main. First run each repro on a clean origin/main (tests/tools/ci_digest.py on one of "
                      f"the PRs names it). Red there: find the main commit that broke it and fix main in one PR with "
-                     f"tests that says `Fixes #{k}`. Green there: close #{k} with a comment saying so, and open no PR.")})
+                     f"tests that says `Fixes #{k}`. Green there: close #{k} as not planned (`gh issue close {k} --reason \"not planned\"`) with a comment saying "
+                     f"so, and open no PR. A signature "
+                     f"that is an error line, not a test, is a CI step failing the same way on every PR: read that step's log. "
+                     f"If the step compares this repo with a companion repo (rosetta-audit and keyword-rosetta), the fix may "
+                     f"belong there: open that PR, and close #{k} yourself once it merges (a `Fixes` in another repo "
+                     f"does not close it).")})
     others = sorted({int(p) for ps in sh["sigs"].values() for p in ps})
     e["prs"] = sorted({int(x) for x in e.get("prs", [])} | {int(n)} | set(others))
     e["sigs"] = sorted(set(e["sigs"]) | set(sh["sigs"]))
@@ -8278,6 +8312,14 @@ def issue_closed(n: int, read=None) -> bool | None:
         return None
 
 
+def issue_close_reason(n: int, read=None) -> str | None:
+    """GitHub's state_reason of closed issue n ("completed", "not_planned") or None."""
+    try:
+        return ((read or gh_json)(f"repos/{REPO}/issues/{n}") or {}).get("state_reason")
+    except (RuntimeError, ValueError, AttributeError):
+        return None
+
+
 def release_shared_red(state: dict, issue: int, merged: bool, update=None) -> list[str]:
     """Shared-red issue `issue` is done. Merged fix: update each waiting PR with main once (no worker). Closed with no
     merge: its signatures are not main's for SHARED_RED_H, and the PRs go back to their own fixers."""
@@ -8286,11 +8328,15 @@ def release_shared_red(state: dict, issue: int, merged: bool, update=None) -> li
     if entry is None:
         return []
     book["issues"].remove(entry)
-    out = []
+    out, released = [], []
     for p in state.get("prs", []):
         if isinstance(p, dict) and str(pr_num(p)) in {str(x) for x in entry.get("prs", [])}:
             head = p.pop("flake_head", None)
             p.pop("flake_at", None)
+            if merged and p.get("verdict") == "hold" and str(p.get("note") or "").startswith(FIX_LOOP_NOTE):
+                p.pop("verdict", None)  # held by its fix loop for this red before it was seen as main's: judge it again
+                p.pop("reviewed_head", None)
+                released.append(f"#{pr_num(p)}")
             if merged and p.get("update_tried") != f"shared-red:{issue}":
                 p["update_tried"] = f"shared-red:{issue}"  # once per shared red
                 if (update or update_branch)(pr_num(p)):
@@ -8303,7 +8349,8 @@ def release_shared_red(state: dict, issue: int, merged: bool, update=None) -> li
         for sg in entry.get("sigs", []):
             book.setdefault("not_main", {})[sg] = iso(now())
     kind = "fixed" if merged else "closed as not main's"
-    return [f"shared red #{issue} {kind}: " + (f"updated with main {', '.join(sorted(out, key=lambda x: int(x[1:])))}" if out else "PRs back to their fixers")]
+    note = f"shared red #{issue} {kind}: " + (f"updated with main {', '.join(sorted(out, key=lambda x: int(x[1:])))}" if out else "PRs back to their fixers")
+    return [note + (f"; released from their fix-loop hold {', '.join(sorted(released, key=lambda x: int(x[1:])))}" if released else "")]
 
 
 def prune_pr_fixes(state: dict, snap: dict) -> list[str]:
