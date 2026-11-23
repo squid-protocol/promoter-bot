@@ -6662,6 +6662,100 @@ def test_the_fix_loop_hold_records_what_to_recheck(churn):
     assert entry["hold_sigs"] == ["rosetta-audit::- clist/short_circuit"] and entry["hold_checks"] == ["rosetta-audit"]
 
 
+# keyword-rosetta #171 / #172 (2026-11-22): each PR's only red was what the other one changes
+SIG171 = ["verify::- c.ps1 -> probe_cleanup: calls_out_to expected [], got ['dispose']", "verify::fail powershell: n mismatch(es)",
+          "verify::fail tcl: n mismatch(es)"]
+SIG172 = ["verify::- clist/short_circuit", "verify::unreviewed n/a cells: n (n baselined)"]
+T171 = "docs: baseline clist/short_circuit n/a cell (unblocks gitgalaxy rosetta-audit)"
+T172 = "rebless(powershell, tcl): companion to gitgalaxy#8921 and #8915"
+
+
+def companion_state(churn, sigs=None, extra=None, age_h=5):
+    created = churn.iso(churn.now() - churn.dt.timedelta(hours=age_h))
+    snap = {"171": {"state": "open", "head": "h171", "branch": "docs/na-baseline-clist-short-circuit", "title": T171, "created": created,
+                    "labels": [], "mergeable_state": "blocked"},
+            "172": {"state": "open", "head": "h172", "branch": "rebless-powershell-tcl-8915-8921", "title": T172, "created": created,
+                    "labels": [], "mergeable_state": "blocked"}}
+    sigs = sigs or {"171": SIG171, "172": SIG172}
+    book = {n: {"issue": int(n), "head": f"h{n}", "checks": ["verify"], "sigs": s, "at": churn.iso(churn.now())} for n, s in sigs.items()}
+    st = {"prs": [], "queue": [{"issue": 171, "pr": 171, "auto": "pr-fix", "task": "Fix PR #171"}], "running": [], "shared_red": {"prs": book}}
+    if extra:
+        st.update(extra)
+    return st, snap
+
+
+def test_companion_tokens_drop_generic_words(churn):
+    assert churn.companion_tokens("Process completed with exit code 1: FAIL powershell: 1 mismatch(es)") == {"powershell"}
+    assert {"clist", "short_circuit"} <= churn.companion_tokens(T171)
+
+
+def test_two_prs_that_each_fail_on_what_the_other_fixes_are_companions(churn):
+    st, snap = companion_state(churn)
+    assert churn.companion_pairs(st, snap) == [(171, 172)]
+
+
+@pytest.mark.parametrize("why, kw", [
+    ("unrelated reds: neither names the other", {"sigs": {"171": ["verify::fail ruby: n mismatch(es)"], "172": ["verify::- clist/short_circuit"]}}),
+    ("the same red on both is a shared red, not a deadlock", {"sigs": {"171": SIG172, "172": SIG172}}),
+    ("too old", {"age_h": 60}),
+    ("a third PR carries the same red", {"sigs": {"171": SIG171, "172": SIG172, "173": SIG172}}),
+])
+def test_unrelated_shared_old_or_three_way_reds_are_not_companions(churn, why, kw):
+    st, snap = companion_state(churn, **kw)
+    if "173" in (kw.get("sigs") or {}):
+        snap["173"] = {**snap["172"], "title": "something else", "branch": "x"}
+    assert churn.companion_pairs(st, snap) == [], why
+
+
+def test_a_pr_with_a_worker_running_is_left_alone(churn):
+    st, snap = companion_state(churn, extra={"running": [{"pr": 172, "issue": 172}]})
+    assert churn.companion_pairs(st, snap) == []
+
+
+def test_the_fold_withdraws_the_per_pr_fixers_queues_one_item_and_locks(churn):
+    st, snap = companion_state(churn)
+    notes = churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 900)
+    assert notes == ["companion fold #900 queued for #171 and #172"]
+    (q,) = st["queue"]  # PR 171's own fix item is gone
+    assert q["auto"] == "companion-fold" and q["lane"] == "ci" and not q["needs_owner"] and "#171" in q["task"] and "#172" in q["task"]
+    assert {p["number"] for p in st["prs"]} == {171, 172} and all("flake_head" in p for p in st["prs"])  # no fixer relaunches
+    assert churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 1 / 0) == []  # one at a time: the issue is the lock
+    assert churn.real_in_focus(st, q)  # red work stays inside the focus lock, like shared-red
+
+
+def test_a_closed_fold_issue_releases_the_lock_and_the_pair_is_not_folded_again(churn):
+    st, snap = companion_state(churn)
+    churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 900)
+    st["companion"]["fold"]["at"] = "2026-01-01T00:00Z"
+    st["queue"] = []
+    assert churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 1 / 0, read=lambda path: {"state": "closed"}) == []
+    assert "fold" not in st["companion"] and "171-172" in st["companion"]["done"]
+    assert churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 1 / 0) == []
+
+
+def test_a_fold_with_no_worker_or_item_goes_stale(churn):
+    st, snap = companion_state(churn)
+    churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 900)
+    st["queue"] = []
+    st["companion"]["fold"]["at"] = churn.iso(churn.now() - churn.dt.timedelta(hours=churn.COMPANION_STALE_H + 1))
+    churn.queue_companion_fold(st, snap, pairs=[], read=lambda path: {"state": "open"})
+    assert "fold" not in st["companion"]
+
+
+def test_the_companion_fold_off_switch(churn, monkeypatch):
+    monkeypatch.setattr(churn, "COMPANION_FOLD", 0)
+    st, snap = companion_state(churn)
+    assert churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 1 / 0) == [] and len(st["queue"]) == 1
+
+
+def test_the_snapshot_carries_title_and_creation_time(churn, monkeypatch):
+    p = {"state": "open", "merged": False, "head": {"sha": "a" * 40, "ref": "x"}, "mergeable_state": "clean", "labels": [], "body": "",
+         "title": "t" * 200, "created_at": "2026-11-22T10:00:00Z"}
+    monkeypatch.setattr(churn, "prs_graphql", lambda nums: {5: p})
+    snap = churn.pr_snapshot([5], {})
+    assert snap["5"]["title"] == "t" * 140 and snap["5"]["created"] == "2026-11-22T10:00:00Z"
+
+
 def test_a_program_refused_by_design_is_settled_and_listed_apart(churn):
     # owner 2026-11-03 (#5106): DBB epscsmrd.cbl stays at L0 as a stated boundary, not untranslated work
     reps = [{"file": "docs/language_status/evidence_report/dbb-mortgage-application/report.json", "programs": [
