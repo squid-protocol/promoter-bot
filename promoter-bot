@@ -8608,7 +8608,8 @@ def hold_fix_loop(entry: dict, n: str, v: dict, checks: list[str], rounds: int) 
     rid = entry.get("fix_loop", {}).get("run")
     note = (f"{FIX_LOOP_NOTE} {', '.join(checks)}: {run_blocker(rid)} ({rounds} rounds, no hand-written change; "
             f"last run {rid})")
-    entry.update(reviewed_head=v.get("head"), verdict="hold", reviewed_at=iso(now()), note=note[:300])
+    entry.update(reviewed_head=v.get("head"), verdict="hold", reviewed_at=iso(now()), note=note[:300],
+                 hold_sigs=sorted(CI_SIGS.get(int(n)) or []), hold_checks=sorted(checks))  # what to re-check (recheck_holds)
     entry.pop("fix_loop", None)
     log(f"PR #{n} held: {note[:300]}")
     return f"hold:#{n} ({FIX_LOOP_NOTE} {', '.join(checks)})"
@@ -9204,6 +9205,83 @@ def release_workflow_holds(state: dict, snap: dict) -> list[str]:
             p.pop("reviewed_head", None)
             p["allow_workflows"] = True
             out.append(f"PR #{n}: workflow hold released under the standing grant; review it again ({note[:80]})")
+    return out
+
+
+# 2026-11-23: ~13 PRs sat on `hold` for a main-wide red that was fixed hours later; holds lasted "until a later verdict" and
+# nothing ever looked again, so the owner had to find and release each one. Holds now expire: churn re-reads the hold's red when
+# the PR got a new head or the hold is HOLD_RECHECK_H old, lifts it when the red is gone or changed, updates the branch once per
+# head when it is merely behind, and after HOLD_RECHECK_H forces a re-triage (at most HOLD_RETRIAGE_MAX per PR; then the PR
+# stays held for the owner). Never an owner's hold or an "Owner ruling" item.
+HOLD_RECHECK_H = float(_CFG.get("hold_recheck_h", 6))  # 0 turns it off
+HOLD_RETRIAGE_MAX = 2
+HOLD_READS_PER_TICK = 2  # CI triage reads (ci_digest, network) per tick
+HOLD_MIN_GAP_H = 1.0  # the same hold is re-read at most this often
+
+
+def hold_is_owners(state: dict, n: str) -> bool:
+    """PR n's hold is the owner's: an owner-answered hold or an open owner-ruling question. Never lifted automatically."""
+    return any(q.get("pr") == int(n) and (q.get("owner_hold") or (q.get("needs_owner") and str(q.get("task", "")).startswith("Owner ruling for PR")))
+               for q in state.get("queue", []))
+
+
+def recheck_holds(state: dict, snap: dict, triage=None, update=None) -> list[str]:
+    """Expire holds that no longer hold. For each open PR on a churn hold (not the owner's): when its head moved since the hold,
+    or the hold is HOLD_RECHECK_H old, read its CI (triage; at most HOLD_READS_PER_TICK a tick) and
+      - nothing failing -> lift (the red cleared, or CI is running again after an update);
+      - failing signatures differ from the recorded ones -> lift (the blocker changed: judge it afresh);
+      - merely behind main / dirty -> update the branch once per head (CI then reruns on the new head);
+      - same red and the hold is old -> lift for ONE forced re-triage (at most HOLD_RETRIAGE_MAX per PR).
+    A lifted hold drops its verdict and review head, so the next pass judges the PR. Returns log notes."""
+    if HOLD_RECHECK_H <= 0:
+        return []
+    out, reads = [], 0
+    cut = dt.timedelta(hours=HOLD_RECHECK_H)
+    for p in state.get("prs", []):
+        if not isinstance(p, dict) or p.get("verdict") != "hold":
+            continue
+        n = str(pr_num(p))
+        v = snap.get(n) or {}
+        if v.get("state") != "open" or hold_is_owners(state, n):
+            continue
+        at = parse_iso(p.get("reviewed_at"))
+        head = v.get("head", "")
+        old = bool(at and now() - at >= cut)
+        moved = bool(head) and bool(p.get("reviewed_head")) and not (str(p["reviewed_head"]).startswith(head) or head.startswith(str(p["reviewed_head"])[:12]))
+        last = parse_iso(p.get("hold_checked_at"))
+        recent = bool(last and now() - last < dt.timedelta(hours=HOLD_MIN_GAP_H))
+        if recent or not ((moved and p.get("hold_checked") != head) or old):
+            continue
+        if reads >= HOLD_READS_PER_TICK:
+            break
+        reads += 1
+        kinds = (triage or ci_triage)(int(n))
+        p["hold_checked"], p["hold_checked_at"] = head, iso(now())
+        if kinds is None:
+            continue  # could not read it: look again next time
+        real = [k for k in kinds if k not in NOISE]
+        sigs = sorted(CI_SIGS.get(int(n)) or [])
+        recorded = p.get("hold_sigs") or []
+        why = None
+        if not real:
+            why = "nothing failing at its head now"
+        elif recorded and sigs and not set(sigs) & set(recorded):
+            why = "its red changed since the hold"
+        elif v.get("mergeable_state") in ("behind", "dirty") and p.get("update_tried") != f"hold:{head}":
+            p["update_tried"] = f"hold:{head}"  # once per head
+            if (update or update_branch)(int(n)):
+                p["updated_from"] = head
+                out.append(f"hold #{n}: updated with main (CI reruns on the new head)")
+            continue
+        elif old and int(p.get("retriaged", 0)) < HOLD_RETRIAGE_MAX:
+            p["retriaged"] = int(p.get("retriaged", 0)) + 1
+            why = f"held {HOLD_RECHECK_H:g} h or more with the same red: forced re-triage {p['retriaged']}/{HOLD_RETRIAGE_MAX}"
+        if why:
+            for k in ("verdict", "reviewed_head", "hold_sigs", "hold_checks"):
+                p.pop(k, None)
+            out.append(f"hold #{n} lifted: {why}")
+    for note in out:
+        log(note)
     return out
 
 
@@ -10525,6 +10603,8 @@ def cmd_tick(a) -> int:
                 with contextlib.suppress(Exception):  # sibling slices of one issue (2026-11-04)
                     for note in hold_sibling_slices(st, snap):
                         log(note)
+                with contextlib.suppress(Exception):  # holds expire: lift the ones whose red is gone or changed
+                    recheck_holds(st, snap)
                 pruned = prune_pr_fixes(st, snap)
                 fixes = queue_pr_fixes(st, snap)
                 with contextlib.suppress(Exception):  # rebless pipeline: one batch for the PRs that owe a rebless
