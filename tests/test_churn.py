@@ -6575,6 +6575,79 @@ def test_the_status_line_counts_owed_prs_and_names_the_batch(churn):
     assert churn.rebless_status_line(st).endswith("batch #700 open for #100, #101, #102")
 
 
+def draft_snap(**kw):
+    return {"7": {"state": "open", "head": "h7", "branch": "churn/70-x", "labels": ["shepherd:needs-fix"], "mergeable_state": "blocked",
+                  "draft": True, **kw}}
+
+
+def test_a_worker_draft_with_stale_red_is_marked_ready_once_per_head_and_gets_no_fixer(churn):
+    st = {"prs": [{"number": 7, "issue": 70}], "queue": [], "running": []}
+    ready = []
+    added = churn.queue_pr_fixes(st, draft_snap(), triage=lambda n: 1 / 0, mark_ready=lambda n: ready.append(n) or True)
+    assert ready == [7] and st["queue"] == [] and any(x.startswith("ready:#7") for x in added)
+    churn.queue_pr_fixes(st, draft_snap(), triage=lambda n: 1 / 0, mark_ready=lambda n: ready.append(n) or True)
+    assert ready == [7] and st["queue"] == []  # same head: not again, still no fixer
+    churn.queue_pr_fixes(st, draft_snap(head="h8"), triage=lambda n: 1 / 0, mark_ready=lambda n: ready.append(n) or True)
+    assert ready == [7, 7]  # a new head gets its own try
+
+
+def test_a_failed_ready_still_gives_a_draft_no_fix_worker(churn):
+    st = {"prs": [{"number": 7, "issue": 70}], "queue": [], "running": []}
+    assert churn.queue_pr_fixes(st, draft_snap(), triage=lambda n: 1 / 0, mark_ready=lambda n: False) == [] and st["queue"] == []
+
+
+def test_a_draft_with_a_live_worker_or_not_from_churn_is_left_to_its_owner(churn, monkeypatch):
+    st = {"prs": [{"number": 7, "issue": 70}], "queue": [], "running": [{"issue": 70, "pid": 4242}]}
+    ready = []
+    churn.queue_pr_fixes(st, draft_snap(), triage=lambda n: ["real"], mark_ready=lambda n: ready.append(n) or True)
+    assert ready == []  # the worker that opened it marks it ready itself
+    st = {"prs": [], "queue": [], "running": []}
+    churn.queue_pr_fixes(st, draft_snap(branch="rebless-batch-x"), triage=lambda n: ["real"], mark_ready=lambda n: ready.append(n) or True)
+    assert ready == []  # not a churn/<issue>- branch: not ours to promote
+
+
+def test_the_snapshot_carries_the_draft_flag(churn, monkeypatch):
+    p = {"state": "open", "merged": False, "head": {"sha": "a" * 40, "ref": "x"}, "mergeable_state": "clean", "labels": [], "body": "", "draft": True}
+    monkeypatch.setattr(churn, "prs_graphql", lambda nums: {5: p})
+    assert churn.pr_snapshot([5], {})["5"]["draft"] is True
+
+
+class _StuckGH(_BotGH):
+    """A bot PR whose failed run GitHub will not rerun; `update` and `rebuild` say whether those steps work."""
+    def __init__(self, update=True, rebuild=True, **kw):
+        super().__init__(**kw)
+        self.update, self.rebuild = update, rebuild
+
+    def sh(self, cmd):
+        self.calls.append(cmd[:3])
+        if cmd[:3] == ["gh", "run", "rerun"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "run 1 cannot be rerun; This workflow run cannot be retried")
+        ok = self.update if cmd[1] == "api" else self.rebuild
+        return subprocess.CompletedProcess(cmd, 0 if ok else 1, "", "")
+
+
+def test_a_run_github_will_not_rerun_updates_the_branch_instead_of_paging(bot):
+    churn, pages = bot
+    g = _StuckGH(state="clean", runs=[{"id": 1, "name": "ground-truth", "conclusion": "failure", "run_attempt": 1}])
+    [line] = churn.tend_bot_prs(g.gh, g.sh)
+    assert "cannot be retried; updated the branch with main" in line and ["gh", "api", "-X"] in g.calls and pages == []
+    assert churn.tend_bot_prs(g.gh, g.sh) == []  # once per head
+
+
+def test_a_run_that_cannot_be_retried_on_a_branch_that_will_not_update_gets_rebuilt(bot):
+    churn, pages = bot
+    g = _StuckGH(update=False, state="clean", runs=[{"id": 1, "name": "ground-truth", "conclusion": "failure", "run_attempt": 1}])
+    [line] = churn.tend_bot_prs(g.gh, g.sh)
+    assert "dispatched evidence-refresh.yml on main to rebuild it" in line and pages == []
+
+
+def test_a_normal_rerun_still_reruns(bot):
+    churn, _ = bot
+    g = _BotGH(state="clean", runs=[{"id": 1, "name": "ground-truth", "conclusion": "failure", "run_attempt": 1}])
+    [line] = churn.tend_bot_prs(g.gh, g.sh)
+    assert line.startswith("bot PR #5317: reran the failed jobs once")
+
+
 def test_a_program_refused_by_design_is_settled_and_listed_apart(churn):
     # owner 2026-11-03 (#5106): DBB epscsmrd.cbl stays at L0 as a stated boundary, not untranslated work
     reps = [{"file": "docs/language_status/evidence_report/dbb-mortgage-application/report.json", "programs": [
