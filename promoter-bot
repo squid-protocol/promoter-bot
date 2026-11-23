@@ -4508,7 +4508,7 @@ def reap(state: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------- PR snapshot
-PR_FIELDS_GQL = ("number state merged headRefOid headRefName mergeStateStatus body title createdAt "
+PR_FIELDS_GQL = ("number state merged headRefOid headRefName mergeStateStatus body isDraft title createdAt "
                  "labels(first: 40) { nodes { name } }")
 
 
@@ -4531,7 +4531,7 @@ def prs_graphql(nums: list[int], batch: int = 40) -> dict[int, dict]:
             if g:
                 out[n] = {"state": "open" if g["state"] == "OPEN" else "closed", "merged": g["state"] == "MERGED",
                           "head": {"sha": g["headRefOid"], "ref": g["headRefName"]},
-                          "mergeable_state": str(g.get("mergeStateStatus") or "unknown").lower(), "body": g.get("body"),
+                          "mergeable_state": str(g.get("mergeStateStatus") or "unknown").lower(), "body": g.get("body"), "draft": bool(g.get("isDraft")),
                           "title": g.get("title"), "created_at": g.get("createdAt"),
                           "labels": [{"name": x["name"]} for x in (g.get("labels") or {}).get("nodes") or []]}
     return out
@@ -4555,7 +4555,7 @@ def pr_snapshot(prs: list[int], old: dict) -> dict:
             ms = old.get(str(n), {}).get("mergeable_state", "unknown")
         snap[str(n)] = {"state": p["state"], "merged": p.get("merged", False), "head": p["head"]["sha"][:12],
                         "mergeable_state": ms, "labels": sorted(lbl["name"] for lbl in p.get("labels", [])),
-                        "branch": p["head"].get("ref", ""), "closes": bool(CLOSES_RE.search(p.get("body") or "")),
+                        "branch": p["head"].get("ref", ""), "closes": bool(CLOSES_RE.search(p.get("body") or "")), "draft": bool(p.get("draft")),
                         "title": str(p.get("title") or "")[:140], "created": str(p.get("created_at") or ""),
                         **pr_checks(p.get("body") or "")}
     return snap
@@ -5930,9 +5930,24 @@ def tend_bot_prs(gh=None, sh=None) -> list[str]:
         if not failed:
             continue
         if not mem.get("rerun"):
+            stuck = False
             for r in failed:
-                sh(["gh", "run", "rerun", str(r["id"]), "--failed", "-R", REPO])
+                res = sh(["gh", "run", "rerun", str(r["id"]), "--failed", "-R", REPO])
+                stuck = stuck or (bool(getattr(res, "returncode", 0)) and "cannot be retried" in f"{getattr(res, 'stderr', '')}{getattr(res, 'stdout', '')}")
             mem["rerun"] = iso(t)
+            if stuck:
+                # 2026-11-23: GitHub refuses to rerun an old run ("This workflow run cannot be retried"), and this path logged
+                # "reran" and paged the owner anyway. Take main's newest into the branch (a new head runs CI afresh); if that
+                # conflicts, rebuild the PR from main as the dirty path does.
+                if sh(["gh", "api", "-X", "PUT", f"repos/{REPO}/pulls/{n}/update-branch"]).returncode == 0:
+                    mem["updated"] = iso(t)
+                    lines.append(f"bot PR #{n}: its failed run cannot be retried; updated the branch with main so CI runs afresh ({names})")
+                elif sh(["gh", "workflow", "run", wf, "-R", REPO, "--ref", "main"]).returncode == 0:
+                    mem["dispatched"] = iso(t)
+                    lines.append(f"bot PR #{n}: its failed run cannot be retried and the branch will not update: dispatched {wf} on main to rebuild it")
+                else:
+                    lines.append(f"bot PR #{n}: its failed run cannot be retried and neither an update nor a rebuild started ({names})")
+                continue
             lines.append(f"bot PR #{n}: reran the failed jobs once ({names})")
         elif not mem.get("paged") and all(r.get("run_attempt", 1) > 1 for r in failed):
             mem["paged"] = iso(t)
@@ -9121,8 +9136,13 @@ def carry_reviews(state: dict, snap: dict, compare=None) -> list[str]:
     return out
 
 
+def pr_ready(n: int) -> bool:
+    """Take PR n out of draft (gh pr ready): drafts run only the cheap checks, so its CI starts now."""
+    return not run(["gh", "pr", "ready", str(n), "--repo", REPO]).returncode
+
+
 def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=None, conflicts=None, read=None,
-                   open_issue=None, json_merge=None) -> list[str]:
+                   open_issue=None, json_merge=None, mark_ready=None) -> list[str]:
     """Owner 2026-10-13: #5038/#5041 sat conflicting for hours because a tick with no free slot only logged them and
     stuck_seen then hid them. Any watched open PR that is conflicting (dirty) or shepherd:needs-fix, with no live worker
     on it and no queue item for it, gets a fix item at the FRONT of the queue (key "pr").
@@ -9150,6 +9170,15 @@ def queue_pr_fixes(state: dict, snap: dict, triage=None, update=None, compare=No
         if recently_settling(state, n, v, issue):
             continue
         entry = next((p for p in state.get("prs", []) if isinstance(p, dict) and pr_num(p) == int(n)), None)
+        if v.get("draft") and m and not any(r.get("issue") == issue for r in live):
+            # 2026-11-23: a draft skips CI, so its red is the red of an OLDER head and no fix worker can clear it: #9064/#9076
+            # sat "red" as drafts until someone marked them ready. A worker's PR left a draft with nobody working on it is marked
+            # ready once per head (CI then runs on it); until then it gets no fix item.
+            if entry is not None and entry.get("ready_tried") != v.get("head"):
+                entry["ready_tried"] = v.get("head")
+                if (mark_ready or pr_ready)(int(n)):
+                    added.append(f"ready:#{n} (a draft's red is stale: CI runs once it is ready)")
+            continue  # ready or not, a draft's old red is no worker's job
         if why == ["conflicts with main"] and entry is not None and entry.get("update_tried") != v.get("head"):
             # #20: a branch that only needs main merged is GitHub's job, not a model's; a real conflict fails (422)
             entry["update_tried"] = v.get("head")
