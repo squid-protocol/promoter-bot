@@ -6575,6 +6575,93 @@ def test_the_status_line_counts_owed_prs_and_names_the_batch(churn):
     assert churn.rebless_status_line(st).endswith("batch #700 open for #100, #101, #102")
 
 
+def hold_state(churn, n=7, age_h=8, head="h7", reviewed="h7", note=None, sigs=("rosetta-audit::- clist/short_circuit",), **extra):
+    at = churn.iso(churn.now() - churn.dt.timedelta(hours=age_h))
+    ent = {"number": n, "issue": 70, "verdict": "hold", "reviewed_head": reviewed, "reviewed_at": at, "hold_sigs": list(sigs),
+           "note": note or f"{churn.FIX_LOOP_NOTE} rosetta-audit: blocked (2 rounds, no hand-written change)", **extra}
+    return {"prs": [ent], "queue": [], "running": []}, {str(n): {"state": "open", "head": head, "mergeable_state": "blocked", "labels": []}}
+
+
+def tri(churn, kinds, sigs=()):
+    def t(n):
+        churn.CI_SIGS[n] = list(sigs)
+        return kinds
+    return t
+
+
+def test_a_hold_whose_red_is_gone_is_lifted(churn):
+    st, snap = hold_state(churn)
+    notes = churn.recheck_holds(st, snap, triage=tri(churn, []))
+    assert notes == ["hold #7 lifted: nothing failing at its head now"]
+    assert "verdict" not in st["prs"][0] and "reviewed_head" not in st["prs"][0] and not churn.on_hold(st, "7")
+
+
+def test_a_hold_whose_red_changed_is_lifted_for_a_fresh_look(churn):
+    st, snap = hold_state(churn)
+    notes = churn.recheck_holds(st, snap, triage=tri(churn, ["real"], ["ruff::E501"]))
+    assert notes == ["hold #7 lifted: its red changed since the hold"]
+
+
+def test_a_new_head_gets_the_hold_rechecked_before_it_is_old(churn):
+    st, snap = hold_state(churn, age_h=1, head="h8", reviewed="h7")
+    assert churn.recheck_holds(st, snap, triage=tri(churn, [])) == ["hold #7 lifted: nothing failing at its head now"]
+    st, snap = hold_state(churn, age_h=1)  # same head, young: not even read
+    assert churn.recheck_holds(st, snap, triage=lambda n: 1 / 0) == []
+
+
+def test_a_young_hold_at_the_same_head_is_left_alone_and_a_read_is_not_repeated_within_the_gap(churn):
+    st, snap = hold_state(churn, age_h=8)
+    assert churn.recheck_holds(st, snap, triage=tri(churn, ["real"], ["rosetta-audit::- clist/short_circuit"]))[0].startswith("hold #7 lifted: held")
+    st, snap = hold_state(churn, age_h=8, hold_checked_at=churn.iso(churn.now()))
+    assert churn.recheck_holds(st, snap, triage=lambda n: 1 / 0) == []
+
+
+def test_the_same_red_after_the_hold_age_forces_a_retriage_at_most_twice(churn):
+    st, snap = hold_state(churn, retriaged=2)
+    assert churn.recheck_holds(st, snap, triage=tri(churn, ["real"], ["rosetta-audit::- clist/short_circuit"])) == []
+    assert churn.on_hold(st, "7")  # past the cap: it stays held for the owner
+
+
+def test_a_behind_hold_updates_the_branch_once_per_head(churn):
+    st, snap = hold_state(churn)
+    snap["7"]["mergeable_state"] = "behind"
+    updated = []
+    t = tri(churn, ["real"], ["rosetta-audit::- clist/short_circuit"])
+    assert churn.recheck_holds(st, snap, triage=t, update=lambda n: updated.append(n) or True) == ["hold #7: updated with main (CI reruns on the new head)"]
+    st["prs"][0].pop("hold_checked_at")
+    churn.recheck_holds(st, snap, triage=t, update=lambda n: updated.append(n) or True)
+    assert updated == [7]  # not twice for one head
+
+
+def test_an_owners_hold_or_ruling_is_never_lifted(churn):
+    st, snap = hold_state(churn)
+    st["queue"] = [{"issue": 70, "pr": 7, "owner_hold": True}]
+    assert churn.recheck_holds(st, snap, triage=lambda n: 1 / 0) == [] and churn.on_hold(st, "7")
+    st["queue"] = [{"issue": 70, "pr": 7, "needs_owner": True, "task": "Owner ruling for PR #7: a question"}]
+    assert churn.recheck_holds(st, snap, triage=lambda n: 1 / 0) == [] and churn.on_hold(st, "7")
+
+
+def test_hold_rechecks_respect_the_read_cap_the_off_switch_and_unreadable_ci(churn, monkeypatch):
+    st = {"prs": [], "queue": [], "running": []}
+    snap = {}
+    for n in (7, 8, 9):
+        s1, sn = hold_state(churn, n=n)
+        st["prs"] += s1["prs"]
+        snap.update(sn)
+    reads = []
+    churn.recheck_holds(st, snap, triage=lambda n: reads.append(n) or None)
+    assert len(reads) == churn.HOLD_READS_PER_TICK and all(churn.on_hold(st, str(n)) for n in (7, 8, 9))  # None = unreadable: kept
+    monkeypatch.setattr(churn, "HOLD_RECHECK_H", 0)
+    assert churn.recheck_holds(st, snap, triage=lambda n: 1 / 0) == []
+
+
+def test_the_fix_loop_hold_records_what_to_recheck(churn):
+    churn.CI_SIGS[7] = ["rosetta-audit::- clist/short_circuit"]
+    entry = {}
+    churn.hold_fix_loop(entry, "7", {"head": "h7"}, ["rosetta-audit"], 2)
+    assert entry["hold_sigs"] == ["rosetta-audit::- clist/short_circuit"] and entry["hold_checks"] == ["rosetta-audit"]
+
+
 # keyword-rosetta #171 / #172 (2026-11-22): each PR's only red was what the other one changes
 SIG171 = ["verify::- c.ps1 -> probe_cleanup: calls_out_to expected [], got ['dispose']", "verify::fail powershell: n mismatch(es)",
           "verify::fail tcl: n mismatch(es)"]
