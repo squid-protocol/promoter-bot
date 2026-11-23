@@ -4683,7 +4683,7 @@ GENERATED_AUTO = ("refill", "followup-next")  # a next slice queued on purpose a
 
 
 def _foldable(x: dict) -> bool:
-    return bool(x.get("issue")) and not x.get("pr") and x.get("auto") not in ("main-red", "shared-red") \
+    return bool(x.get("issue")) and not x.get("pr") and x.get("auto") not in ("main-red", "shared-red", "rebless-batch") \
         and not x.get("main_red_pr") and not str(x.get("task", "")).startswith(("Fix PR", "Main is red:", SHARED_RED_TITLE)) and bool(task_paths(x.get("task", "")))
 
 
@@ -4731,7 +4731,7 @@ CLOSEOUT = _CFG.get("features", {}).get("closeout", True)
 
 def _sibling_gateable(x: dict) -> bool:
     return (bool(x.get("issue")) and not x.get("pr") and not x.get("repo") and x.get("backend") != "agy"
-            and x.get("lane", "normal") == "normal" and x.get("auto") not in ("main-red", "shared-red", "pr-fix")
+            and x.get("lane", "normal") == "normal" and x.get("auto") not in ("main-red", "shared-red", "rebless-batch", "pr-fix")
             and not x.get("main_red_pr") and not x.get("needs_owner")
             and not str(x.get("task", "")).startswith(("Fix PR", "Main is red:", SHARED_RED_TITLE)))
 
@@ -7314,7 +7314,7 @@ def prune_prereqs(state: dict) -> list[str]:
 def in_focus(state: dict, x: dict) -> bool:
     """May item / launch x run under the focus? With no focus set only red main and the exempt lanes run: churn never
     roams free (the free-roaming refill was where the drift came from). Filler is decided separately (filler_open)."""
-    if x.get("auto") in ("main-red", "shared-red") or str(x.get("task", "")).startswith(("Main is red:", SHARED_RED_TITLE)):
+    if x.get("auto") in ("main-red", "shared-red", "rebless-batch") or str(x.get("task", "")).startswith(("Main is red:", SHARED_RED_TITLE, REBLESS_TITLE)):
         return True  # a red main blocks every merge, the focus's too (a shared red is main's red on PR-only checks)
     if x.get("lane") in FOCUS_EXEMPT_LANES:
         return True
@@ -7887,7 +7887,7 @@ def focus_pick(state: dict, snap: dict | None, mode: str, focus: bool) -> tuple[
     q = [(i, x) for i, x in enumerate(state.get("queue", [])) if not x.get("needs_owner") and x.get("backend") != "agy"
          and in_focus(state, x) == focus and not blocked_by(x, snap, state) and not waiting(x)
          and not plan_overlap(state, x) and not estate_wait(state, x)]
-    for want in (lambda x: x.get("pr"), lambda x: x.get("auto") in ("main-red", "shared-red"), lambda x: x.get("lane") == "ci"):
+    for want in (lambda x: x.get("pr"), lambda x: x.get("auto") in ("main-red", "shared-red", "rebless-batch"), lambda x: x.get("lane") == "ci"):
         if hit := next(((i, x) for i, x in q if want(x)), None):
             return hit  # a PR fix finishes work in hand; a red main blocks every PR
     cfg = ci_cfg(state)
@@ -8351,6 +8351,168 @@ def release_shared_red(state: dict, issue: int, merged: bool, update=None) -> li
     kind = "fixed" if merged else "closed as not main's"
     note = f"shared red #{issue} {kind}: " + (f"updated with main {', '.join(sorted(out, key=lambda x: int(x[1:])))}" if out else "PRs back to their fixers")
     return [note + (f"; released from their fix-loop hold {', '.join(sorted(released, key=lambda x: int(x[1:])))}" if released else "")]
+
+
+# ---------------------------------------------------------------- the rebless pipeline
+# 2026-11-23: nine engine PRs (one per language) each carried their own golden-master snapshots, so every merge broke the
+# next one: all nine sat red/conflicting for two days and were rebuilt by hand into ONE PR with ONE bless (gitgalaxy #9111).
+# Churn now counts the PRs that owe a rebless, shows it in `churn status`, and when REBLESS_BATCH_MIN of them wait it queues
+# ONE batch item (tests/tools/rebless_batch.py in gitgalaxy builds the combined branch and blesses once).
+REBLESS_BATCH_MIN = int(_CFG.get("rebless_batch_min", 3))  # 0 turns the lane off
+REBLESS_BATCH_MAX = 12  # PRs per batch
+REBLESS_BATCH_STALE_H = 48  # a batch with no live worker and no open PR this long releases its lock
+REBLESS_TITLE = "Rebless batch"
+REBLESS_CONFLICT_TTL_H = 6  # a PR's conflict list is re-read at most this often (it also keys on the head)
+REBLESS_READS_PER_TICK = 3  # conflict reads (a git fetch each) per tick
+SNAPSHOT_RE = re.compile(r"^tests/(golden_master_audit|golden_master_zero_dep_audit|golden_doom_rosetta)/")
+GOLDEN_CHECK_RE = re.compile(r"golden|crucible-audit|rosetta-audit|doom", re.I)
+
+
+def rebless_owed(state: dict, snap: dict, files=None, conflicts=None) -> list[dict]:
+    """Open PRs that owe a golden rebless: they change snapshot files AND are conflicting (mergeable_state dirty) or fail a
+    golden/rosetta check at this head. Each: {"pr", "head", "since", "batchable", "why"}. `batchable` = the batch tool can
+    take it: its conflicts are ONLY snapshot files, or it is not conflicting at all (a hand-written conflict needs its own
+    fixer; a conflict list that could not be read is not batchable). Held PRs count unless the owner holds them: fix-loop
+    holds are exactly the stuck ones. Per-head caches (changed files, conflicts) keep the GitHub and git reads few;
+    persisted in state["rebless"]["prs"] for `churn status`."""
+    book = state.setdefault("rebless", {})
+    seen = book.setdefault("prs", {})
+    owner_held = {str(q.get("pr")) for q in state.get("queue", []) if q.get("owner_hold")}
+    out, reads, live = [], 0, set()
+    for n, v in sorted(snap.items(), key=lambda kv: int(kv[0])):
+        if v.get("state") != "open" or "rebless-batch" in str(v.get("branch", "")) or n in owner_held:
+            continue
+        entry = next((p for p in state.get("prs", []) if isinstance(p, dict) and pr_num(p) == int(n)), None)
+        if entry and entry.get("verdict") == "hold" and not str(entry.get("note") or "").startswith(FIX_LOOP_NOTE):
+            continue  # an owner's / rescue's hold: not ours to batch around
+        head = v.get("head", "")
+        fl = (files or pr_changed_files)(int(n), head)
+        if not fl or not any(SNAPSHOT_RE.match(f) for f in fl):
+            continue
+        rec = seen.get(n) or {}
+        rec = {"head": head, "since": rec.get("since") or iso(now()), **({"conflicts": rec["conflicts"], "conflicts_at": rec["conflicts_at"]}
+                                                                           if rec.get("head") == head and "conflicts_at" in rec else {})}
+        failing = [c for c in (CI_CHECKS.get(int(n)) or []) if GOLDEN_CHECK_RE.search(c)]
+        if failing:
+            rec["failing"] = failing
+        elif seen.get(n, {}).get("head") == head and seen[n].get("failing"):
+            rec["failing"] = seen[n]["failing"]  # triage did not run this tick: keep what this head showed
+        dirty = v.get("mergeable_state") == "dirty"
+        conf = None
+        if dirty:
+            t = parse_iso(rec.get("conflicts_at"))
+            if rec.get("conflicts_at") and t and now() - t < dt.timedelta(hours=REBLESS_CONFLICT_TTL_H):
+                conf = rec.get("conflicts")
+            elif reads < REBLESS_READS_PER_TICK:
+                reads += 1
+                conf = (conflicts or conflict_files)(int(n))
+                if conf is not None:
+                    rec["conflicts"], rec["conflicts_at"] = conf, iso(now())
+        if not (dirty or rec.get("failing")):
+            continue
+        only_snap = dirty and bool(conf) and all(SNAPSHOT_RE.match(f) for f in conf)
+        batchable = only_snap or (not dirty and bool(rec.get("failing")))
+        why = ("conflicts only in snapshots" if only_snap else "conflicts beyond snapshots" if dirty and conf
+               else "conflicts, list unknown" if dirty else "red: " + ", ".join(rec["failing"]))
+        rec.update(batchable=batchable, why=why)
+        seen[n] = rec
+        live.add(n)
+        out.append({"pr": int(n), "head": head, "since": rec["since"], "batchable": batchable, "why": why})
+    for n in [n for n in seen if n not in live]:
+        seen.pop(n)
+    return out
+
+
+def rebless_batch_open(state: dict, snap: dict) -> bool:
+    """A batch is in flight: its book entry (until its issue closes or all its PRs are gone), a queued item of it, or an
+    open PR whose branch carries rebless-batch."""
+    if any(q.get("auto") == "rebless-batch" for q in state.get("queue", [])):
+        return True
+    return any(v.get("state") == "open" and "rebless-batch" in str(v.get("branch", "")) for v in snap.values())
+
+
+def rebless_batch_issue(prs: list[int]) -> int | None:
+    """Open the one "Rebless batch" issue the batch worker reports on; its number or None."""
+    body = (f"These open PRs each carry golden-master snapshots and are red or conflicting, so merging them one at a time "
+            f"re-conflicts the rest: {', '.join(f'#{p}' for p in prs)}.\n\nOne worker builds a single combined branch with "
+            f"`tests/tools/rebless_batch.py` and blesses once. When that PR is merged, the originals are closed as "
+            f"superseded and the issues they Fix are closed. This issue closes with it.")
+    r = run(["gh", "api", f"repos/{REPO}/issues", "-f", f"title={REBLESS_TITLE}: {len(prs)} PRs ({', '.join(f'#{p}' for p in prs[:6])})"[:200],
+             "-f", f"body={body}", "--jq", ".number"])
+    return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else None
+
+
+def rebless_batch_task(k: int, prs: list[int]) -> str:
+    lst = ",".join(str(p) for p in prs)
+    return (f"{REBLESS_TITLE} (#{k}): {len(prs)} open PRs owe a golden rebless ({', '.join(f'#{p}' for p in prs)}): each changes "
+            f"snapshot files and is red or conflicting, so one-at-a-time merges keep re-conflicting the rest. Build ONE combined "
+            f"PR instead. In a FRESH worktree off origin/main (never in the primary checkout, never in another PR's worktree) "
+            f"run `python tests/tools/rebless_batch.py --prs {lst} --push` (flags: --branch NAME, --dry-run, --push, "
+            f"--no-bless; it applies each PR's hand-written change, blesses the goldens ONCE through tests/tools/box/"
+            f"golden-lock.sh, and pushes a branch named rebless-batch-*). Exit 2 means a PR's hand-written change did not "
+            f"apply or two PRs overlap: drop that PR from the list and rerun (it keeps its own fixer), and say which. Then "
+            f"open ONE DRAFT PR (title 'Rebless once for N stacked engine fixes (supersedes #..)', plain-language body: why, "
+            f"what, what was checked), mark it ready once the local checks pass, and shepherd its CI: fix real reds, rerun "
+            f"infra flakes once, and compare a red against plain origin/main before blaming the batch. Do NOT merge unless "
+            f"the standing merge rule applies. After it is green AND merged: close each superseded PR with a comment naming "
+            f"the batch PR and its merge commit, close the issues they Fix as completed (leave 'Part of' issues open with a "
+            f"note), then close #{k}. At most {REBLESS_BATCH_MAX} PRs per batch; one batch at a time.")
+
+
+def queue_rebless_batch(state: dict, snap: dict, owed: list[dict] | None = None, open_issue=None, read=None) -> list[str]:
+    """Queue ONE `rebless-batch` ci-lane item when >= REBLESS_BATCH_MIN batchable PRs wait. Returns the log notes."""
+    if REBLESS_BATCH_MIN <= 0:
+        return []
+    book = state.setdefault("rebless", {})
+    batch = book.get("batch")
+    if batch:
+        young = (t := parse_iso(batch.get("at"))) and now() - t < dt.timedelta(minutes=FIX_SETTLE_MIN)
+        gone = not any((snap.get(str(p)) or {}).get("state") == "open" for p in batch.get("prs", []))
+        stale = ((t := parse_iso(batch.get("at"))) and now() - t > dt.timedelta(hours=REBLESS_BATCH_STALE_H)
+                 and not rebless_batch_open(state, snap) and not any(r.get("issue") == batch["issue"] for r in state.get("running", [])))
+        if gone or stale or (not young and issue_closed(int(batch["issue"]), read) is True):
+            book.pop("batch")
+            log(f"rebless batch #{batch['issue']} released ({'its PRs are closed' if gone else 'no worker or PR for it' if stale else 'issue closed'})")
+        if book.get("batch"):
+            return []  # one batch at a time: its issue is the lock
+    if rebless_batch_open(state, snap):
+        return []
+    owed = rebless_owed(state, snap) if owed is None else owed
+    ready = sorted((o for o in owed if o["batchable"]), key=lambda o: (o["since"], o["pr"]))[:REBLESS_BATCH_MAX]
+    if len(ready) < REBLESS_BATCH_MIN:
+        return []
+    prs = sorted(o["pr"] for o in ready)
+    if not (k := (open_issue or rebless_batch_issue)(prs)):
+        return []  # could not open the issue: try again next tick
+    book["batch"] = {"issue": k, "prs": prs, "at": iso(now())}
+    state.setdefault("queue", []).insert(0, {
+        "issue": k, "model": "sonnet", "needs_owner": False, "lane": "ci", "allow_workflows": False, "auto": "rebless-batch",
+        "task": rebless_batch_task(k, prs)})
+    note = f"rebless batch #{k} queued for {', '.join(f'#{p}' for p in prs)}"
+    log(note)
+    return [note]
+
+
+def rebless_status_line(state: dict) -> str:
+    """One line for `churn status`, from the book the tick keeps (no network)."""
+    book = state.get("rebless") or {}
+    owed = {n: r for n, r in (book.get("prs") or {}).items()}
+    batchable = sorted(int(n) for n, r in owed.items() if r.get("batchable"))
+    if not owed:
+        head = "rebless pipeline: none owed"
+    else:
+        ages = [(now() - t).total_seconds() / 3600 for r in owed.values() if (t := parse_iso(r.get("since")))]
+        head = (f"rebless pipeline: {len(owed)} PR{'s' if len(owed) != 1 else ''} owe a rebless "
+                f"({' '.join('#' + n for n in sorted(owed, key=int))}), {len(batchable)} batchable"
+                + (f", oldest {max(ages):.0f} h" if ages else ""))
+    b = book.get("batch")
+    if REBLESS_BATCH_MIN <= 0:
+        tail = "batch lane off"
+    elif b:
+        tail = f"batch #{b['issue']} open for {', '.join('#' + str(p) for p in b['prs'])}"
+    else:
+        tail = f"batch: none queued (queues at {REBLESS_BATCH_MIN} batchable)"
+    return f"{head}; {tail}"
 
 
 def prune_pr_fixes(state: dict, snap: dict) -> list[str]:
@@ -10365,6 +10527,9 @@ def cmd_tick(a) -> int:
                         log(note)
                 pruned = prune_pr_fixes(st, snap)
                 fixes = queue_pr_fixes(st, snap)
+                with contextlib.suppress(Exception):  # rebless pipeline: one batch for the PRs that owe a rebless
+                    for note in queue_rebless_batch(st, snap):
+                        log(note, quiet=True)
                 with contextlib.suppress(Exception):
                     if ladder := ladder_items(st, snap):
                         st.setdefault("queue", []).extend(ladder)
@@ -11369,6 +11534,7 @@ def cmd_status(a) -> int:
     print("watched PRs: " + ", ".join(f"#{pr_num(p)}" + (f"(reviewed {str(p.get('reviewed_head'))[:8]})"
                                                        if isinstance(p, dict) and p.get("reviewed_head") else "")
                                       for p in state.get("prs", [])))
+    print(rebless_status_line(state))
     for f in state.get("followups", []):
         print(f"followup: PR #{f['pr']} {f['kind']}" + (f" (issue #{f['issue']})" if f.get("issue") else "") + f" since {f.get('since')}")
     snap = json.loads(SNAP.read_text()) if SNAP.exists() else {}
