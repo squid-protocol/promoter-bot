@@ -35,6 +35,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -4507,7 +4508,7 @@ def reap(state: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------- PR snapshot
-PR_FIELDS_GQL = ("number state merged headRefOid headRefName mergeStateStatus body isDraft "
+PR_FIELDS_GQL = ("number state merged headRefOid headRefName mergeStateStatus body isDraft title createdAt "
                  "labels(first: 40) { nodes { name } }")
 
 
@@ -4531,6 +4532,7 @@ def prs_graphql(nums: list[int], batch: int = 40) -> dict[int, dict]:
                 out[n] = {"state": "open" if g["state"] == "OPEN" else "closed", "merged": g["state"] == "MERGED",
                           "head": {"sha": g["headRefOid"], "ref": g["headRefName"]},
                           "mergeable_state": str(g.get("mergeStateStatus") or "unknown").lower(), "body": g.get("body"), "draft": bool(g.get("isDraft")),
+                          "title": g.get("title"), "created_at": g.get("createdAt"),
                           "labels": [{"name": x["name"]} for x in (g.get("labels") or {}).get("nodes") or []]}
     return out
 
@@ -4554,6 +4556,7 @@ def pr_snapshot(prs: list[int], old: dict) -> dict:
         snap[str(n)] = {"state": p["state"], "merged": p.get("merged", False), "head": p["head"]["sha"][:12],
                         "mergeable_state": ms, "labels": sorted(lbl["name"] for lbl in p.get("labels", [])),
                         "branch": p["head"].get("ref", ""), "closes": bool(CLOSES_RE.search(p.get("body") or "")), "draft": bool(p.get("draft")),
+                        "title": str(p.get("title") or "")[:140], "created": str(p.get("created_at") or ""),
                         **pr_checks(p.get("body") or "")}
     return snap
 
@@ -4683,7 +4686,7 @@ GENERATED_AUTO = ("refill", "followup-next")  # a next slice queued on purpose a
 
 
 def _foldable(x: dict) -> bool:
-    return bool(x.get("issue")) and not x.get("pr") and x.get("auto") not in ("main-red", "shared-red", "rebless-batch") \
+    return bool(x.get("issue")) and not x.get("pr") and x.get("auto") not in ("main-red", "shared-red", "rebless-batch", "companion-fold") \
         and not x.get("main_red_pr") and not str(x.get("task", "")).startswith(("Fix PR", "Main is red:", SHARED_RED_TITLE)) and bool(task_paths(x.get("task", "")))
 
 
@@ -4731,7 +4734,7 @@ CLOSEOUT = _CFG.get("features", {}).get("closeout", True)
 
 def _sibling_gateable(x: dict) -> bool:
     return (bool(x.get("issue")) and not x.get("pr") and not x.get("repo") and x.get("backend") != "agy"
-            and x.get("lane", "normal") == "normal" and x.get("auto") not in ("main-red", "shared-red", "rebless-batch", "pr-fix")
+            and x.get("lane", "normal") == "normal" and x.get("auto") not in ("main-red", "shared-red", "rebless-batch", "companion-fold", "pr-fix")
             and not x.get("main_red_pr") and not x.get("needs_owner")
             and not str(x.get("task", "")).startswith(("Fix PR", "Main is red:", SHARED_RED_TITLE)))
 
@@ -7329,7 +7332,7 @@ def prune_prereqs(state: dict) -> list[str]:
 def in_focus(state: dict, x: dict) -> bool:
     """May item / launch x run under the focus? With no focus set only red main and the exempt lanes run: churn never
     roams free (the free-roaming refill was where the drift came from). Filler is decided separately (filler_open)."""
-    if x.get("auto") in ("main-red", "shared-red", "rebless-batch") or str(x.get("task", "")).startswith(("Main is red:", SHARED_RED_TITLE, REBLESS_TITLE)):
+    if x.get("auto") in ("main-red", "shared-red", "rebless-batch", "companion-fold") or str(x.get("task", "")).startswith(("Main is red:", SHARED_RED_TITLE, REBLESS_TITLE, COMPANION_TITLE)):
         return True  # a red main blocks every merge, the focus's too (a shared red is main's red on PR-only checks)
     if x.get("lane") in FOCUS_EXEMPT_LANES:
         return True
@@ -7902,7 +7905,7 @@ def focus_pick(state: dict, snap: dict | None, mode: str, focus: bool) -> tuple[
     q = [(i, x) for i, x in enumerate(state.get("queue", [])) if not x.get("needs_owner") and x.get("backend") != "agy"
          and in_focus(state, x) == focus and not blocked_by(x, snap, state) and not waiting(x)
          and not plan_overlap(state, x) and not estate_wait(state, x)]
-    for want in (lambda x: x.get("pr"), lambda x: x.get("auto") in ("main-red", "shared-red", "rebless-batch"), lambda x: x.get("lane") == "ci"):
+    for want in (lambda x: x.get("pr"), lambda x: x.get("auto") in ("main-red", "shared-red", "rebless-batch", "companion-fold"), lambda x: x.get("lane") == "ci"):
         if hit := next(((i, x) for i, x in q if want(x)), None):
             return hit  # a PR fix finishes work in hand; a red main blocks every PR
     cfg = ci_cfg(state)
@@ -8508,6 +8511,113 @@ def queue_rebless_batch(state: dict, snap: dict, owed: list[dict] | None = None,
     return [note]
 
 
+# 2026-11-23: keyword-rosetta #171 baselined clist/short_circuit but failed verify on the powershell/tcl mismatches; #172 reblessed
+# powershell/tcl but failed on the unbaselined clist cell. Each PR's red was the other's fix, both sat red for a day, and neither
+# looked like a shared red (the two signature sets are disjoint). Two open PRs are COMPANIONS when each one's failure wording
+# names something specific in the other's title or branch AND neither red appears on any third PR. One ci-lane item folds them
+# into one PR. Mutual evidence is the point: two unrelated red PRs are not companions.
+COMPANION_FOLD = int(_CFG.get("companion_fold", 1))  # 0 turns the lane off
+COMPANION_WINDOW_H = 48  # both PRs opened this recently
+COMPANION_STALE_H = 24  # a fold with no worker, item or PR for it this long is released
+COMPANION_TITLE = "Fold companion PRs"
+COMPANION_STOP = {"error", "errors", "failed", "failure", "expected", "process", "completed", "exit", "code", "test", "tests", "check",
+                  "assert", "assertion", "fail", "pass", "file", "files", "line", "mismatch", "github", "workflow", "python", "build",
+                  "docs", "rule", "rules", "case", "cases", "with", "this", "that", "from", "into", "main", "verify", "audit",
+                  "baselined", "unreviewed", "cells", "cell", "none", "true", "false", "when", "have", "must", "need"}
+_COMPANION_TOKEN_RE = re.compile(r"[a-z][a-z0-9_]{3,}")
+
+
+def companion_tokens(text: str) -> set[str]:
+    """Specific words of a failure signature or a PR title/branch: lower-case, >= 4 chars, not on the generic stop list."""
+    return {t for t in _COMPANION_TOKEN_RE.findall(str(text).lower()) if t not in COMPANION_STOP}
+
+
+def companion_pairs(state: dict, snap: dict, now_=None) -> list[tuple[int, int]]:
+    """Open PR pairs (a < b) that fold into one. From the shared-red book (each triaged PR's real signatures at its head):
+    both PRs open, opened within COMPANION_WINDOW_H, red on non-empty signature sets that are DISJOINT, neither signature
+    appears on any third PR, no worker running for either, and each PR's signature words (minus the
+    generic stop list) appear in the OTHER's title or branch. Pure: no network."""
+    book = (state.get("shared_red") or {}).get("prs") or {}
+    t0 = now_ or now()
+    busy = {int(r.get("pr")) for r in state.get("running", []) if r.get("pr")}  # a QUEUED fix item is withdrawn by the fold
+    cand = {}
+    for n, rec in book.items():
+        v = snap.get(n) or {}
+        created = parse_iso(v.get("created"))
+        if (v.get("state") != "open" or not rec.get("sigs") or int(n) in busy or not created
+                or t0 - created > dt.timedelta(hours=COMPANION_WINDOW_H) or v.get("draft")):
+            continue
+        cand[n] = {"sigs": set(rec["sigs"]), "tokens": companion_tokens(" ".join(rec["sigs"])),
+                   "label": companion_tokens(f"{v.get('title', '')} {v.get('branch', '')}")}
+    out = []
+    for a, b in itertools.combinations(sorted(cand, key=int), 2):
+        A, B = cand[a], cand[b]
+        if A["sigs"] & B["sigs"]:
+            continue  # the same red on both: a shared red, main's, not a deadlock
+        if any(book[o].get("sigs") and (A["sigs"] | B["sigs"]) & set(book[o]["sigs"]) for o in book if o not in (a, b)):
+            continue  # either red is also on a third PR
+        if A["tokens"] & B["label"] and B["tokens"] & A["label"]:
+            out.append((int(a), int(b)))
+    return out
+
+
+def companion_fold_issue(a: int, b: int) -> int | None:
+    """Open the one "Fold companion PRs" issue its worker reports on; its number or None."""
+    body = (f"PRs #{a} and #{b} each fail only on what the other one fixes, so neither can go green alone and both wait. "
+            f"One worker folds them into one PR: #{b}'s branch takes #{a}'s change, both reds clear, #{a} is closed as "
+            f"superseded. This issue closes with it.")
+    r = run(["gh", "api", f"repos/{REPO}/issues", "-f", f"title={COMPANION_TITLE} #{a} and #{b}", "-f", f"body={body}", "--jq", ".number"])
+    return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else None
+
+
+def companion_fold_task(k: int, a: int, b: int) -> str:
+    return (f"{COMPANION_TITLE} (#{k}): PRs #{a} and #{b} are companions: each one's only real red is what the other changes, so "
+            f"each fails while the other is unmerged (read each PR's failing check and its diff to confirm; if they are NOT "
+            f"companions, say so on #{k}, close it and stop). Fold them: in a fresh worktree on #{b}'s branch merge #{a}'s branch "
+            f"(never rebase, never force-push; if the merge conflicts on generated files regenerate them with the repo's tools), "
+            f"run the checks both PRs failed locally, push to #{b}'s branch, and wait for CI on that head. When both reds are "
+            f"gone close #{a} with a comment naming #{b}; close #{k} as completed. A genuinely different red that remains is "
+            f"#{b}'s own work: fix it or report it. Do NOT merge unless the standing merge rule applies.")
+
+
+def queue_companion_fold(state: dict, snap: dict, pairs=None, open_issue=None, read=None) -> list[str]:
+    """Queue ONE `companion-fold` ci-lane item for a companion pair. One fold at a time; the issue is the lock."""
+    if COMPANION_FOLD <= 0:
+        return []
+    book = state.setdefault("companion", {})
+    fold = book.get("fold")
+    if fold:
+        gone = not all((snap.get(str(p)) or {}).get("state") == "open" for p in fold["prs"])
+        open_ = any(q.get("auto") == "companion-fold" for q in state.get("queue", [])) or any(
+            r.get("issue") == fold["issue"] for r in state.get("running", []))
+        t = parse_iso(fold.get("at"))
+        stale = bool(t and now() - t > dt.timedelta(hours=COMPANION_STALE_H) and not open_)
+        young = bool(t and now() - t < dt.timedelta(minutes=FIX_SETTLE_MIN))
+        if gone or stale or (not young and issue_closed(int(fold["issue"]), read) is True):
+            book.pop("fold")
+            log(f"companion fold #{fold['issue']} released ({'a PR is closed' if gone else 'no worker or item for it' if stale else 'issue closed'})")
+            book.setdefault("done", {})[f"{fold['prs'][0]}-{fold['prs'][1]}"] = iso(now())
+        if book.get("fold"):
+            return []
+    pairs = companion_pairs(state, snap) if pairs is None else pairs
+    for a, b in pairs:
+        key = f"{a}-{b}"
+        if key in book.get("done", {}):
+            continue  # folded or judged not companions already: not again
+        if not (k := (open_issue or companion_fold_issue)(a, b)):
+            return []
+        book["fold"] = {"issue": k, "prs": [a, b], "at": iso(now())}
+        state["queue"] = [q for q in state.get("queue", []) if not (q.get("auto") == "pr-fix" and q.get("pr") in (a, b))]  # no per-PR fixer
+        for n in (a, b):
+            mark_flake(state, str(n), (snap.get(str(n)) or {}).get("head", ""), f"gate: companion fold (#{k})")
+        state.setdefault("queue", []).insert(0, {"issue": k, "model": "sonnet", "needs_owner": False, "lane": "ci",
+                                                 "allow_workflows": False, "auto": "companion-fold", "task": companion_fold_task(k, a, b)})
+        note = f"companion fold #{k} queued for #{a} and #{b}"
+        log(note)
+        return [note]
+    return []
+
+
 def rebless_status_line(state: dict) -> str:
     """One line for `churn status`, from the book the tick keeps (no network)."""
     book = state.get("rebless") or {}
@@ -8623,7 +8733,8 @@ def hold_fix_loop(entry: dict, n: str, v: dict, checks: list[str], rounds: int) 
     rid = entry.get("fix_loop", {}).get("run")
     note = (f"{FIX_LOOP_NOTE} {', '.join(checks)}: {run_blocker(rid)} ({rounds} rounds, no hand-written change; "
             f"last run {rid})")
-    entry.update(reviewed_head=v.get("head"), verdict="hold", reviewed_at=iso(now()), note=note[:300])
+    entry.update(reviewed_head=v.get("head"), verdict="hold", reviewed_at=iso(now()), note=note[:300],
+                 hold_sigs=sorted(CI_SIGS.get(int(n)) or []), hold_checks=sorted(checks))  # what to re-check (recheck_holds)
     entry.pop("fix_loop", None)
     log(f"PR #{n} held: {note[:300]}")
     return f"hold:#{n} ({FIX_LOOP_NOTE} {', '.join(checks)})"
@@ -9233,6 +9344,83 @@ def release_workflow_holds(state: dict, snap: dict) -> list[str]:
             p.pop("reviewed_head", None)
             p["allow_workflows"] = True
             out.append(f"PR #{n}: workflow hold released under the standing grant; review it again ({note[:80]})")
+    return out
+
+
+# 2026-11-23: ~13 PRs sat on `hold` for a main-wide red that was fixed hours later; holds lasted "until a later verdict" and
+# nothing ever looked again, so the owner had to find and release each one. Holds now expire: churn re-reads the hold's red when
+# the PR got a new head or the hold is HOLD_RECHECK_H old, lifts it when the red is gone or changed, updates the branch once per
+# head when it is merely behind, and after HOLD_RECHECK_H forces a re-triage (at most HOLD_RETRIAGE_MAX per PR; then the PR
+# stays held for the owner). Never an owner's hold or an "Owner ruling" item.
+HOLD_RECHECK_H = float(_CFG.get("hold_recheck_h", 6))  # 0 turns it off
+HOLD_RETRIAGE_MAX = 2
+HOLD_READS_PER_TICK = 2  # CI triage reads (ci_digest, network) per tick
+HOLD_MIN_GAP_H = 1.0  # the same hold is re-read at most this often
+
+
+def hold_is_owners(state: dict, n: str) -> bool:
+    """PR n's hold is the owner's: an owner-answered hold or an open owner-ruling question. Never lifted automatically."""
+    return any(q.get("pr") == int(n) and (q.get("owner_hold") or (q.get("needs_owner") and str(q.get("task", "")).startswith("Owner ruling for PR")))
+               for q in state.get("queue", []))
+
+
+def recheck_holds(state: dict, snap: dict, triage=None, update=None) -> list[str]:
+    """Expire holds that no longer hold. For each open PR on a churn hold (not the owner's): when its head moved since the hold,
+    or the hold is HOLD_RECHECK_H old, read its CI (triage; at most HOLD_READS_PER_TICK a tick) and
+      - nothing failing -> lift (the red cleared, or CI is running again after an update);
+      - failing signatures differ from the recorded ones -> lift (the blocker changed: judge it afresh);
+      - merely behind main / dirty -> update the branch once per head (CI then reruns on the new head);
+      - same red and the hold is old -> lift for ONE forced re-triage (at most HOLD_RETRIAGE_MAX per PR).
+    A lifted hold drops its verdict and review head, so the next pass judges the PR. Returns log notes."""
+    if HOLD_RECHECK_H <= 0:
+        return []
+    out, reads = [], 0
+    cut = dt.timedelta(hours=HOLD_RECHECK_H)
+    for p in state.get("prs", []):
+        if not isinstance(p, dict) or p.get("verdict") != "hold":
+            continue
+        n = str(pr_num(p))
+        v = snap.get(n) or {}
+        if v.get("state") != "open" or hold_is_owners(state, n):
+            continue
+        at = parse_iso(p.get("reviewed_at"))
+        head = v.get("head", "")
+        old = bool(at and now() - at >= cut)
+        moved = bool(head) and bool(p.get("reviewed_head")) and not (str(p["reviewed_head"]).startswith(head) or head.startswith(str(p["reviewed_head"])[:12]))
+        last = parse_iso(p.get("hold_checked_at"))
+        recent = bool(last and now() - last < dt.timedelta(hours=HOLD_MIN_GAP_H))
+        if recent or not ((moved and p.get("hold_checked") != head) or old):
+            continue
+        if reads >= HOLD_READS_PER_TICK:
+            break
+        reads += 1
+        kinds = (triage or ci_triage)(int(n))
+        p["hold_checked"], p["hold_checked_at"] = head, iso(now())
+        if kinds is None:
+            continue  # could not read it: look again next time
+        real = [k for k in kinds if k not in NOISE]
+        sigs = sorted(CI_SIGS.get(int(n)) or [])
+        recorded = p.get("hold_sigs") or []
+        why = None
+        if not real:
+            why = "nothing failing at its head now"
+        elif recorded and sigs and not set(sigs) & set(recorded):
+            why = "its red changed since the hold"
+        elif v.get("mergeable_state") in ("behind", "dirty") and p.get("update_tried") != f"hold:{head}":
+            p["update_tried"] = f"hold:{head}"  # once per head
+            if (update or update_branch)(int(n)):
+                p["updated_from"] = head
+                out.append(f"hold #{n}: updated with main (CI reruns on the new head)")
+            continue
+        elif old and int(p.get("retriaged", 0)) < HOLD_RETRIAGE_MAX:
+            p["retriaged"] = int(p.get("retriaged", 0)) + 1
+            why = f"held {HOLD_RECHECK_H:g} h or more with the same red: forced re-triage {p['retriaged']}/{HOLD_RETRIAGE_MAX}"
+        if why:
+            for k in ("verdict", "reviewed_head", "hold_sigs", "hold_checks"):
+                p.pop(k, None)
+            out.append(f"hold #{n} lifted: {why}")
+    for note in out:
+        log(note)
     return out
 
 
@@ -10554,10 +10742,15 @@ def cmd_tick(a) -> int:
                 with contextlib.suppress(Exception):  # sibling slices of one issue (2026-11-04)
                     for note in hold_sibling_slices(st, snap):
                         log(note)
+                with contextlib.suppress(Exception):  # holds expire: lift the ones whose red is gone or changed
+                    recheck_holds(st, snap)
                 pruned = prune_pr_fixes(st, snap)
                 fixes = queue_pr_fixes(st, snap)
                 with contextlib.suppress(Exception):  # rebless pipeline: one batch for the PRs that owe a rebless
                     for note in queue_rebless_batch(st, snap):
+                        log(note, quiet=True)
+                with contextlib.suppress(Exception):  # two PRs that each fail on what the other fixes: one fold
+                    for note in queue_companion_fold(st, snap):
                         log(note, quiet=True)
                 with contextlib.suppress(Exception):
                     if ladder := ladder_items(st, snap):

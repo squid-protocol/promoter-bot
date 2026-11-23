@@ -6648,6 +6648,187 @@ def test_a_normal_rerun_still_reruns(bot):
     assert line.startswith("bot PR #5317: reran the failed jobs once")
 
 
+def hold_state(churn, n=7, age_h=8, head="h7", reviewed="h7", note=None, sigs=("rosetta-audit::- clist/short_circuit",), **extra):
+    at = churn.iso(churn.now() - churn.dt.timedelta(hours=age_h))
+    ent = {"number": n, "issue": 70, "verdict": "hold", "reviewed_head": reviewed, "reviewed_at": at, "hold_sigs": list(sigs),
+           "note": note or f"{churn.FIX_LOOP_NOTE} rosetta-audit: blocked (2 rounds, no hand-written change)", **extra}
+    return {"prs": [ent], "queue": [], "running": []}, {str(n): {"state": "open", "head": head, "mergeable_state": "blocked", "labels": []}}
+
+
+def tri(churn, kinds, sigs=()):
+    def t(n):
+        churn.CI_SIGS[n] = list(sigs)
+        return kinds
+    return t
+
+
+def test_a_hold_whose_red_is_gone_is_lifted(churn):
+    st, snap = hold_state(churn)
+    notes = churn.recheck_holds(st, snap, triage=tri(churn, []))
+    assert notes == ["hold #7 lifted: nothing failing at its head now"]
+    assert "verdict" not in st["prs"][0] and "reviewed_head" not in st["prs"][0] and not churn.on_hold(st, "7")
+
+
+def test_a_hold_whose_red_changed_is_lifted_for_a_fresh_look(churn):
+    st, snap = hold_state(churn)
+    notes = churn.recheck_holds(st, snap, triage=tri(churn, ["real"], ["ruff::E501"]))
+    assert notes == ["hold #7 lifted: its red changed since the hold"]
+
+
+def test_a_new_head_gets_the_hold_rechecked_before_it_is_old(churn):
+    st, snap = hold_state(churn, age_h=1, head="h8", reviewed="h7")
+    assert churn.recheck_holds(st, snap, triage=tri(churn, [])) == ["hold #7 lifted: nothing failing at its head now"]
+    st, snap = hold_state(churn, age_h=1)  # same head, young: not even read
+    assert churn.recheck_holds(st, snap, triage=lambda n: 1 / 0) == []
+
+
+def test_a_young_hold_at_the_same_head_is_left_alone_and_a_read_is_not_repeated_within_the_gap(churn):
+    st, snap = hold_state(churn, age_h=8)
+    assert churn.recheck_holds(st, snap, triage=tri(churn, ["real"], ["rosetta-audit::- clist/short_circuit"]))[0].startswith("hold #7 lifted: held")
+    st, snap = hold_state(churn, age_h=8, hold_checked_at=churn.iso(churn.now()))
+    assert churn.recheck_holds(st, snap, triage=lambda n: 1 / 0) == []
+
+
+def test_the_same_red_after_the_hold_age_forces_a_retriage_at_most_twice(churn):
+    st, snap = hold_state(churn, retriaged=2)
+    assert churn.recheck_holds(st, snap, triage=tri(churn, ["real"], ["rosetta-audit::- clist/short_circuit"])) == []
+    assert churn.on_hold(st, "7")  # past the cap: it stays held for the owner
+
+
+def test_a_behind_hold_updates_the_branch_once_per_head(churn):
+    st, snap = hold_state(churn)
+    snap["7"]["mergeable_state"] = "behind"
+    updated = []
+    t = tri(churn, ["real"], ["rosetta-audit::- clist/short_circuit"])
+    assert churn.recheck_holds(st, snap, triage=t, update=lambda n: updated.append(n) or True) == ["hold #7: updated with main (CI reruns on the new head)"]
+    st["prs"][0].pop("hold_checked_at")
+    churn.recheck_holds(st, snap, triage=t, update=lambda n: updated.append(n) or True)
+    assert updated == [7]  # not twice for one head
+
+
+def test_an_owners_hold_or_ruling_is_never_lifted(churn):
+    st, snap = hold_state(churn)
+    st["queue"] = [{"issue": 70, "pr": 7, "owner_hold": True}]
+    assert churn.recheck_holds(st, snap, triage=lambda n: 1 / 0) == [] and churn.on_hold(st, "7")
+    st["queue"] = [{"issue": 70, "pr": 7, "needs_owner": True, "task": "Owner ruling for PR #7: a question"}]
+    assert churn.recheck_holds(st, snap, triage=lambda n: 1 / 0) == [] and churn.on_hold(st, "7")
+
+
+def test_hold_rechecks_respect_the_read_cap_the_off_switch_and_unreadable_ci(churn, monkeypatch):
+    st = {"prs": [], "queue": [], "running": []}
+    snap = {}
+    for n in (7, 8, 9):
+        s1, sn = hold_state(churn, n=n)
+        st["prs"] += s1["prs"]
+        snap.update(sn)
+    reads = []
+    churn.recheck_holds(st, snap, triage=lambda n: reads.append(n) or None)
+    assert len(reads) == churn.HOLD_READS_PER_TICK and all(churn.on_hold(st, str(n)) for n in (7, 8, 9))  # None = unreadable: kept
+    monkeypatch.setattr(churn, "HOLD_RECHECK_H", 0)
+    assert churn.recheck_holds(st, snap, triage=lambda n: 1 / 0) == []
+
+
+def test_the_fix_loop_hold_records_what_to_recheck(churn):
+    churn.CI_SIGS[7] = ["rosetta-audit::- clist/short_circuit"]
+    entry = {}
+    churn.hold_fix_loop(entry, "7", {"head": "h7"}, ["rosetta-audit"], 2)
+    assert entry["hold_sigs"] == ["rosetta-audit::- clist/short_circuit"] and entry["hold_checks"] == ["rosetta-audit"]
+
+
+# keyword-rosetta #171 / #172 (2026-11-22): each PR's only red was what the other one changes
+SIG171 = ["verify::- c.ps1 -> probe_cleanup: calls_out_to expected [], got ['dispose']", "verify::fail powershell: n mismatch(es)",
+          "verify::fail tcl: n mismatch(es)"]
+SIG172 = ["verify::- clist/short_circuit", "verify::unreviewed n/a cells: n (n baselined)"]
+T171 = "docs: baseline clist/short_circuit n/a cell (unblocks gitgalaxy rosetta-audit)"
+T172 = "rebless(powershell, tcl): companion to gitgalaxy#8921 and #8915"
+
+
+def companion_state(churn, sigs=None, extra=None, age_h=5):
+    created = churn.iso(churn.now() - churn.dt.timedelta(hours=age_h))
+    snap = {"171": {"state": "open", "head": "h171", "branch": "docs/na-baseline-clist-short-circuit", "title": T171, "created": created,
+                    "labels": [], "mergeable_state": "blocked"},
+            "172": {"state": "open", "head": "h172", "branch": "rebless-powershell-tcl-8915-8921", "title": T172, "created": created,
+                    "labels": [], "mergeable_state": "blocked"}}
+    sigs = sigs or {"171": SIG171, "172": SIG172}
+    book = {n: {"issue": int(n), "head": f"h{n}", "checks": ["verify"], "sigs": s, "at": churn.iso(churn.now())} for n, s in sigs.items()}
+    st = {"prs": [], "queue": [{"issue": 171, "pr": 171, "auto": "pr-fix", "task": "Fix PR #171"}], "running": [], "shared_red": {"prs": book}}
+    if extra:
+        st.update(extra)
+    return st, snap
+
+
+def test_companion_tokens_drop_generic_words(churn):
+    assert churn.companion_tokens("Process completed with exit code 1: FAIL powershell: 1 mismatch(es)") == {"powershell"}
+    assert {"clist", "short_circuit"} <= churn.companion_tokens(T171)
+
+
+def test_two_prs_that_each_fail_on_what_the_other_fixes_are_companions(churn):
+    st, snap = companion_state(churn)
+    assert churn.companion_pairs(st, snap) == [(171, 172)]
+
+
+@pytest.mark.parametrize("why, kw", [
+    ("unrelated reds: neither names the other", {"sigs": {"171": ["verify::fail ruby: n mismatch(es)"], "172": ["verify::- clist/short_circuit"]}}),
+    ("the same red on both is a shared red, not a deadlock", {"sigs": {"171": SIG172, "172": SIG172}}),
+    ("too old", {"age_h": 60}),
+    ("a third PR carries the same red", {"sigs": {"171": SIG171, "172": SIG172, "173": SIG172}}),
+])
+def test_unrelated_shared_old_or_three_way_reds_are_not_companions(churn, why, kw):
+    st, snap = companion_state(churn, **kw)
+    if "173" in (kw.get("sigs") or {}):
+        snap["173"] = {**snap["172"], "title": "something else", "branch": "x"}
+    assert churn.companion_pairs(st, snap) == [], why
+
+
+def test_a_pr_with_a_worker_running_is_left_alone(churn):
+    st, snap = companion_state(churn, extra={"running": [{"pr": 172, "issue": 172}]})
+    assert churn.companion_pairs(st, snap) == []
+
+
+def test_the_fold_withdraws_the_per_pr_fixers_queues_one_item_and_locks(churn):
+    st, snap = companion_state(churn)
+    notes = churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 900)
+    assert notes == ["companion fold #900 queued for #171 and #172"]
+    (q,) = st["queue"]  # PR 171's own fix item is gone
+    assert q["auto"] == "companion-fold" and q["lane"] == "ci" and not q["needs_owner"] and "#171" in q["task"] and "#172" in q["task"]
+    assert {p["number"] for p in st["prs"]} == {171, 172} and all("flake_head" in p for p in st["prs"])  # no fixer relaunches
+    assert churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 1 / 0) == []  # one at a time: the issue is the lock
+    assert churn.real_in_focus(st, q)  # red work stays inside the focus lock, like shared-red
+
+
+def test_a_closed_fold_issue_releases_the_lock_and_the_pair_is_not_folded_again(churn):
+    st, snap = companion_state(churn)
+    churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 900)
+    st["companion"]["fold"]["at"] = "2026-01-01T00:00Z"
+    st["queue"] = []
+    assert churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 1 / 0, read=lambda path: {"state": "closed"}) == []
+    assert "fold" not in st["companion"] and "171-172" in st["companion"]["done"]
+    assert churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 1 / 0) == []
+
+
+def test_a_fold_with_no_worker_or_item_goes_stale(churn):
+    st, snap = companion_state(churn)
+    churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 900)
+    st["queue"] = []
+    st["companion"]["fold"]["at"] = churn.iso(churn.now() - churn.dt.timedelta(hours=churn.COMPANION_STALE_H + 1))
+    churn.queue_companion_fold(st, snap, pairs=[], read=lambda path: {"state": "open"})
+    assert "fold" not in st["companion"]
+
+
+def test_the_companion_fold_off_switch(churn, monkeypatch):
+    monkeypatch.setattr(churn, "COMPANION_FOLD", 0)
+    st, snap = companion_state(churn)
+    assert churn.queue_companion_fold(st, snap, open_issue=lambda a, b: 1 / 0) == [] and len(st["queue"]) == 1
+
+
+def test_the_snapshot_carries_title_and_creation_time(churn, monkeypatch):
+    p = {"state": "open", "merged": False, "head": {"sha": "a" * 40, "ref": "x"}, "mergeable_state": "clean", "labels": [], "body": "",
+         "title": "t" * 200, "created_at": "2026-11-22T10:00:00Z"}
+    monkeypatch.setattr(churn, "prs_graphql", lambda nums: {5: p})
+    snap = churn.pr_snapshot([5], {})
+    assert snap["5"]["title"] == "t" * 140 and snap["5"]["created"] == "2026-11-22T10:00:00Z"
+
+
 def test_a_program_refused_by_design_is_settled_and_listed_apart(churn):
     # owner 2026-11-03 (#5106): DBB epscsmrd.cbl stays at L0 as a stated boundary, not untranslated work
     reps = [{"file": "docs/language_status/evidence_report/dbb-mortgage-application/report.json", "programs": [
